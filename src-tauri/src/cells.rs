@@ -1,0 +1,938 @@
+use ironcalc::base::types::{Alignment, BorderItem, BorderStyle, HorizontalAlignment};
+use serde::{Deserialize, Serialize};
+use tauri::State;
+
+use crate::state::AppState;
+use crate::util::col_letter;
+
+/// Flat snapshot of a cell's visual style — only what the frontend renders.
+/// `None`-style cells use the workbook default (no inline CSS needed).
+#[derive(Serialize, Default)]
+pub(crate) struct CellStyleView {
+    #[serde(skip_serializing_if = "is_false_b")]
+    bold: bool,
+    #[serde(skip_serializing_if = "is_false_b")]
+    italic: bool,
+    #[serde(skip_serializing_if = "is_false_b")]
+    underline: bool,
+    #[serde(skip_serializing_if = "is_false_b")]
+    strike: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_pt: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bg: Option<String>,
+    /// "left" | "center" | "right" (general handled by frontend per cell type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    align_h: Option<&'static str>,
+    /// "top" | "middle" | "bottom"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    align_v: Option<&'static str>,
+    #[serde(skip_serializing_if = "is_false_b")]
+    wrap: bool,
+    /// Border presence flags — one bit per side. Frontend renders thin
+    /// black borders on whichever sides are set.
+    #[serde(skip_serializing_if = "is_false_b")]
+    border_top: bool,
+    #[serde(skip_serializing_if = "is_false_b")]
+    border_bottom: bool,
+    #[serde(skip_serializing_if = "is_false_b")]
+    border_left: bool,
+    #[serde(skip_serializing_if = "is_false_b")]
+    border_right: bool,
+}
+
+fn is_false_b(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Serialize)]
+pub(crate) struct CellView {
+    row: u32,
+    col: u32,
+    /// Display string as IronCalc would format it (formulas → evaluated value).
+    text: String,
+    /// Original input — formula like "=SUM(A1:A5)" or the raw entered value.
+    input: String,
+    is_formula: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    style: Option<CellStyleView>,
+}
+
+fn build_style_view(
+    s: &ironcalc::base::types::Style,
+    default_sz: i32,
+    default_name: &str,
+) -> Option<CellStyleView> {
+    use ironcalc::base::types::{HorizontalAlignment, VerticalAlignment};
+    let f = &s.font;
+    let fill = &s.fill;
+    let mut sv = CellStyleView::default();
+    let mut any = false;
+    if f.b { sv.bold = true; any = true; }
+    if f.i { sv.italic = true; any = true; }
+    if f.u { sv.underline = true; any = true; }
+    if f.strike { sv.strike = true; any = true; }
+    // Only emit if it deviates from the workbook's default font size.
+    // For xls loaded via load_xls we overwrote fonts[0].sz with the
+    // file's FONT-record-0 size (e.g. 10 or 11). The old hardcoded
+    // 13 check left cells with the file's default size EMITTING it
+    // as a style override, so bold cells at 11pt would show fine
+    // while unstyled 11pt cells would also render at 11pt (app-root
+    // CSS default is 11pt) — no issue there. The bigger problem was
+    // bold FONT records with dy_height=0 silently inheriting
+    // IronCalc's own 13pt, which made bold cells render 2-3pt bigger
+    // than the surrounding non-bold text. That's fixed in load_xls
+    // by always applying default_font_size when size_pt is 0.
+    if f.sz != default_sz { sv.size_pt = Some(f.sz); any = true; }
+    if f.name != default_name {
+        sv.family = Some(f.name.clone());
+        any = true;
+    }
+    if let Some(c) = &f.color {
+        if c != "#000000" {
+            sv.color = Some(c.clone());
+            any = true;
+        }
+    }
+    // Background — only solid pattern with a colour we can render
+    // straightforwardly. Patterns like "darkGrid" we ignore for now.
+    if fill.pattern_type == "solid" {
+        if let Some(c) = fill.fg_color.as_ref().or(fill.bg_color.as_ref()) {
+            sv.bg = Some(c.clone());
+            any = true;
+        }
+    }
+    if let Some(a) = &s.alignment {
+        let h = match a.horizontal {
+            HorizontalAlignment::Left => Some("left"),
+            HorizontalAlignment::Center => Some("center"),
+            HorizontalAlignment::CenterContinuous => Some("center"),
+            HorizontalAlignment::Right => Some("right"),
+            HorizontalAlignment::Justify => Some("justify"),
+            HorizontalAlignment::Fill => Some("left"),
+            HorizontalAlignment::Distributed => Some("justify"),
+            HorizontalAlignment::General => None,
+        };
+        if h.is_some() { sv.align_h = h; any = true; }
+        let v = match a.vertical {
+            VerticalAlignment::Top => Some("top"),
+            VerticalAlignment::Center => Some("middle"),
+            VerticalAlignment::Bottom => Some("bottom"),
+            VerticalAlignment::Justify => Some("middle"),
+            VerticalAlignment::Distributed => Some("middle"),
+        };
+        if v.is_some() && !matches!(a.vertical, VerticalAlignment::Bottom) {
+            sv.align_v = v;
+            any = true;
+        }
+        if a.wrap_text { sv.wrap = true; any = true; }
+    }
+    if s.border.top.is_some() { sv.border_top = true; any = true; }
+    if s.border.bottom.is_some() { sv.border_bottom = true; any = true; }
+    if s.border.left.is_some() { sv.border_left = true; any = true; }
+    if s.border.right.is_some() { sv.border_right = true; any = true; }
+    if any { Some(sv) } else { None }
+}
+
+/// Per-column / per-row sizing for the requested viewport. Excel's column
+/// width unit is "characters of the default font"; the canonical conversion
+/// is `px = floor(width * 7 + 5)` for sans-serif. Row heights are in points
+/// and convert to px via `pt * 96/72`.
+#[derive(Serialize)]
+pub(crate) struct LayoutData {
+    /// (col_index_1based, width_in_chars)
+    col_widths: Vec<(u32, f64)>,
+    /// (row_index_1based, height_in_points)
+    row_heights: Vec<(u32, f64)>,
+    /// Number of frozen header rows (top), from worksheet.frozen_rows.
+    frozen_rows: i32,
+    /// Number of frozen header cols (left), from worksheet.frozen_columns.
+    frozen_cols: i32,
+    /// Merged-cell ranges as A1-style strings (e.g. "A1:B2"). Frontend
+    /// renders the anchor with colspan/rowspan and skips the others.
+    merged_ranges: Vec<String>,
+}
+
+/// Read a rectangular block of cells [start_row..=end_row, start_col..=end_col] (1-indexed).
+#[tauri::command]
+pub(crate) fn get_cells(
+    sheet: u32,
+    start_row: u32,
+    end_row: u32,
+    start_col: u32,
+    end_col: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<CellView>, String> {
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    let mut out =
+        Vec::with_capacity(((end_row - start_row + 1) * (end_col - start_col + 1)) as usize);
+    for row in start_row..=end_row {
+        for col in start_col..=end_col {
+            let text = model
+                .get_formatted_cell_value(sheet, row as i32, col as i32)
+                .unwrap_or_default();
+            let input = model
+                .get_localized_cell_content(sheet, row as i32, col as i32)
+                .unwrap_or_default();
+            let is_formula = input.starts_with('=');
+            // Per-cell style — None when the cell uses the workbook default,
+            // saving a chunk of payload size on big viewports.
+            let default_sz = model
+                .workbook
+                .styles
+                .fonts
+                .first()
+                .map(|f| f.sz)
+                .unwrap_or(13);
+            let default_name = model
+                .workbook
+                .styles
+                .fonts
+                .first()
+                .map(|f| f.name.as_str())
+                .unwrap_or("Calibri");
+            let style = model
+                .get_style_for_cell(sheet, row as i32, col as i32)
+                .ok()
+                .as_ref()
+                .and_then(|s| build_style_view(s, default_sz, default_name));
+            // Elide truly empty cells from the wire: no text, no input, no
+            // style. Frontend `cells.get(key)` returns undefined for these
+            // and renders them as transparent passthrough — exactly what
+            // we want for spill rendering anyway. Cuts the get_cells
+            // payload by ~10× on typical sheets.
+            if text.is_empty() && input.is_empty() && style.is_none() {
+                continue;
+            }
+            out.push(CellView {
+                row,
+                col,
+                text,
+                input,
+                is_formula,
+                style,
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub(crate) fn get_layout(
+    sheet: u32,
+    start_row: u32,
+    end_row: u32,
+    start_col: u32,
+    end_col: u32,
+    state: State<'_, AppState>,
+) -> Result<LayoutData, String> {
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    let ws = model
+        .workbook
+        .worksheets
+        .get(sheet as usize)
+        .ok_or("bad sheet index")?;
+    // Hidden columns live in a side-channel set populated on workbook open
+    // (see workbook::open_workbook) and updated by set_column_hidden.
+    // IronCalc's `Col` struct has no `hidden` field, so this state is the
+    // authoritative source.
+    let hidden_cols_guard = state.hidden_cols.lock().unwrap();
+    let empty_set = std::collections::HashSet::new();
+    let hidden_cols = hidden_cols_guard.get(&sheet).unwrap_or(&empty_set);
+    let is_col_hidden = |c: i32| hidden_cols.contains(&c);
+    let mut col_widths = Vec::new();
+    for col in start_col..=end_col {
+        let w = if is_col_hidden(col as i32) {
+            0.0
+        } else {
+            model.get_column_width(sheet, col as i32).unwrap_or(0.0)
+        };
+        col_widths.push((col, w));
+    }
+    let mut row_heights = Vec::new();
+    for row in start_row..=end_row {
+        let hidden = ws
+            .rows
+            .iter()
+            .find(|r| r.r == row as i32)
+            .map(|r| r.hidden)
+            .unwrap_or(false);
+        let h = if hidden {
+            0.0
+        } else {
+            model.get_row_height(sheet, row as i32).unwrap_or(0.0)
+        };
+        row_heights.push((row, h));
+    }
+    Ok(LayoutData {
+        col_widths,
+        row_heights,
+        frozen_rows: ws.frozen_rows,
+        frozen_cols: ws.frozen_columns,
+        merged_ranges: ws.merge_cells.clone(),
+    })
+}
+
+#[tauri::command]
+pub(crate) fn set_cell(
+    sheet: u32,
+    row: u32,
+    col: u32,
+    value: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    if value.is_empty() {
+        model
+            .cell_clear_contents(sheet, row as i32, col as i32)
+            .map_err(|e| e)?;
+    } else {
+        model
+            .set_user_input(sheet, row as i32, col as i32, value.clone())
+            .map_err(|e| e)?;
+    }
+    // Track the edit for in-place preservation on save. We store the user's
+    // raw input so the saver can re-classify it (number / formula / string).
+    state
+        .dirty
+        .lock()
+        .unwrap()
+        .insert((sheet, row as i32, col as i32), value);
+    // No recalc here — IronCalc only exposes a full-workbook evaluate()
+    // which is multi-second on a 40-sheet workbook. Frontend triggers
+    // recalc via F9 (the `recalc` command).
+    Ok(model
+        .get_formatted_cell_value(sheet, row as i32, col as i32)
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub(crate) fn recalc(state: State<'_, AppState>) -> Result<u128, String> {
+    use std::time::Instant;
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let t0 = Instant::now();
+    model.evaluate();
+    Ok(t0.elapsed().as_millis())
+}
+
+#[tauri::command]
+pub(crate) fn cell_addr(row: u32, col: u32) -> String {
+    format!("{}{}", col_letter(col), row)
+}
+
+/// Create a workbook-scoped named range pointing at the given range.
+#[tauri::command]
+pub(crate) fn define_name(
+    name: String,
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let sheet_name = model
+        .workbook
+        .worksheets
+        .get(sheet as usize)
+        .ok_or("bad sheet index")?
+        .name
+        .clone();
+    let needs_quotes = sheet_name.contains(' ') || sheet_name.contains('-');
+    let qualified = if needs_quotes {
+        format!("'{}'", sheet_name.replace('\'', "''"))
+    } else {
+        sheet_name
+    };
+    let formula = format!(
+        "={}!${}${}:${}${}",
+        qualified,
+        col_letter(c1 as u32),
+        r1,
+        col_letter(c2 as u32),
+        r2
+    );
+    model.new_defined_name(&name, None, &formula)
+}
+
+#[tauri::command]
+pub(crate) fn delete_name(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    model.delete_defined_name(&name, None)
+}
+
+#[tauri::command]
+pub(crate) fn list_names(state: State<'_, AppState>) -> Result<Vec<(String, String)>, String> {
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    Ok(model
+        .workbook
+        .defined_names
+        .iter()
+        .map(|n| (n.name.clone(), n.formula.clone()))
+        .collect())
+}
+
+/// One generic style mutation applied to every cell in a rectangle.
+/// `kind` selects the field; the optional `value` carries the
+/// argument for setters that take one (e.g. fill colour). Toggle ops
+/// (bold/italic/underline) flip every cell to the OPPOSITE of the
+/// first cell's current state — Excel/Google-Sheets convention so the
+/// whole selection ends up consistent.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum StyleOp {
+    ToggleBold,
+    ToggleItalic,
+    ToggleUnderline,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignGeneral,
+    SetFillColor { color: String },
+    SetTextColor { color: String },
+    ClearFillColor,
+    ClearTextColor,
+    /// Apply a thin black border to one or more sides of every cell. The
+    /// `where` field selects which sides get the border (combinations
+    /// expressed as comma-separated tokens for simplicity).
+    SetBorder {
+        sides: String, // "all" | "outline" | "top" | "bottom" | "left" | "right" | "none"
+    },
+}
+
+#[derive(Serialize)]
+pub(crate) struct StyleEditResult {
+    pub count: usize,
+    /// Style index per cell BEFORE the op (row-major: r1..r2 outer, c1..c2 inner).
+    pub prev_indices: Vec<i32>,
+    /// Style index per cell AFTER the op (same order).
+    pub next_indices: Vec<i32>,
+}
+
+#[tauri::command]
+pub(crate) fn set_range_style(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    op: StyleOp,
+    state: State<'_, AppState>,
+) -> Result<StyleEditResult, String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+
+    // For toggle ops, flip to !first-cell's-state so the whole selection
+    // ends up consistent rather than alternating.
+    let toggle_target: Option<bool> = match &op {
+        StyleOp::ToggleBold => Some(!model.get_style_for_cell(sheet, r1, c1)?.font.b),
+        StyleOp::ToggleItalic => Some(!model.get_style_for_cell(sheet, r1, c1)?.font.i),
+        StyleOp::ToggleUnderline => Some(!model.get_style_for_cell(sheet, r1, c1)?.font.u),
+        _ => None,
+    };
+
+    let mut n = 0;
+    let mut prev_indices = Vec::new();
+    let mut next_indices = Vec::new();
+    for r in r1..=r2 {
+        for c in c1..=c2 {
+            let prev_idx = model.get_cell_style_index(sheet, r, c)?;
+            let mut s = model.get_style_for_cell(sheet, r, c)?;
+            match &op {
+                StyleOp::ToggleBold => s.font.b = toggle_target.unwrap(),
+                StyleOp::ToggleItalic => s.font.i = toggle_target.unwrap(),
+                StyleOp::ToggleUnderline => s.font.u = toggle_target.unwrap(),
+                StyleOp::AlignLeft => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.horizontal = HorizontalAlignment::Left;
+                    s.alignment = Some(a);
+                }
+                StyleOp::AlignCenter => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.horizontal = HorizontalAlignment::Center;
+                    s.alignment = Some(a);
+                }
+                StyleOp::AlignRight => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.horizontal = HorizontalAlignment::Right;
+                    s.alignment = Some(a);
+                }
+                StyleOp::AlignGeneral => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.horizontal = HorizontalAlignment::General;
+                    if a == Alignment::default() {
+                        s.alignment = None;
+                    } else {
+                        s.alignment = Some(a);
+                    }
+                }
+                StyleOp::SetFillColor { color } => {
+                    s.fill.pattern_type = "solid".to_string();
+                    s.fill.fg_color = Some(color.clone());
+                    s.fill.bg_color = None;
+                }
+                StyleOp::ClearFillColor => {
+                    s.fill.pattern_type = "none".to_string();
+                    s.fill.fg_color = None;
+                    s.fill.bg_color = None;
+                }
+                StyleOp::SetTextColor { color } => {
+                    s.font.color = Some(color.clone());
+                }
+                StyleOp::ClearTextColor => {
+                    s.font.color = None;
+                }
+                StyleOp::SetBorder { sides } => {
+                    let item = BorderItem {
+                        style: BorderStyle::Thin,
+                        color: Some("#000000".to_string()),
+                    };
+                    let on_outline = sides == "outline";
+                    let on_all = sides == "all";
+                    let none = sides == "none";
+                    let on_top = on_all || sides == "top" || (on_outline && r == r1);
+                    let on_bottom = on_all || sides == "bottom" || (on_outline && r == r2);
+                    let on_left = on_all || sides == "left" || (on_outline && c == c1);
+                    let on_right = on_all || sides == "right" || (on_outline && c == c2);
+                    if none {
+                        s.border.top = None;
+                        s.border.bottom = None;
+                        s.border.left = None;
+                        s.border.right = None;
+                    } else {
+                        if on_top { s.border.top = Some(item.clone()); }
+                        if on_bottom { s.border.bottom = Some(item.clone()); }
+                        if on_left { s.border.left = Some(item.clone()); }
+                        if on_right { s.border.right = Some(item); }
+                    }
+                }
+            }
+            model.set_cell_style(sheet, r, c, &s)?;
+            let next_idx = model.get_cell_style_index(sheet, r, c)?;
+            prev_indices.push(prev_idx);
+            next_indices.push(next_idx);
+            n += 1;
+        }
+    }
+    drop(guard);
+    state.style_dirty.lock().unwrap().insert(sheet);
+    Ok(StyleEditResult { count: n, prev_indices, next_indices })
+}
+
+/// Restore per-cell style indices captured by a previous set_range_style
+/// call. Used by undo/redo to roll the styles back / forward.
+#[tauri::command]
+pub(crate) fn apply_style_indices(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    indices: Vec<i32>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let ws = model.workbook.worksheet_mut(sheet)?;
+    let mut i = 0;
+    for r in r1..=r2 {
+        for c in c1..=c2 {
+            let idx = indices.get(i).copied().unwrap_or(0);
+            ws.set_cell_style(r, c, idx)?;
+            i += 1;
+        }
+    }
+    drop(guard);
+    state.style_dirty.lock().unwrap().insert(sheet);
+    Ok(())
+}
+
+/// Apply a number-format string to every cell in a rectangle. Other style
+/// attributes (font, fill, alignment, borders) are preserved per-cell —
+/// we round-trip through get_style_for_cell so the format change doesn't
+/// stomp on existing styling.
+#[tauri::command]
+pub(crate) fn set_range_number_format(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    format: String,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let mut n = 0;
+    for r in r1..=r2 {
+        for c in c1..=c2 {
+            let mut style = model.get_style_for_cell(sheet, r, c)?;
+            style.num_fmt = format.clone();
+            model.set_cell_style(sheet, r, c, &style)?;
+            n += 1;
+        }
+    }
+    drop(guard);
+    state.style_dirty.lock().unwrap().insert(sheet);
+    Ok(n)
+}
+
+/// Insert `count` blank rows at `row`, shifting subsequent rows down.
+#[tauri::command]
+pub(crate) fn insert_rows(
+    sheet: u32,
+    row: i32,
+    count: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    model.insert_rows(sheet, row, count)
+}
+
+/// Delete `count` rows starting at `row`, shifting subsequent rows up.
+#[tauri::command]
+pub(crate) fn delete_rows(
+    sheet: u32,
+    row: i32,
+    count: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    model.delete_rows(sheet, row, count)
+}
+
+/// Insert `count` blank cols at `col`, shifting subsequent cols right.
+#[tauri::command]
+pub(crate) fn insert_columns(
+    sheet: u32,
+    col: i32,
+    count: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    model.insert_columns(sheet, col, count)
+}
+
+/// Delete `count` cols starting at `col`, shifting subsequent cols left.
+#[tauri::command]
+pub(crate) fn delete_columns(
+    sheet: u32,
+    col: i32,
+    count: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    model.delete_columns(sheet, col, count)
+}
+
+/// Set the displayed width of a column. `px` is the display pixel value
+/// the user dragged to; we reverse the colWidthPx scaling factor (7/12)
+/// to get IronCalc's internal "char × 12" unit.
+#[tauri::command]
+pub(crate) fn set_column_width(
+    sheet: u32,
+    col: i32,
+    px: f64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let internal = (px * 12.0 / 7.0).max(0.0);
+    model.set_column_width(sheet, col, internal)
+}
+
+/// Set the displayed height of a row. `px` is the display pixel value;
+/// reverse the rowHeightPx scaling (96/72 / 2) to IronCalc's "pt × 2".
+#[tauri::command]
+pub(crate) fn set_row_height(
+    sheet: u32,
+    row: i32,
+    px: f64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let internal = (px * (72.0 / 96.0) * 2.0).max(0.0);
+    model.set_row_height(sheet, row, internal)
+}
+
+/// Toggle hidden state on a row. Persists into the IronCalc model only
+/// (not back into the saved xlsx — that's a follow-up); next refresh
+/// will see the new state via get_layout.
+#[tauri::command]
+pub(crate) fn set_row_hidden(
+    sheet: u32,
+    row: i32,
+    hidden: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    model.set_row_hidden(sheet, row, hidden)
+}
+
+/// Toggle hidden state on a column. The state is shadowed in
+/// AppState::hidden_cols since IronCalc's Col struct lacks a hidden field.
+#[tauri::command]
+pub(crate) fn set_column_hidden(
+    sheet: u32,
+    col: i32,
+    hidden: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut hc = state.hidden_cols.lock().unwrap();
+    let entry = hc.entry(sheet).or_default();
+    if hidden {
+        entry.insert(col);
+    } else {
+        entry.remove(&col);
+    }
+    Ok(())
+}
+
+/// Set the frozen pane counts for a sheet. Either argument can be 0
+/// (no freeze in that direction). Mirrors Lotus /Worksheet/Titles
+/// (Both / Horizontal / Vertical / Clear).
+#[tauri::command]
+pub(crate) fn set_frozen_panes(
+    sheet: u32,
+    rows: i32,
+    cols: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let ws = model
+        .workbook
+        .worksheets
+        .get_mut(sheet as usize)
+        .ok_or("bad sheet index")?;
+    ws.frozen_rows = rows.max(0);
+    ws.frozen_columns = cols.max(0);
+    Ok(())
+}
+
+/// Unhide every hidden row in the active sheet — Lotus
+/// /Worksheet/Row/Display.
+#[tauri::command]
+pub(crate) fn show_all_rows(sheet: u32, state: State<'_, AppState>) -> Result<usize, String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let ws = model
+        .workbook
+        .worksheets
+        .get_mut(sheet as usize)
+        .ok_or("bad sheet index")?;
+    let mut n = 0;
+    for r in ws.rows.iter_mut() {
+        if r.hidden {
+            r.hidden = false;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Unhide every hidden column in the active sheet — Lotus
+/// /Worksheet/Column/Display.
+#[tauri::command]
+pub(crate) fn show_all_cols(sheet: u32, state: State<'_, AppState>) -> Result<usize, String> {
+    let mut hc = state.hidden_cols.lock().unwrap();
+    let n = hc.get(&sheet).map(|s| s.len()).unwrap_or(0);
+    if let Some(set) = hc.get_mut(&sheet) {
+        set.clear();
+    }
+    Ok(n)
+}
+
+/// True (un-clamped) used range of the sheet — the bottom-right of
+/// worksheet.dimension, no min/max bounds applied. Used by Ctrl+End.
+#[tauri::command]
+pub(crate) fn get_used_range(
+    sheet: u32,
+    state: State<'_, AppState>,
+) -> Result<(u32, u32), String> {
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    let ws = model
+        .workbook
+        .worksheets
+        .get(sheet as usize)
+        .ok_or("bad sheet index")?;
+    let (rows, cols) = parse_dimension(&ws.dimension).unwrap_or((1, 1));
+    Ok((rows, cols))
+}
+
+/// Used range of a sheet in (rows, cols), parsed from the worksheet's
+/// `dimension` attribute (e.g. "A1:CK127"). MIN gives empty sheets a
+/// usable workspace; MAX caps pathological dimensions to Excel's own
+/// limits — both axes are virtualised in the frontend (only the visible
+/// band of rows × the visible band of cols hits the DOM) so huge
+/// dimensions don't translate into upfront render work.
+#[tauri::command]
+pub(crate) fn get_sheet_dim(
+    sheet: u32,
+    state: State<'_, AppState>,
+) -> Result<(u32, u32), String> {
+    const MIN_ROWS: u32 = 100;
+    const MIN_COLS: u32 = 60;
+    const MAX_ROWS: u32 = 1_048_576;
+    const MAX_COLS: u32 = 16_384;
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    let ws = model
+        .workbook
+        .worksheets
+        .get(sheet as usize)
+        .ok_or("bad sheet index")?;
+    let (rows, cols) = parse_dimension(&ws.dimension).unwrap_or((MIN_ROWS, MIN_COLS));
+    Ok((rows.clamp(MIN_ROWS, MAX_ROWS), cols.clamp(MIN_COLS, MAX_COLS)))
+}
+
+/// Parse "A1:CK127" / "A1" / "$AB$45:$CK$127" → (max_row, max_col).
+/// Tolerant: returns None on malformed input so the caller can fall back.
+fn parse_dimension(s: &str) -> Option<(u32, u32)> {
+    let mut max_r = 0u32;
+    let mut max_c = 0u32;
+    for part in s.split(':') {
+        let (r, c) = parse_a1_addr(part.trim())?;
+        max_r = max_r.max(r);
+        max_c = max_c.max(c);
+    }
+    if max_r > 0 && max_c > 0 {
+        Some((max_r, max_c))
+    } else {
+        None
+    }
+}
+
+fn parse_a1_addr(s: &str) -> Option<(u32, u32)> {
+    let s = s.replace('$', "");
+    let mut col = 0u32;
+    let mut row_start = None;
+    for (i, c) in s.char_indices() {
+        if c.is_ascii_alphabetic() {
+            col = col * 26 + (c.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+        } else {
+            row_start = Some(i);
+            break;
+        }
+    }
+    let row_start = row_start?;
+    let row: u32 = s[row_start..].parse().ok()?;
+    if col == 0 || row == 0 {
+        return None;
+    }
+    Some((row, col))
+}
+
+/// Excel-style Ctrl+Arrow jump.
+///
+/// `dr`/`dc` are -1, 0, or +1 indicating the direction (exactly one is
+/// non-zero in practice). Semantics match Excel:
+///   * If the current cell is empty: skip empties until the first non-empty
+///     in that direction; if none found, stop at the last visited cell.
+///   * If the current cell is populated AND the next cell is populated:
+///     stop at the LAST populated cell in the contiguous run.
+///   * If the current cell is populated AND the next cell is empty: skip
+///     empties until the next non-empty; if none, stop at the boundary.
+///
+/// Bounded by `max_step` cells walked to avoid pathological scans on
+/// near-empty sheets — Excel itself caps at 1048576 rows / 16384 cols.
+#[tauri::command]
+pub(crate) fn jump_edge(
+    sheet: u32,
+    row: u32,
+    col: u32,
+    dr: i32,
+    dc: i32,
+    state: State<'_, AppState>,
+) -> Result<(u32, u32), String> {
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    if (dr == 0 && dc == 0) || dr.abs() > 1 || dc.abs() > 1 {
+        return Ok((row, col));
+    }
+    let max_row: i32 = 1_048_576;
+    let max_col: i32 = 16_384;
+    let max_step: i32 = 16_384;
+
+    let is_empty = |r: i32, c: i32| -> bool {
+        if r < 1 || c < 1 || r > max_row || c > max_col {
+            return true;
+        }
+        model
+            .get_formatted_cell_value(sheet, r, c)
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+    };
+
+    let in_bounds = |r: i32, c: i32| -> bool { r >= 1 && c >= 1 && r <= max_row && c <= max_col };
+
+    let r0 = row as i32;
+    let c0 = col as i32;
+    let started_empty = is_empty(r0, c0);
+    let next_r = r0 + dr;
+    let next_c = c0 + dc;
+    if !in_bounds(next_r, next_c) {
+        return Ok((row, col));
+    }
+
+    let (mut r, mut c) = (r0, c0);
+
+    if started_empty {
+        let (mut nr, mut nc) = (r0 + dr, c0 + dc);
+        let mut steps = 0;
+        while in_bounds(nr, nc) && is_empty(nr, nc) && steps < max_step {
+            r = nr;
+            c = nc;
+            nr += dr;
+            nc += dc;
+            steps += 1;
+        }
+        if in_bounds(nr, nc) && !is_empty(nr, nc) {
+            return Ok((nr as u32, nc as u32));
+        }
+        return Ok((r as u32, c as u32));
+    }
+
+    let next_is_empty = is_empty(next_r, next_c);
+
+    if next_is_empty {
+        let (mut nr, mut nc) = (next_r + dr, next_c + dc);
+        let mut steps = 0;
+        while in_bounds(nr, nc) && is_empty(nr, nc) && steps < max_step {
+            nr += dr;
+            nc += dc;
+            steps += 1;
+        }
+        if in_bounds(nr, nc) && !is_empty(nr, nc) {
+            return Ok((nr as u32, nc as u32));
+        }
+        return Ok(((nr - dr) as u32, (nc - dc) as u32));
+    }
+
+    let mut steps = 0;
+    while in_bounds(r + dr, c + dc) && !is_empty(r + dr, c + dc) && steps < max_step {
+        r += dr;
+        c += dc;
+        steps += 1;
+    }
+    Ok((r as u32, c as u32))
+}

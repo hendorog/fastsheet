@@ -1,0 +1,27 @@
+.DS_Store
+node_modules
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Windows-side detritus that creeps in via /mnt/c
+*:Zone.Identifier
+~$*
+
+# User's real test spreadsheets — keep out of git unless explicitly added.
+# Only the generated fixtures (basic/tables/array_formulas) stay tracked.
+/fixtures/*
+!/fixtures/basic.xlsx
+!/fixtures/tables.xlsx
+!/fixtures/array_formulas.xlsx
+.claude/
+
+# Internal working docs (kept on disk, not pushed to public repo)
+CLAUDE.md
+HANDOVER_*.md
+SPIKE_FINDINGS.md
