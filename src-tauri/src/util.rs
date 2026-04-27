@@ -28,19 +28,23 @@ pub(crate) fn parse_attr_val(tag: &str, name: &str) -> Option<String> {
 /// Tauri GUI binary is built with subsystem=windows on Windows and
 /// has no stderr; writing to stderr there discards the output.
 ///
-/// Default log path: `<temp_dir>/fastsheet_profile.log`. Override via
-/// `FASTSHEET_PROFILE_LOG`. Best-effort; failures are silent.
+/// Default log path: `fastsheet_profile.log` next to the running
+/// binary (whatever `std::env::current_exe()` resolves to). Falls
+/// back to the OS temp dir if current_exe fails. Override the path
+/// entirely with `FASTSHEET_PROFILE_LOG`. Best-effort; failures are
+/// silent.
 pub(crate) fn profile_log(line: &str) {
     if std::env::var("FASTSHEET_PROFILE_LOAD").is_err() {
         return;
     }
-    let path = std::env::var("FASTSHEET_PROFILE_LOG")
-        .unwrap_or_else(|_| {
-            std::env::temp_dir()
-                .join("fastsheet_profile.log")
-                .to_string_lossy()
-                .into_owned()
-        });
+    let path = std::env::var("FASTSHEET_PROFILE_LOG").unwrap_or_else(|_| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("fastsheet_profile.log")))
+            .unwrap_or_else(|| std::env::temp_dir().join("fastsheet_profile.log"))
+            .to_string_lossy()
+            .into_owned()
+    });
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write;
         let _ = writeln!(f, "{line}");
