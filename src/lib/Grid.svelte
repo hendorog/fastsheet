@@ -36,7 +36,9 @@
     /// edit-mode to outline cells/ranges the formula refers to. Each
     /// entry is one outlined box, independent of the selection. Cells
     /// here aren't part of any range; they're purely visual hints.
-    highlights?: { r1: number; c1: number; r2: number; c2: number; color: string }[];
+    /// Optional `label` renders a small tag at the top-left — used to
+    /// show the name of a defined-range reference.
+    highlights?: { r1: number; c1: number; r2: number; c2: number; color: string; label?: string }[];
     /// When set, the grid auto-scrolls to bring (row, col) into view
     /// without changing the selection cursor. Used by trace preview
     /// to follow the highlighted entry through the workbook. The page
@@ -662,6 +664,7 @@
       width: (colLefts[h.c2 + 1] ?? 0) - (colLefts[h.c1] ?? 0),
       height: (rowOffsets[h.r2 + 1] ?? 0) - (rowOffsets[h.r1] ?? 0),
       color: h.color,
+      label: h.label ?? null,
     })),
   );
   let fillBox = $derived.by(() => {
@@ -855,6 +858,12 @@
       class="ref-highlight"
       style={`top:${h.top}px; left:${h.left}px; width:${h.width}px; height:${h.height}px; border-color: ${h.color}; box-shadow: 0 0 0 1px ${h.color} inset;`}
     ></div>
+    {#if h.label}
+      <div
+        class="ref-tag"
+        style={`top:${Math.max(h.top - 14, colhdrH)}px; left:${h.left}px; background:${h.color};`}
+      >{h.label}</div>
+    {/if}
   {/each}
   <div
     class="sel-cell-outline"
@@ -1052,6 +1061,23 @@
     border-radius: 2px;
     pointer-events: none;
     z-index: 8;
+  }
+  /* Small badge anchored to the top-left of a highlight, used to
+     show the name of a defined-range reference. Background color
+     matches the highlight border so the visual association is
+     immediate. */
+  .ref-tag {
+    position: absolute;
+    height: 14px;
+    padding: 0 4px;
+    font-size: 10px;
+    font-weight: bold;
+    color: #fff;
+    line-height: 14px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 9;
+    border-radius: 2px 2px 0 0;
   }
   /* Excel-style fill handle — moves to whichever corner of the
      selection rectangle is the "free" one (cycled by `.` in the

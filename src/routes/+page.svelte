@@ -105,8 +105,28 @@
   /// trace popup (single-element preview) and F2 edit-mode (one
   /// per ref in the in-progress formula).
   let refHighlights = $state<
-    { sheet: number; r1: number; c1: number; r2: number; c2: number; color: string }[]
+    {
+      sheet: number;
+      r1: number;
+      c1: number;
+      r2: number;
+      c2: number;
+      color: string;
+      label?: string;
+    }[]
   >([]);
+  /// Cache of defined names → resolved range bounds. Refreshed on
+  /// workbook open and after any name create / delete. Lets F2 edit
+  /// mode highlight named-range references in real time without a
+  /// per-keystroke backend round-trip.
+  type ParsedNameRange = {
+    sheet: number;
+    r1: number;
+    c1: number;
+    r2: number;
+    c2: number;
+  };
+  let nameCache = $state<Map<string, ParsedNameRange>>(new Map());
   /// Tells Grid to scroll a non-cursor cell into view. Set to a new
   /// object identity each time we want the scroll-on-target effect to
   /// re-fire.
@@ -541,6 +561,7 @@
     sheetCursors = new Map();
     await resizeViewportToSheet();
     await refreshViewport({ clear: true });
+    await refreshNameCache();
     statusMsg = "New workbook";
   }
 
@@ -563,6 +584,7 @@
       sheetCursors = new Map();
       await resizeViewportToSheet();
       await refreshViewport({ clear: true });
+      await refreshNameCache();
       statusMsg = `Opened ${p} (sheets: ${workbook.sheet_names.join(", ")})`;
       focusGrid();
     } catch (e) {
@@ -807,10 +829,36 @@
   /// Called by FormulaTrace as the user moves through the list. We
   /// switch sheets if needed and scroll the grid to the highlighted
   /// item's cell — without changing the active selection cursor on
-  /// either sheet. Highlights show what the popup is pointing at.
+  /// either sheet. Highlights show what the popup is pointing at;
+  /// for `name` kind nodes the highlight covers the full resolved
+  /// range and carries the name as a tag.
   async function tracePreview(node: TraceNode) {
+    if (node.kind === "name") {
+      // Defined name — value field carries the resolved formula text
+      // (e.g. "Discount!$B$24:$W$35"). Parse it and highlight the
+      // full range with the name as a label.
+      const range = parseNameFormula(node.value);
+      if (!range) {
+        refHighlights = [];
+        scrollTarget = null;
+        return;
+      }
+      if (range.sheet !== activeSheet) await switchSheet(range.sheet);
+      refHighlights = [
+        {
+          sheet: range.sheet,
+          r1: range.r1,
+          c1: range.c1,
+          r2: range.r2,
+          c2: range.c2,
+          color: "#ff8800",
+          label: node.address,
+        },
+      ];
+      scrollTarget = { row: range.r1, col: range.c1 };
+      return;
+    }
     if (node.sheet === null || node.row === null || node.col === null) {
-      // Defined-name or literal-with-no-coords — clear preview.
       refHighlights = [];
       scrollTarget = null;
       return;
@@ -819,11 +867,6 @@
     if (targetSheet !== activeSheet) {
       await switchSheet(targetSheet);
     }
-    // Build the highlight rectangle. Cells = single cell. Ranges keep
-    // their bounds from the address parsing in the backend; for now
-    // we only get top-left from the trace node, so for ranges we use
-    // (row,col) as the top-left and the popup's `address` already
-    // describes the bounds visually.
     refHighlights = [
       {
         sheet: targetSheet,
@@ -1009,11 +1052,18 @@
     }
     const palette = ["#0a84ff", "#34c759", "#ff9500", "#bf5af2", "#ff375f", "#5ac8fa"];
     const stripped = editValue.replace(/"[^"]*"/g, '""');
-    const re = /(?:'([^']+)'!|([A-Za-z_][A-Za-z_0-9.]*)!)?(\$?[A-Z]{1,2}\$?\d+)(?::(\$?[A-Z]{1,2}\$?\d+))?/g;
     const out: typeof refHighlights = [];
-    let m: RegExpExecArray | null;
     let colorIdx = 0;
-    while ((m = re.exec(stripped)) !== null) {
+
+    // Pass 1: A1-style cells and ranges, with optional sheet prefix.
+    // The sheet prefix can be quoted ('Sheet One') or bare (Sheet1).
+    // We track consumed character spans so the name pass below can
+    // skip over identifiers already accounted for here.
+    const consumed: Array<[number, number]> = [];
+    const cellRe = /(?:'([^']+)'!|([A-Za-z_][A-Za-z_0-9.]*)!)?(\$?[A-Z]{1,2}\$?\d+)(?::(\$?[A-Z]{1,2}\$?\d+))?/g;
+    let m: RegExpExecArray | null;
+    while ((m = cellRe.exec(stripped)) !== null) {
+      consumed.push([m.index, m.index + m[0].length]);
       const sheetName = m[1] ?? m[2] ?? null;
       let sheetIdx = activeSheet;
       if (sheetName) {
@@ -1035,6 +1085,36 @@
       });
       colorIdx++;
     }
+
+    // Pass 2: bare identifiers that match a defined name in the
+    // cache. Skip identifiers that are followed by `(` (function
+    // calls), preceded by `!` (sheet qualifier — already handled),
+    // or fall inside a span consumed by a cell match above.
+    const nameRe = /[A-Za-z_][A-Za-z_0-9.]*/g;
+    while ((m = nameRe.exec(stripped)) !== null) {
+      const start = m.index;
+      const end = start + m[0].length;
+      // Skip if any consumed span overlaps this identifier.
+      if (consumed.some(([a, b]) => start < b && end > a)) continue;
+      // Skip function calls.
+      if (stripped[end] === "(") continue;
+      // Skip sheet qualifier head (e.g. "Sheet1!" — should have been
+      // handled in Pass 1, but be defensive).
+      if (stripped[end] === "!") continue;
+      const range = nameCache.get(m[0].toLowerCase());
+      if (!range) continue;
+      out.push({
+        sheet: range.sheet,
+        r1: range.r1,
+        c1: range.c1,
+        r2: range.r2,
+        c2: range.c2,
+        color: palette[colorIdx % palette.length],
+        label: m[0],
+      });
+      colorIdx++;
+    }
+
     refHighlights = out;
   }
 
@@ -1879,6 +1959,7 @@
       try {
         await invoke("define_name", { name: t, sheet: activeSheet, r1, c1, r2, c2 });
         statusMsg = `Named "${t}" → ${addr(r1, c1)}:${addr(r2, c2)}`;
+        await refreshNameCache();
       } catch (e) {
         statusMsg = `Define name failed: ${e}`;
       }
@@ -1893,11 +1974,66 @@
       try {
         await invoke("delete_name", { name: t });
         statusMsg = `Deleted name "${t}"`;
+        await refreshNameCache();
       } catch (e) {
         statusMsg = `Delete name failed: ${e}`;
       }
       focusGrid();
     });
+  }
+
+  /// Parse a defined-name's resolved formula text — typically
+  /// "Discount!$B$24:$W$35" or "'Sheet 1'!$A$1" — into concrete range
+  /// bounds. Returns null when the formula isn't a simple sheet-
+  /// qualified A1 / A1:B2 reference (e.g. names defined as
+  /// expressions like OFFSET(...) — those get skipped).
+  function parseNameFormula(formula: string): ParsedNameRange | null {
+    if (!workbook) return null;
+    const stripped = formula.startsWith("=") ? formula.slice(1) : formula;
+    // Pull off the sheet name first (quoted or bare).
+    let sheet = "";
+    let rest = "";
+    if (stripped.startsWith("'")) {
+      const close = stripped.indexOf("'!");
+      if (close < 0) return null;
+      sheet = stripped.slice(1, close);
+      rest = stripped.slice(close + 2);
+    } else {
+      const bang = stripped.indexOf("!");
+      if (bang < 0) return null;
+      sheet = stripped.slice(0, bang);
+      rest = stripped.slice(bang + 1);
+    }
+    const sheetIdx = workbook.sheet_names.indexOf(sheet);
+    if (sheetIdx < 0) return null;
+    const cells = rest.split(":");
+    const start = parseA1Frontend(cells[0]);
+    if (!start) return null;
+    const end = cells.length === 2 ? parseA1Frontend(cells[1]) : start;
+    if (!end) return null;
+    return {
+      sheet: sheetIdx,
+      r1: Math.min(start.row, end.row),
+      c1: Math.min(start.col, end.col),
+      r2: Math.max(start.row, end.row),
+      c2: Math.max(start.col, end.col),
+    };
+  }
+
+  /// Pull the current defined-name list from the backend and rebuild
+  /// the cache used by F2 edit-mode highlighting.
+  async function refreshNameCache() {
+    try {
+      const names = await invoke<NamedRangeInfo[]>("list_named_ranges");
+      const next = new Map<string, ParsedNameRange>();
+      for (const n of names) {
+        const range = parseNameFormula(n.formula);
+        if (range) next.set(n.name.toLowerCase(), range);
+      }
+      nameCache = next;
+    } catch {
+      nameCache = new Map();
+    }
   }
 
   /// Lotus /R/N/L — drop the names list into the worksheet as a 2-column
