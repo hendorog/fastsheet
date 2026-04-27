@@ -91,6 +91,26 @@
   /// Formula trace popup — set to a TraceNode to show the popup,
   /// null to close. Driven by the /T menu items.
   let traceRoot = $state<TraceNode | null>(null);
+  /// Snapshot of (sheet, cursor) at the moment the trace popup
+  /// opened. Restored on Esc close so the user lands back where they
+  /// started. Cleared if they Enter-jump to a previewed cell instead.
+  let traceOriginCursor = $state<{
+    sheet: number;
+    selRow: number;
+    selCol: number;
+    rangeEndRow: number;
+    rangeEndCol: number;
+  } | null>(null);
+  /// Active reference highlights overlaid on the grid. Used by the
+  /// trace popup (single-element preview) and F2 edit-mode (one
+  /// per ref in the in-progress formula).
+  let refHighlights = $state<
+    { sheet: number; r1: number; c1: number; r2: number; c2: number; color: string }[]
+  >([]);
+  /// Tells Grid to scroll a non-cursor cell into view. Set to a new
+  /// object identity each time we want the scroll-on-target effect to
+  /// re-fire.
+  let scrollTarget = $state<{ row: number; col: number } | null>(null);
 
   /// Inline menu prompt — when set, the menu description bar becomes a
   /// single-line input. Used by menu actions that need a value (column
@@ -725,6 +745,7 @@
     }
     editing = false;
     editValue = "";
+    refHighlights = [];
     focusGrid();
   }
 
@@ -769,10 +790,67 @@
         row: selRow,
         col: selCol,
       });
+      // Snapshot where the user was so Esc-close can put them back.
+      traceOriginCursor = {
+        sheet: activeSheet,
+        selRow,
+        selCol,
+        rangeEndRow,
+        rangeEndCol,
+      };
       traceRoot = root;
     } catch (e) {
       statusMsg = `Trace failed: ${e}`;
     }
+  }
+
+  /// Called by FormulaTrace as the user moves through the list. We
+  /// switch sheets if needed and scroll the grid to the highlighted
+  /// item's cell — without changing the active selection cursor on
+  /// either sheet. Highlights show what the popup is pointing at.
+  async function tracePreview(node: TraceNode) {
+    if (node.sheet === null || node.row === null || node.col === null) {
+      // Defined-name or literal-with-no-coords — clear preview.
+      refHighlights = [];
+      scrollTarget = null;
+      return;
+    }
+    const targetSheet = node.sheet;
+    if (targetSheet !== activeSheet) {
+      await switchSheet(targetSheet);
+    }
+    // Build the highlight rectangle. Cells = single cell. Ranges keep
+    // their bounds from the address parsing in the backend; for now
+    // we only get top-left from the trace node, so for ranges we use
+    // (row,col) as the top-left and the popup's `address` already
+    // describes the bounds visually.
+    refHighlights = [
+      {
+        sheet: targetSheet,
+        r1: node.row,
+        c1: node.col,
+        r2: node.row,
+        c2: node.col,
+        color: "#ff8800",
+      },
+    ];
+    scrollTarget = { row: node.row, col: node.col };
+  }
+
+  async function closeTrace(restoreCursor: boolean) {
+    traceRoot = null;
+    refHighlights = [];
+    scrollTarget = null;
+    if (restoreCursor && traceOriginCursor) {
+      const o = traceOriginCursor;
+      if (o.sheet !== activeSheet) await switchSheet(o.sheet);
+      selRow = o.selRow;
+      selCol = o.selCol;
+      rangeEndRow = o.rangeEndRow;
+      rangeEndCol = o.rangeEndCol;
+    }
+    traceOriginCursor = null;
+    focusGrid();
   }
 
   /// /Trace Goto — list the top-level dependencies of the current cell's
@@ -898,6 +976,7 @@
       editValue = c?.input ?? "";
     }
     editing = true;
+    updateEditHighlights();
     // Explicit focus after the input is in the DOM — autofocus is flaky
     // in Svelte 5 when the element conditionally renders.
     tick().then(() => {
@@ -909,7 +988,61 @@
   function cancelEdit() {
     editing = false;
     editValue = "";
+    refHighlights = [];
   }
+
+  /// Parse `editValue` as an in-progress formula and update
+  /// `refHighlights` so the user can see what cells / ranges the
+  /// formula points at while they type. Limited to A1-style refs
+  /// (with optional sheet prefix) — defined names are not resolved
+  /// here yet (would need a per-keystroke list_names lookup).
+  /// Strings inside `"..."` are stripped first so cells named like
+  /// "M3" inside a string literal don't trigger highlights.
+  ///
+  /// Color cycles through a small palette so multiple distinct refs
+  /// in the same formula get different colors — easier to read at a
+  /// glance.
+  function updateEditHighlights() {
+    if (!editing || !workbook || !editValue.startsWith("=")) {
+      refHighlights = [];
+      return;
+    }
+    const palette = ["#0a84ff", "#34c759", "#ff9500", "#bf5af2", "#ff375f", "#5ac8fa"];
+    const stripped = editValue.replace(/"[^"]*"/g, '""');
+    const re = /(?:'([^']+)'!|([A-Za-z_][A-Za-z_0-9.]*)!)?(\$?[A-Z]{1,2}\$?\d+)(?::(\$?[A-Z]{1,2}\$?\d+))?/g;
+    const out: typeof refHighlights = [];
+    let m: RegExpExecArray | null;
+    let colorIdx = 0;
+    while ((m = re.exec(stripped)) !== null) {
+      const sheetName = m[1] ?? m[2] ?? null;
+      let sheetIdx = activeSheet;
+      if (sheetName) {
+        const idx = workbook.sheet_names.indexOf(sheetName);
+        if (idx < 0) continue;
+        sheetIdx = idx;
+      }
+      const startCell = parseA1Frontend(m[3]);
+      if (!startCell) continue;
+      const endCell = m[4] ? parseA1Frontend(m[4]) : startCell;
+      if (!endCell) continue;
+      out.push({
+        sheet: sheetIdx,
+        r1: Math.min(startCell.row, endCell.row),
+        c1: Math.min(startCell.col, endCell.col),
+        r2: Math.max(startCell.row, endCell.row),
+        c2: Math.max(startCell.col, endCell.col),
+        color: palette[colorIdx % palette.length],
+      });
+      colorIdx++;
+    }
+    refHighlights = out;
+  }
+
+  // Keep edit-mode highlights in sync with the input value.
+  $effect(() => {
+    editValue;
+    if (editing) updateEditHighlights();
+  });
 
   /// Excel F4: cycle the cell reference under the caret through
   /// A1 → $A$1 → A$1 → $A1 → A1. Token detection is liberal — anything
@@ -2692,6 +2825,12 @@
     if (menuPrompt) {
       return;
     }
+    // Trace popup owns all keys while visible — its own listener is on
+    // the capture phase, but we also gate here so F5 / Ctrl+R defangs
+    // above still work but selection-moving keys don't bleed through.
+    if (traceRoot) {
+      return;
+    }
     // Pending /Copy or /Move — arrow keys steer the destination, Enter
     // commits, Esc cancels. All other keys are swallowed so they can't
     // disturb the source selection.
@@ -3073,17 +3212,18 @@
   {#if traceRoot}
     <FormulaTrace
       root={traceRoot}
-      onClose={() => {
-        traceRoot = null;
-        focusGrid();
-      }}
+      onClose={() => closeTrace(true)}
+      onPreview={tracePreview}
       onJump={async (sheet, row, col) => {
+        // Explicit jump — close popup but DON'T restore origin cursor;
+        // the user picked this cell.
         if (sheet !== activeSheet) await switchSheet(sheet);
         selRow = row;
         selCol = col;
         rangeEndRow = row;
         rangeEndCol = col;
         growViewportToInclude(row, col);
+        await closeTrace(false);
       }}
     />
   {/if}
@@ -3098,6 +3238,8 @@
     {frozenCols}
     {mergedRanges}
     {ghostRange}
+    highlights={refHighlights.filter((h) => h.sheet === activeSheet)}
+    {scrollTarget}
     bind:selRow
     bind:selCol
     bind:rangeEndRow

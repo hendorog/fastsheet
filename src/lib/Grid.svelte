@@ -32,6 +32,18 @@
     /// destination preview. Cells in this range get a dashed outline
     /// without affecting the active selection.
     ghostRange: { r1: number; c1: number; r2: number; c2: number } | null;
+    /// Reference highlights — used by the formula-trace popup and F2
+    /// edit-mode to outline cells/ranges the formula refers to. Each
+    /// entry is one outlined box, independent of the selection. Cells
+    /// here aren't part of any range; they're purely visual hints.
+    highlights?: { r1: number; c1: number; r2: number; c2: number; color: string }[];
+    /// When set, the grid auto-scrolls to bring (row, col) into view
+    /// without changing the selection cursor. Used by trace preview
+    /// to follow the highlighted entry through the workbook. The page
+    /// is expected to set this once per highlight transition; the
+    /// effect re-runs on each new identity (set to null and back to
+    /// retrigger).
+    scrollTarget?: { row: number; col: number } | null;
     gridWrapEl?: HTMLDivElement | null;
     onDblClick: () => void;
     onResizeRow: (row: number, px: number) => void;
@@ -67,6 +79,8 @@
     frozenCols,
     mergedRanges,
     ghostRange,
+    highlights = [],
+    scrollTarget = null,
     gridWrapEl = $bindable(null),
     onDblClick,
     onResizeRow,
@@ -577,6 +591,43 @@
     scrollSelIntoView();
   });
 
+  /// Scroll a (row, col) into view WITHOUT touching the selection.
+  /// Mirrors scrollSelIntoView but reads the target from `scrollTarget`
+  /// so the trace-preview / F2-highlight flows can keep their target
+  /// cell visible while the user keeps their original cursor.
+  function scrollToTarget(row: number, col: number) {
+    if (!gridWrapEl) return;
+    const wrap = gridWrapEl;
+    const cellTop = (rowOffsets[row] ?? 0) + colhdrH;
+    const cellBottom = (rowOffsets[row + 1] ?? 0) + colhdrH;
+    const cellLeft = colLefts[col] ?? 0;
+    const cellRight = colLefts[col + 1] ?? 0;
+    const sTop = wrap.scrollTop;
+    const sLeft = wrap.scrollLeft;
+    const visTop = sTop + colhdrH;
+    const visBottom = sTop + viewportH;
+    const visLeft = sLeft + ROWHDR_W;
+    const visRight = sLeft + viewportW;
+    let dy = 0;
+    if (cellTop < visTop) dy = cellTop - visTop;
+    else if (cellBottom > visBottom) dy = cellBottom - visBottom;
+    let dx = 0;
+    if (cellLeft < visLeft) dx = cellLeft - visLeft;
+    else if (cellRight > visRight) dx = cellRight - visRight;
+    if (dx !== 0 || dy !== 0) {
+      scrollTop = sTop + dy;
+      scrollLeft = sLeft + dx;
+      flushSync();
+      wrap.scrollBy({ left: dx, top: dy, behavior: "instant" as ScrollBehavior });
+    }
+  }
+
+  $effect(() => {
+    if (!scrollTarget) return;
+    if (!gridWrapEl) return;
+    scrollToTarget(scrollTarget.row, scrollTarget.col);
+  });
+
   // Overlay-layer geometry. Computed once per reactive update and read
   // by the absolute-positioned overlay divs in the markup. Cells stay
   // independent of selRow/selCol so arrow keys don't trigger any
@@ -603,6 +654,15 @@
           height: (rowOffsets[ghostRange.r2 + 1] ?? 0) - (rowOffsets[ghostRange.r1] ?? 0),
         }
       : null,
+  );
+  let highlightBoxes = $derived.by(() =>
+    (highlights ?? []).map((h) => ({
+      top: colhdrH + (rowOffsets[h.r1] ?? 0),
+      left: colLefts[h.c1] ?? 0,
+      width: (colLefts[h.c2 + 1] ?? 0) - (colLefts[h.c1] ?? 0),
+      height: (rowOffsets[h.r2 + 1] ?? 0) - (rowOffsets[h.r1] ?? 0),
+      color: h.color,
+    })),
   );
   let fillBox = $derived.by(() => {
     const r = freeCorner === "tl" || freeCorner === "tr" ? rangeBounds.r1 : rangeBounds.r2;
@@ -790,6 +850,12 @@
       style={`top:${ghostBox.top}px; left:${ghostBox.left}px; width:${ghostBox.width}px; height:${ghostBox.height}px;`}
     ></div>
   {/if}
+  {#each highlightBoxes as h}
+    <div
+      class="ref-highlight"
+      style={`top:${h.top}px; left:${h.left}px; width:${h.width}px; height:${h.height}px; border-color: ${h.color}; box-shadow: 0 0 0 1px ${h.color} inset;`}
+    ></div>
+  {/each}
   <div
     class="sel-cell-outline"
     style={`top:${selBox.top}px; left:${selBox.left}px; width:${selBox.width}px; height:${selBox.height}px;`}
@@ -975,6 +1041,17 @@
     outline-offset: -1px;
     pointer-events: none;
     z-index: 9;
+  }
+  /* Reference highlight — outline-only box used by the formula trace
+     popup and F2 edit mode to show what cells/ranges a formula points
+     at. Border color is set per-instance so multiple refs in one
+     formula can be color-coded. */
+  .ref-highlight {
+    position: absolute;
+    border: 2px solid;
+    border-radius: 2px;
+    pointer-events: none;
+    z-index: 8;
   }
   /* Excel-style fill handle — moves to whichever corner of the
      selection rectangle is the "free" one (cycled by `.` in the

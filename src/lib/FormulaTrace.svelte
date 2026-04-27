@@ -19,8 +19,13 @@
     onClose: () => void;
     /// Called with (sheet, row, col) when user activates a cell node.
     onJump: (sheet: number, row: number, col: number) => void;
+    /// Called every time the keyboard highlight changes to a different
+    /// row. The page uses this to switch sheets / scroll the grid to
+    /// the previewed cell + show a reference outline, without changing
+    /// the active cursor.
+    onPreview?: (node: TraceNode) => void;
   };
-  let { root, onClose, onJump }: Props = $props();
+  let { root, onClose, onJump, onPreview }: Props = $props();
 
   /// Flat list of (node, depth, parent-collapse-key) — derived from
   /// the tree + the collapsed set so keyboard navigation is O(N) not
@@ -149,9 +154,21 @@
     });
   }
 
+  /// Fire onPreview whenever the keyboard highlight settles on a new
+  /// row. Skips the initial mount (no movement happened yet — the user
+  /// shouldn't be teleported to wherever they last were on each open).
+  let mounted = $state(false);
+  $effect(() => {
+    highlight;
+    if (!mounted) return;
+    const row = rows[highlight];
+    if (row && onPreview) onPreview(row.node);
+  });
+
   onMount(() => {
     // Capture-phase listener so the popup gets keys before the grid.
     window.addEventListener("keydown", onKey, true);
+    mounted = true;
     return () => window.removeEventListener("keydown", onKey, true);
   });
 
