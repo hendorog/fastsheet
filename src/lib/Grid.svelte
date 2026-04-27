@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { flushSync, tick } from "svelte";
+  import { flushSync, tick, untrack } from "svelte";
   import type { CellView } from "./types";
   import {
     autoFitColumnPx,
@@ -586,11 +586,20 @@
     }
   }
 
+  // Only fire scrollSelIntoView when selRow/selCol *change* — not when
+  // the reactive reads INSIDE scrollSelIntoView (rowOffsets, colhdrH,
+  // viewportH, ...) invalidate. Without `untrack` the parent's
+  // band-driven rowHeights map mutation during a mouse-wheel scroll
+  // re-derives rowOffsets, which re-fires this effect, which scrolls
+  // the cursor back into view — visible "snap back" while the user is
+  // mid-wheel.
   $effect(() => {
     selRow;
     selCol;
-    if (!gridWrapEl) return;
-    scrollSelIntoView();
+    untrack(() => {
+      if (!gridWrapEl) return;
+      scrollSelIntoView();
+    });
   });
 
   /// Scroll a (row, col) into view WITHOUT touching the selection.
@@ -626,8 +635,11 @@
 
   $effect(() => {
     if (!scrollTarget) return;
-    if (!gridWrapEl) return;
-    scrollToTarget(scrollTarget.row, scrollTarget.col);
+    const { row, col } = scrollTarget;
+    untrack(() => {
+      if (!gridWrapEl) return;
+      scrollToTarget(row, col);
+    });
   });
 
   // Overlay-layer geometry. Computed once per reactive update and read
