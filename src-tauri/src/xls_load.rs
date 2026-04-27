@@ -28,9 +28,10 @@
 //! falls back to the IronCalc save path (always produces .xlsx output).
 
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::time::Instant;
 
-use calamine::{open_workbook, Data, Reader, Xls};
+use calamine::{Data, Reader, Xls};
 use ironcalc::base::types::{
     Alignment, BorderItem, BorderStyle, HorizontalAlignment, VerticalAlignment,
 };
@@ -57,17 +58,16 @@ use crate::xls_biff::{
 ///      a temp file with that directory removed, and retry.
 /// We never use the VBA payload, so the fallback path produces a
 /// workbook indistinguishable from the original for our purposes.
-fn open_xls_with_vba_fallback(path: &str)
-    -> Result<Xls<std::io::BufReader<std::fs::File>>, String>
-{
-    let path_owned = path.to_string();
+fn open_xls_with_vba_fallback(
+    bytes: &[u8],
+) -> Result<Xls<Cursor<Vec<u8>>>, String> {
     // Silence the default panic-trace print — we're converting the
     // panic into an Err and don't want stderr noise. Restore the
     // previous hook before returning.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        open_workbook::<Xls<_>, _>(&path_owned)
+        Xls::new(Cursor::new(bytes.to_vec()))
     }));
     std::panic::set_hook(prev_hook);
     match opened {
@@ -77,26 +77,16 @@ fn open_xls_with_vba_fallback(path: &str)
             // Fall through to the VBA-strip retry below.
         }
     }
-    // Copy the file and strip the VBA storage. tempfile / std::env::temp_dir
-    // is fine — only used as a transient parsing workspace.
-    let stripped = strip_vba_to_temp(path).map_err(|e| {
+    let stripped = strip_vba_in_memory(bytes).map_err(|e| {
         format!(
             "calamine panicked decoding the workbook AND the VBA-strip \
              fallback failed: {e}"
         )
     })?;
-    let stripped_path = stripped.path.clone();
-    // Hold the TempXls drop guard alive only until calamine has
-    // ingested the file — calamine reads upfront on construction and
-    // we keep the Xls returning to the caller, which owns its own
-    // file handle into the stripped copy. We can delete the file when
-    // the Xls is dropped, but for now leak it (small temp footprint;
-    // the OS cleans /tmp eventually).
-    std::mem::forget(stripped);
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let retry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        open_workbook::<Xls<_>, _>(&stripped_path)
+        Xls::new(Cursor::new(stripped))
     }));
     std::panic::set_hook(prev_hook);
     match retry {
@@ -110,30 +100,11 @@ fn open_xls_with_vba_fallback(path: &str)
     }
 }
 
-struct TempXls {
-    path: String,
-}
-
-impl Drop for TempXls {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn strip_vba_to_temp(src: &str) -> Result<TempXls, String> {
-    let bytes = std::fs::read(src).map_err(|e| format!("read {src}: {e}"))?;
-    // Pick a stable temp name based on the source path so repeated
-    // opens don't pile up files.
-    let basename = std::path::Path::new(src)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("xls");
-    let mut tmp = std::env::temp_dir();
-    tmp.push(format!("fastsheet_novba_{basename}.xls"));
-    std::fs::write(&tmp, &bytes).map_err(|e| format!("write tmp: {e}"))?;
+fn strip_vba_in_memory(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut buf = Cursor::new(bytes.to_vec());
     {
-        let mut comp = cfb::open_rw(&tmp)
-            .map_err(|e| format!("cfb open_rw: {e}"))?;
+        let mut comp = cfb::CompoundFile::open(&mut buf)
+            .map_err(|e| format!("cfb open: {e}"))?;
         // Remove any VBA-related storage we know about. `_VBA_PROJECT_CUR`
         // is the canonical location; some files have additional
         // co-resident `VBA` / `Macros` storages.
@@ -142,10 +113,9 @@ fn strip_vba_to_temp(src: &str) -> Result<TempXls, String> {
                 let _ = comp.remove_storage_all(name);
             }
         }
+        comp.flush().map_err(|e| format!("cfb flush: {e}"))?;
     }
-    Ok(TempXls {
-        path: tmp.to_string_lossy().into_owned(),
-    })
+    Ok(buf.into_inner())
 }
 
 /// Phase timing for load_xls. Active when FASTSHEET_PROFILE_LOAD is set in
@@ -172,22 +142,26 @@ impl PhaseTimer {
 pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>>), String> {
     let mut timer = PhaseTimer::new();
     crate::util::profile_log(&format!("[load_xls] === path={path}"));
+    // Read the file ONCE, then drive both calamine and the BIFF
+    // scanner from the in-memory bytes. The previous version opened
+    // the file twice (calamine via path, scanner via cfb path) and
+    // each path-based open did many small reads to walk CFB headers
+    // / FAT / sectors. On a Windows .xls served from the WSL
+    // `\\wsl.localhost` share that's a 9P round-trip per read, and
+    // biff_scan ballooned from ~100ms to ~3700ms. Reading the whole
+    // file linearly into a Vec is one syscall pair in practice and
+    // lets cfb / calamine do all their seeks in RAM.
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("read {path}: {e}"))?;
+    timer.lap("read_bytes");
+
     // Calamine 0.26's xls reader unconditionally parses any embedded
-    // `_VBA_PROJECT_CUR` directory during `open_workbook`, and its CFB
+    // `_VBA_PROJECT_CUR` directory during `Xls::new`, and its CFB
     // RLE decompressor (cfb.rs:362) `assert_eq!`s the chunk signature
-    // — corrupt or non-standard VBA streams crash the whole
-    // process. We don't use the VBA payload
-    // anyway, so catch the unwind, surface it as a load error, and
-    // let the caller decide what to do (the GUI just shows a message
-    // and stays on the previous workbook).
-    // Try a normal calamine open first; fall back to a VBA-stripped
-    // copy if that panics (calamine 0.26's xls reader unconditionally
-    // parses any embedded `_VBA_PROJECT_CUR` directory and its CFB
-    // RLE decompressor `assert_eq!`s the chunk signature — corrupt or
-    // non-standard VBA streams crash the whole process). We don't use
-    // the VBA payload for anything, so the strip-and-retry path is
-    // safe.
-    let mut wb: Xls<_> = match open_xls_with_vba_fallback(path) {
+    // — corrupt or non-standard VBA streams crash the whole process.
+    // We don't use the VBA payload anyway, so the open helper catches
+    // the unwind and falls back to a VBA-stripped in-memory copy.
+    let mut wb: Xls<Cursor<Vec<u8>>> = match open_xls_with_vba_fallback(&bytes) {
         Ok(wb) => wb,
         Err(e) => return Err(format!("xls open: {e}")),
     };
@@ -197,11 +171,12 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
     }
     timer.lap("calamine_open");
 
-    // BIFF scan runs in parallel with calamine's own parse — it re-opens
-    // the CFB container and walks record types calamine doesn't surface
-    // (COLINFO, ROW, PANE, WINDOW2). Best-effort; an empty XlsShape just
-    // means everything falls back to IronCalc defaults.
-    let shape = scan_xls_shape(path);
+    // BIFF scan runs over the same in-memory bytes — it walks record
+    // types calamine doesn't surface (COLINFO, ROW, PANE, WINDOW2,
+    // FONT, XF, PALETTE, NAME, EXTERNNAME, ARRAY, SHRFMLA). Best-
+    // effort; an empty XlsShape just means everything falls back to
+    // IronCalc defaults.
+    let shape = scan_xls_shape(&bytes);
     timer.lap("biff_scan");
 
     // Sheet names that need quoting when referenced from formulas.

@@ -3319,8 +3319,8 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("fastsheet_xls_save_scanner_rt.xls");
         save_xls(&model, &path).expect("save_xls");
-        let path_str = path.to_string_lossy().into_owned();
-        let shape = scan_xls_shape(&path_str);
+        let bytes = std::fs::read(&path).expect("read saved xls");
+        let shape = scan_xls_shape(&bytes);
         // The reader doesn't expose sheet count directly; the SST and
         // BOUNDSHEET8 paths it walks shouldn't panic. As a soft signal,
         // a non-default palette or any populated map indicates it

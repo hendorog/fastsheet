@@ -328,8 +328,12 @@ fn builtin_format(idx: u16) -> Option<&'static str> {
 /// Parse the given .xls file and return its layout metadata. On any
 /// error the result is a partial (possibly empty) XlsShape — this is
 /// best-effort; the caller falls back to calamine-only behaviour.
-pub fn scan_xls_shape(path: &str) -> XlsShape {
-    let Ok(mut cfb) = cfb::open(path) else {
+pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
+    // Take an in-memory copy so cfb's many small seeks land in RAM
+    // rather than re-reading the source over a slow filesystem (e.g.
+    // the WSL `\\wsl.localhost` share via 9P).
+    let cursor = std::io::Cursor::new(bytes.to_vec());
+    let Ok(mut cfb) = cfb::CompoundFile::open(cursor) else {
         return XlsShape::default();
     };
     // The workbook BIFF stream lives in one of these entries depending
