@@ -25,6 +25,11 @@ your PC" prompt — fastsheet builds aren't yet code-signed. Click
 **Requirements:** Windows 10 1809+ or Windows 11. The WebView2
 runtime ships with both, so no extra install needed.
 
+**First-time users:** read [QUICKSTART.md](./QUICKSTART.md) for a
+keyboard-shortcut reference, the full `/` menu tree (with
+implemented vs not-yet-implemented marked), and a walkthrough of
+the formula-trace popup.
+
 ## Why
 
 Modern spreadsheet UIs are built around a mouse. fastsheet is built
