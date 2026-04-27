@@ -1,6 +1,9 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount, tick } from "svelte";
+  // Best-effort boot-trace mark. Active only when FASTSHEET_PROFILE_LOAD
+  // is set on the .exe — otherwise this Tauri command is a no-op.
+  invoke("profile_mark", { label: "script_loaded" }).catch(() => {});
   import Grid from "$lib/Grid.svelte";
   import Navigator from "$lib/Navigator.svelte";
   import SheetTabs from "$lib/SheetTabs.svelte";
@@ -2781,6 +2784,14 @@
   onMount(() => {
     window.addEventListener("keydown", onKey);
     window.addEventListener("contextmenu", blockContextMenu);
+    invoke("profile_mark", { label: "onMount" }).catch(() => {});
+    // After first paint — the moment the user can actually see and
+    // interact with the grid. This is the metric they care about.
+    tick().then(() => {
+      requestAnimationFrame(() => {
+        invoke("profile_mark", { label: "first_paint" }).catch(() => {});
+      });
+    });
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("contextmenu", blockContextMenu);

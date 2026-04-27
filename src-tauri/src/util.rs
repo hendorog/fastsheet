@@ -23,6 +23,16 @@ pub(crate) fn parse_attr_val(tag: &str, name: &str) -> Option<String> {
     Some(after[..end].to_string())
 }
 
+/// Process-start instant. Captured the first time `app_start_instant`
+/// is called (typically the very top of `lib::run`). Used by phases
+/// further down the boot path to compute "time since process start"
+/// for the profile log.
+pub(crate) fn app_start_instant() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
 /// Append a profile line to the profile log file when
 /// FASTSHEET_PROFILE_LOAD is set. Targets a log file because the
 /// Tauri GUI binary is built with subsystem=windows on Windows and

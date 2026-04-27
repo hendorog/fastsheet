@@ -21,13 +21,40 @@ pub use xlsx_load::{load_xlsx_with_fallback, replicate_my_array_formulas};
 
 use state::AppState;
 
+/// Frontend-callable: log a timestamp + label to the profile log,
+/// reporting elapsed-since-process-start so we can measure boot
+/// latency from launch to first interactive frame. Active only when
+/// FASTSHEET_PROFILE_LOAD is set; otherwise a no-op.
+#[tauri::command]
+fn profile_mark(label: String) {
+    let elapsed_ms = util::app_start_instant().elapsed().as_secs_f64() * 1000.0;
+    util::profile_log(&format!("[boot] {:>20} {:>7.1}ms (since process start)", label, elapsed_ms));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = util::app_start_instant();
+    util::profile_log("[boot] === process_start");
     wsl::apply_wsl_webkit_workaround();
+    util::profile_log(&format!(
+        "[boot] {:>20} {:>7.1}ms (since process start)",
+        "wsl_workaround",
+        util::app_start_instant().elapsed().as_secs_f64() * 1000.0
+    ));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::new())
+        .setup(|_app| {
+            let elapsed_ms = util::app_start_instant().elapsed().as_secs_f64() * 1000.0;
+            util::profile_log(&format!(
+                "[boot] {:>20} {:>7.1}ms (since process start)",
+                "tauri_setup",
+                elapsed_ms
+            ));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            profile_mark,
             workbook::open_workbook,
             workbook::new_workbook,
             workbook::save_workbook,
