@@ -351,6 +351,34 @@ pub(crate) fn cell_addr(row: u32, col: u32) -> String {
     format!("{}{}", col_letter(col), row)
 }
 
+/// Trace the dependency chain for the formula at (sheet, row, col).
+/// Returns a tree the frontend renders as a popup. Every cell node
+/// includes its address, formula text (if any), evaluated value, and
+/// recursively the cells/ranges/named-ranges its formula depends on.
+#[tauri::command]
+pub(crate) fn trace_formula(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    state: State<'_, AppState>,
+) -> Result<crate::trace::TraceNode, String> {
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    Ok(crate::trace::trace(model, sheet, row, col))
+}
+
+/// List every defined name in the workbook with its resolved formula
+/// string and (best-effort) jump target. Used by the /Formula Names
+/// menu option for browse + jump-to.
+#[tauri::command]
+pub(crate) fn list_named_ranges(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::trace::NamedRangeInfo>, String> {
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    Ok(crate::trace::list_named_ranges(model))
+}
+
 /// Create a workbook-scoped named range pointing at the given range.
 #[tauri::command]
 pub(crate) fn define_name(

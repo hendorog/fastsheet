@@ -7,6 +7,7 @@
   import Grid from "$lib/Grid.svelte";
   import Navigator from "$lib/Navigator.svelte";
   import SheetTabs from "$lib/SheetTabs.svelte";
+  import FormulaTrace from "$lib/FormulaTrace.svelte";
   import {
     buildMenu,
     saveMenuItems,
@@ -21,6 +22,8 @@
     WorkbookInfo,
     SaveResult,
     BackupResult,
+    TraceNode,
+    NamedRangeInfo,
   } from "$lib/types";
   import {
     addr,
@@ -84,6 +87,10 @@
   // file navigator state
   let navOpen = $state(false);
   let navMode = $state<"open" | "save">("open");
+
+  /// Formula trace popup — set to a TraceNode to show the popup,
+  /// null to close. Driven by the /T menu items.
+  let traceRoot = $state<TraceNode | null>(null);
 
   /// Inline menu prompt — when set, the menu description bar becomes a
   /// single-line input. Used by menu actions that need a value (column
@@ -751,6 +758,135 @@
     } catch (e) {
       statusMsg = `Recalc failed: ${e}`;
     }
+  }
+
+  /// /Trace Trace — open the dependency-tree popup for the current cell.
+  async function traceFormula() {
+    if (!workbook) return;
+    try {
+      const root = await invoke<TraceNode>("trace_formula", {
+        sheet: activeSheet,
+        row: selRow,
+        col: selCol,
+      });
+      traceRoot = root;
+    } catch (e) {
+      statusMsg = `Trace failed: ${e}`;
+    }
+  }
+
+  /// /Trace Goto — list the top-level dependencies of the current cell's
+  /// formula and prompt the user to jump to one. Reuses the menu prompt
+  /// candidates pattern so typing filters the list.
+  async function traceGoto() {
+    if (!workbook) return;
+    let root: TraceNode;
+    try {
+      root = await invoke<TraceNode>("trace_formula", {
+        sheet: activeSheet,
+        row: selRow,
+        col: selCol,
+      });
+    } catch (e) {
+      statusMsg = `Trace failed: ${e}`;
+      return;
+    }
+    if (root.deps.length === 0) {
+      statusMsg = `${root.address} has no dependencies (kind: ${root.kind})`;
+      return;
+    }
+    // Build candidate strings — "Discount!E20 = Hybrid Structured Luff" —
+    // and a parallel index of jump targets so submission can resolve
+    // back to the chosen dep.
+    const candidates: string[] = [];
+    const targets: TraceNode[] = [];
+    for (const d of root.deps) {
+      const value = d.value || "(empty)";
+      candidates.push(`${d.address}  =  ${value}`);
+      targets.push(d);
+    }
+    openMenuPrompt(
+      `Jump to dependency of ${root.address}:`,
+      "",
+      async (v) => {
+        // Match by exact candidate (the user picked from the list)
+        // or by leading-substring on address.
+        const idx = candidates.findIndex((c) => c === v) >= 0
+          ? candidates.findIndex((c) => c === v)
+          : targets.findIndex((t) => t.address.toLowerCase().startsWith(v.trim().toLowerCase()));
+        if (idx < 0) {
+          statusMsg = `No matching dependency: ${v}`;
+          focusGrid();
+          return;
+        }
+        const t = targets[idx];
+        if (t.kind === "name") {
+          // Defined name → jumpToAddress will resolve it via list_names.
+          const ok = await jumpToAddress(t.address);
+          if (!ok) statusMsg = `Could not resolve ${t.address}`;
+        } else if (t.sheet !== null && t.row !== null && t.col !== null) {
+          if (t.sheet !== activeSheet) await switchSheet(t.sheet);
+          selRow = t.row;
+          selCol = t.col;
+          rangeEndRow = t.row;
+          rangeEndCol = t.col;
+          growViewportToInclude(t.row, t.col);
+        }
+        focusGrid();
+      },
+      undefined,
+      candidates,
+    );
+  }
+
+  /// /Trace Names — browse all defined names with their resolved
+  /// locations and jump to the chosen one.
+  async function traceNames() {
+    if (!workbook) return;
+    let names: NamedRangeInfo[];
+    try {
+      names = await invoke<NamedRangeInfo[]>("list_named_ranges");
+    } catch (e) {
+      statusMsg = `List names failed: ${e}`;
+      return;
+    }
+    if (names.length === 0) {
+      statusMsg = "No defined names in this workbook";
+      return;
+    }
+    const candidates = names.map(
+      (n) => `${n.name}  →  ${n.formula}  ${n.scope}`,
+    );
+    openMenuPrompt(
+      `Jump to named range (${names.length} total):`,
+      "",
+      async (v) => {
+        const exact = candidates.indexOf(v);
+        const idx = exact >= 0
+          ? exact
+          : names.findIndex((n) => n.name.toLowerCase() === v.trim().toLowerCase());
+        if (idx < 0) {
+          statusMsg = `No matching name: ${v}`;
+          focusGrid();
+          return;
+        }
+        const n = names[idx];
+        if (n.jump_sheet === null || n.jump_row === null || n.jump_col === null) {
+          statusMsg = `${n.name}: cannot jump (formula = ${n.formula})`;
+          focusGrid();
+          return;
+        }
+        if (n.jump_sheet !== activeSheet) await switchSheet(n.jump_sheet);
+        selRow = n.jump_row;
+        selCol = n.jump_col;
+        rangeEndRow = n.jump_row;
+        rangeEndCol = n.jump_col;
+        growViewportToInclude(n.jump_row, n.jump_col);
+        focusGrid();
+      },
+      undefined,
+      candidates,
+    );
   }
 
   function startEdit(seed?: string) {
@@ -2440,6 +2576,9 @@
     sheetNew: addSheet,
     sheetDelete: () => deleteSheetConfirm(activeSheet),
     sheetRename: () => renameSheetPrompt(activeSheet),
+    traceFormula,
+    traceGoto,
+    traceNames,
   });
 
   let levelItems = $derived(
@@ -2928,6 +3067,24 @@
         focusGrid();
       }}
       onStatus={(m) => (statusMsg = m)}
+    />
+  {/if}
+
+  {#if traceRoot}
+    <FormulaTrace
+      root={traceRoot}
+      onClose={() => {
+        traceRoot = null;
+        focusGrid();
+      }}
+      onJump={async (sheet, row, col) => {
+        if (sheet !== activeSheet) await switchSheet(sheet);
+        selRow = row;
+        selCol = col;
+        rangeEndRow = row;
+        rangeEndCol = col;
+        growViewportToInclude(row, col);
+      }}
     />
   {/if}
 

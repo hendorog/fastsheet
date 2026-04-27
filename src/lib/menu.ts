@@ -58,6 +58,10 @@ export type MenuCallbacks = {
   sheetNew: () => void | Promise<void>;
   sheetDelete: () => void | Promise<void>;
   sheetRename: () => void | Promise<void>;
+  // /Trace — formula dependency tools.
+  traceFormula: () => void | Promise<void>;
+  traceGoto: () => void | Promise<void>;
+  traceNames: () => void | Promise<void>;
 };
 
 export type FormatKind =
@@ -267,6 +271,27 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
       ],
     },
     { letter: "S", label: "System", description: "Temporarily exit to operating system", action: stb("System") },
+    {
+      letter: "T", label: "Trace",
+      description: "Formula dependency tools — trace, jump to dependency, browse named ranges",
+      children: [
+        {
+          letter: "T", label: "Trace",
+          description: "Show the dependency chain of the current cell's formula in a popup",
+          action: cb.traceFormula,
+        },
+        {
+          letter: "G", label: "Goto",
+          description: "Jump to a top-level dependency of the current cell's formula",
+          action: cb.traceGoto,
+        },
+        {
+          letter: "N", label: "Names",
+          description: "Browse the workbook's named ranges and jump to one",
+          action: cb.traceNames,
+        },
+      ],
+    },
     {
       letter: "Q", label: "Quit",
       description: "End the spreadsheet session",

@@ -3,6 +3,7 @@ mod hidden;
 mod index;
 mod navigator;
 mod state;
+pub mod trace;
 mod util;
 mod workbook;
 mod wsl;
@@ -91,6 +92,8 @@ pub fn run() {
             cells::recalc,
             cells::cell_addr,
             cells::jump_edge,
+            cells::trace_formula,
+            cells::list_named_ranges,
             navigator::start_dir,
             navigator::home_dir_path,
             navigator::list_dir,

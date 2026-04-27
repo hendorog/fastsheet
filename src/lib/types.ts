@@ -78,3 +78,27 @@ export type SaveResult = {
 };
 
 export type BackupResult = { save: SaveResult; backup_path: string };
+
+export type TraceNode = {
+  address: string;
+  kind: "cell" | "range" | "name" | "literal" | "error";
+  sheet: number | null;
+  row: number | null;
+  col: number | null;
+  formula: string | null;
+  value: string;
+  note: string | null;
+  is_error: boolean;
+  cycle: boolean;
+  truncated: boolean;
+  deps: TraceNode[];
+};
+
+export type NamedRangeInfo = {
+  name: string;
+  formula: string;
+  scope: string;
+  jump_sheet: number | null;
+  jump_row: number | null;
+  jump_col: number | null;
+};

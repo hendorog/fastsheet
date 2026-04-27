@@ -48,6 +48,8 @@ fn main() {
                     }
                     println!("  PROBE cell: {cell:?}");
                 }
+                let v = model.get_formatted_cell_value(s as u32, r, c).unwrap_or_default();
+                println!("  PROBE formatted: {v:?}");
             }
         }
     }
