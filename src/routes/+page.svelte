@@ -91,6 +91,12 @@
   /// Formula trace popup — set to a TraceNode to show the popup,
   /// null to close. Driven by the /T menu items.
   let traceRoot = $state<TraceNode | null>(null);
+  /// Layout flags for the popup, two-way bound. `docked` flips it
+  /// from centered modal to a right-side panel; `hidden` collapses
+  /// it to a tiny bar so the user can keep interacting with the
+  /// grid without dropping trace state.
+  let traceDocked = $state(false);
+  let traceHidden = $state(false);
   /// Snapshot of (sheet, cursor) at the moment the trace popup
   /// opened. Restored on Esc close so the user lands back where they
   /// started. Cleared if they Enter-jump to a previewed cell instead.
@@ -882,6 +888,8 @@
 
   async function closeTrace(restoreCursor: boolean) {
     traceRoot = null;
+    traceDocked = false;
+    traceHidden = false;
     refHighlights = [];
     scrollTarget = null;
     if (restoreCursor && traceOriginCursor) {
@@ -2961,10 +2969,12 @@
     if (menuPrompt) {
       return;
     }
-    // Trace popup owns all keys while visible — its own listener is on
-    // the capture phase, but we also gate here so F5 / Ctrl+R defangs
-    // above still work but selection-moving keys don't bleed through.
-    if (traceRoot) {
+    // Trace popup owns all keys while visible (modal or docked) —
+    // its own listener is on the capture phase, but we also gate
+    // here so selection-moving keys don't bleed through. While
+    // hidden the popup is collapsed to a tiny status bar and gives
+    // up the keyboard, so the grid runs as normal.
+    if (traceRoot && !traceHidden) {
       return;
     }
     // Pending /Copy or /Move — arrow keys steer the destination, Enter
@@ -3350,15 +3360,25 @@
       root={traceRoot}
       onClose={() => closeTrace(true)}
       onPreview={tracePreview}
-      onJump={async (sheet, row, col) => {
-        // Explicit jump — close popup but DON'T restore origin cursor;
-        // the user picked this cell.
-        if (sheet !== activeSheet) await switchSheet(sheet);
-        selRow = row;
-        selCol = col;
-        rangeEndRow = row;
-        rangeEndCol = col;
-        growViewportToInclude(row, col);
+      bind:docked={traceDocked}
+      bind:hidden={traceHidden}
+      onJump={async (node) => {
+        // Resolve coords by kind — name nodes carry their range in
+        // node.value; cell / range nodes have explicit (sheet,row,col).
+        let target: { sheet: number; row: number; col: number } | null = null;
+        if (node.kind === "name") {
+          const range = parseNameFormula(node.value);
+          if (range) target = { sheet: range.sheet, row: range.r1, col: range.c1 };
+        } else if (node.sheet !== null && node.row !== null && node.col !== null) {
+          target = { sheet: node.sheet, row: node.row, col: node.col };
+        }
+        if (!target) return;
+        if (target.sheet !== activeSheet) await switchSheet(target.sheet);
+        selRow = target.row;
+        selCol = target.col;
+        rangeEndRow = target.row;
+        rangeEndCol = target.col;
+        growViewportToInclude(target.row, target.col);
         await closeTrace(false);
       }}
     />

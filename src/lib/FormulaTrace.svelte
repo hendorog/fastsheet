@@ -17,15 +17,32 @@
   type Props = {
     root: TraceNode;
     onClose: () => void;
-    /// Called with (sheet, row, col) when user activates a cell node.
-    onJump: (sheet: number, row: number, col: number) => void;
+    /// Called when user activates (Enter / click) a row. The page
+    /// handler decides what to do based on node.kind — cells and
+    /// ranges jump to (sheet,row,col); names parse the resolved
+    /// formula text and jump to that range's top-left.
+    onJump: (node: TraceNode) => void | Promise<void>;
     /// Called every time the keyboard highlight changes to a different
     /// row. The page uses this to switch sheets / scroll the grid to
     /// the previewed cell + show a reference outline, without changing
     /// the active cursor.
     onPreview?: (node: TraceNode) => void;
+    /// Two-way bindable layout flags. `docked` shifts the popup from
+    /// centered modal to a right-side panel that doesn't dim the
+    /// grid. `hidden` collapses the popup to a tiny status bar so
+    /// the user can interact with the grid without losing trace
+    /// state. Both default false; toggled by D and H respectively.
+    docked?: boolean;
+    hidden?: boolean;
   };
-  let { root, onClose, onJump, onPreview }: Props = $props();
+  let {
+    root,
+    onClose,
+    onJump,
+    onPreview,
+    docked = $bindable(false),
+    hidden = $bindable(false),
+  }: Props = $props();
 
   /// Flat list of (node, depth, parent-collapse-key) — derived from
   /// the tree + the collapsed set so keyboard navigation is O(N) not
@@ -74,44 +91,69 @@
     collapsed = next;
   }
 
-  function jumpRow(row: FlatRow) {
+  async function jumpRow(row: FlatRow) {
     const n = row.node;
-    if (n.kind === "cell" && n.sheet !== null && n.row !== null && n.col !== null) {
-      onJump(n.sheet, n.row, n.col);
-      onClose();
-    } else if (n.kind === "range" && n.sheet !== null && n.row !== null && n.col !== null) {
-      // Jump to top-left of the range.
-      onJump(n.sheet, n.row, n.col);
-      onClose();
-    }
+    // Skip jump for literals + cycles (no useful target). Everything
+    // else — cells, ranges, named ranges — is handled by the parent.
+    if (n.kind === "literal" && n.sheet === null) return;
+    if (n.cycle) return;
+    await onJump(n);
+    onClose();
   }
 
   function onKey(e: KeyboardEvent) {
+    // Esc always closes, regardless of mode — escape hatch from any
+    // state. Stop propagation so the grid's onKey doesn't see it.
     if (e.key === "Escape") {
       e.preventDefault();
+      e.stopPropagation();
       onClose();
       return;
     }
+    // H toggles hidden — works in all modes. When hidden the popup
+    // becomes a tiny status bar and gives up the keyboard so the
+    // grid runs normally; H brings it back.
+    if (e.key === "h" || e.key === "H") {
+      e.preventDefault();
+      e.stopPropagation();
+      hidden = !hidden;
+      return;
+    }
+    // D toggles docked. If hidden, also un-hide (D = "show me docked").
+    if (e.key === "d" || e.key === "D") {
+      e.preventDefault();
+      e.stopPropagation();
+      docked = !docked;
+      hidden = false;
+      return;
+    }
+    // While hidden the popup gives up all OTHER keys to the grid.
+    // Only Esc / H / D above apply.
+    if (hidden) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
+      e.stopPropagation();
       highlight = Math.min(highlight + 1, rows.length - 1);
       scrollHighlightIntoView();
       return;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
+      e.stopPropagation();
       highlight = Math.max(highlight - 1, 0);
       scrollHighlightIntoView();
       return;
     }
     if (e.key === "ArrowRight") {
       e.preventDefault();
+      e.stopPropagation();
       const r = rows[highlight];
       if (r && collapsed.has(r.key)) toggle(r);
       return;
     }
     if (e.key === "ArrowLeft") {
       e.preventDefault();
+      e.stopPropagation();
       const r = rows[highlight];
       if (!r) return;
       if (r.node.deps.length > 0 && !collapsed.has(r.key)) {
@@ -130,17 +172,20 @@
     }
     if (e.key === "Enter") {
       e.preventDefault();
+      e.stopPropagation();
       const r = rows[highlight];
       if (r) jumpRow(r);
       return;
     }
     if (e.key === "*") {
       e.preventDefault();
+      e.stopPropagation();
       expandAll();
       return;
     }
     if (e.key === "/") {
       e.preventDefault();
+      e.stopPropagation();
       collapseAll();
       return;
     }
@@ -182,11 +227,25 @@
   }
 </script>
 
-<div class="overlay" role="dialog" aria-label="Formula trace">
-  <div class="popup">
+{#if hidden}
+  <!-- Collapsed: tiny status bar at the bottom-right. The popup
+       gives up keyboard focus to the grid; only H / D / Esc still
+       hit the popup's listener. -->
+  <div class="collapsed-bar" role="status">
+    <span class="collapsed-icon">↶</span>
+    <span class="collapsed-text">Trace: {root.address}</span>
+    <span class="collapsed-hint">H show · D dock · Esc close</span>
+  </div>
+{:else}
+  {#if !docked}
+    <!-- Modal: dark overlay, centered. Click outside doesn't close
+         (matches Esc-only convention used elsewhere in the app). -->
+    <div class="overlay" role="presentation"></div>
+  {/if}
+  <div class="popup" class:docked role="dialog" aria-label="Formula trace">
     <div class="header">
       <span class="title">Formula trace — {root.address}</span>
-      <span class="hint">↑↓ move · Enter jump · ← → fold · * expand all · / collapse all · Esc close</span>
+      <span class="hint">↑↓ Enter ←→ · * / · H hide · D {docked ? "undock" : "dock"} · Esc close</span>
     </div>
     <div class="list" bind:this={listEl}>
       {#each rows as row, i}
@@ -225,30 +284,82 @@
       {/each}
     </div>
   </div>
-</div>
+{/if}
 
 <style>
   .overlay {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, 0.55);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
+    z-index: 999;
   }
   .popup {
+    position: fixed;
     background: #1a1a1a;
     color: #ddd;
     border: 1px solid #444;
     border-radius: 4px;
-    width: min(1100px, 95vw);
-    max-height: 85vh;
     display: flex;
     flex-direction: column;
     font-family: monospace;
     font-size: 13px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    z-index: 1000;
+    /* Modal default: centered. */
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(1100px, 95vw);
+    max-height: 85vh;
+  }
+  /* Docked: pinned to the right edge as a full-height panel. No
+     overlay backdrop — user can see the grid behind. */
+  .popup.docked {
+    top: 0;
+    left: auto;
+    right: 0;
+    bottom: 0;
+    transform: none;
+    width: min(560px, 50vw);
+    max-height: 100vh;
+    border-radius: 0;
+    border-left: 1px solid #444;
+    border-top: none;
+    border-right: none;
+    border-bottom: none;
+  }
+  /* Collapsed: tiny status bar at bottom-right. The popup is hidden
+     in this state; this bar is the only visible reminder that a
+     trace is still active. */
+  .collapsed-bar {
+    position: fixed;
+    bottom: 0;
+    right: 0;
+    background: #2a2a2a;
+    border-top: 1px solid #444;
+    border-left: 1px solid #444;
+    border-radius: 4px 0 0 0;
+    padding: 4px 10px;
+    font-family: monospace;
+    font-size: 12px;
+    color: #ddd;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    z-index: 1000;
+    pointer-events: none;
+  }
+  .collapsed-icon {
+    color: #e8c068;
+    font-weight: bold;
+  }
+  .collapsed-text {
+    color: #e8c068;
+    font-weight: bold;
+  }
+  .collapsed-hint {
+    color: #888;
+    font-size: 11px;
   }
   .header {
     padding: 8px 12px;
