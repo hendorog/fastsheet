@@ -167,6 +167,7 @@ pub(crate) fn get_cells(
     end_col: u32,
     state: State<'_, AppState>,
 ) -> Result<Vec<CellView>, String> {
+    let t0 = std::time::Instant::now();
     let guard = state.model.lock().unwrap();
     let model = guard.as_ref().ok_or("no workbook open")?;
     let mut out =
@@ -219,6 +220,17 @@ pub(crate) fn get_cells(
             });
         }
     }
+    let cells_count = out.len();
+    let area = (end_row - start_row + 1) * (end_col - start_col + 1);
+    crate::util::profile_log(&format!(
+        "[get_cells] sheet={} {}x{} area={} kept={} {:>7.1}ms",
+        sheet,
+        end_row - start_row + 1,
+        end_col - start_col + 1,
+        area,
+        cells_count,
+        t0.elapsed().as_secs_f64() * 1000.0
+    ));
     Ok(out)
 }
 
@@ -231,6 +243,7 @@ pub(crate) fn get_layout(
     end_col: u32,
     state: State<'_, AppState>,
 ) -> Result<LayoutData, String> {
+    let t0 = std::time::Instant::now();
     let guard = state.model.lock().unwrap();
     let model = guard.as_ref().ok_or("no workbook open")?;
     let ws = model
@@ -270,13 +283,21 @@ pub(crate) fn get_layout(
         };
         row_heights.push((row, h));
     }
-    Ok(LayoutData {
+    let layout = LayoutData {
         col_widths,
         row_heights,
         frozen_rows: ws.frozen_rows,
         frozen_cols: ws.frozen_columns,
         merged_ranges: ws.merge_cells.clone(),
-    })
+    };
+    crate::util::profile_log(&format!(
+        "[get_layout] sheet={} rows={} cols={} {:>7.1}ms",
+        sheet,
+        end_row - start_row + 1,
+        end_col - start_col + 1,
+        t0.elapsed().as_secs_f64() * 1000.0
+    ));
+    Ok(layout)
 }
 
 #[tauri::command]
@@ -320,7 +341,9 @@ pub(crate) fn recalc(state: State<'_, AppState>) -> Result<u128, String> {
     let model = guard.as_mut().ok_or("no workbook open")?;
     let t0 = Instant::now();
     model.evaluate();
-    Ok(t0.elapsed().as_millis())
+    let ms = t0.elapsed().as_millis();
+    crate::util::profile_log(&format!("[recalc] {:>7}ms", ms));
+    Ok(ms)
 }
 
 #[tauri::command]

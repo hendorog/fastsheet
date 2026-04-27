@@ -115,7 +115,7 @@ impl Styles {
         None
     }
 
-    pub(crate) fn get_style_index_or_create(&mut self, style: &Style) -> i32 {
+    pub fn get_style_index_or_create(&mut self, style: &Style) -> i32 {
         // Check if style exist. If so sets style cell number to that otherwise create a new style.
         if let Some(index) = self.get_style_index(style) {
             index

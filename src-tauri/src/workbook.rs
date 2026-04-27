@@ -45,6 +45,22 @@ pub(crate) fn open_workbook(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<WorkbookInfo, String> {
+    // Phase timing for the full open-file flow. Active when
+    // FASTSHEET_PROFILE_LOAD is set. Includes everything from file
+    // detection through state install — i.e. the wall-clock the user
+    // sees from clicking Open to the GUI being ready to render.
+    let total = std::time::Instant::now();
+    crate::util::profile_log(&format!("[open_workbook] === path={path}"));
+    let mut t = std::time::Instant::now();
+    let lap = |t: &mut std::time::Instant, label: &str| {
+        crate::util::profile_log(&format!(
+            "[open_workbook] {:>20} {:>7.1}ms",
+            label,
+            t.elapsed().as_secs_f64() * 1000.0
+        ));
+        *t = std::time::Instant::now();
+    };
+
     let is_xls = std::path::Path::new(&path)
         .extension()
         .and_then(|s| s.to_str())
@@ -68,7 +84,9 @@ pub(crate) fn open_workbook(
         }
         m
     };
+    lap(&mut t, "load+replicate");
     model.evaluate();
+    lap(&mut t, "evaluate");
     let names: Vec<String> = model
         .workbook
         .worksheets
@@ -111,10 +129,17 @@ pub(crate) fn open_workbook(
     } else {
         *state.loaded.lock().unwrap() = None;
     }
+    lap(&mut t, "snapshot+hidden");
     *state.hidden_cols.lock().unwrap() = hidden_cols_init;
     state.dirty.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
     let _ = record_open_internal(&state, &path);
+    lap(&mut t, "state_install");
+    crate::util::profile_log(&format!(
+        "[open_workbook] {:>20} {:>7.1}ms",
+        "TOTAL",
+        total.elapsed().as_secs_f64() * 1000.0
+    ));
     Ok(info)
 }
 

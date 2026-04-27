@@ -28,6 +28,7 @@
 //! falls back to the IronCalc save path (always produces .xlsx output).
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use calamine::{open_workbook, Data, Reader, Xls};
 use ironcalc::base::types::{
@@ -147,7 +148,30 @@ fn strip_vba_to_temp(src: &str) -> Result<TempXls, String> {
     })
 }
 
+/// Phase timing for load_xls. Active when FASTSHEET_PROFILE_LOAD is set in
+/// the environment. Each phase appends its wall-clock elapsed to the
+/// profile log (see `util::profile_log`).
+struct PhaseTimer {
+    start: Instant,
+}
+
+impl PhaseTimer {
+    fn new() -> Self {
+        Self { start: Instant::now() }
+    }
+    fn lap(&mut self, label: &str) {
+        crate::util::profile_log(&format!(
+            "[load_xls] {:>20} {:>7.1}ms",
+            label,
+            self.start.elapsed().as_secs_f64() * 1000.0
+        ));
+        self.start = Instant::now();
+    }
+}
+
 pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>>), String> {
+    let mut timer = PhaseTimer::new();
+    crate::util::profile_log(&format!("[load_xls] === path={path}"));
     // Calamine 0.26's xls reader unconditionally parses any embedded
     // `_VBA_PROJECT_CUR` directory during `open_workbook`, and its CFB
     // RLE decompressor (cfb.rs:362) `assert_eq!`s the chunk signature
@@ -171,12 +195,14 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
     if sheet_names.is_empty() {
         return Err("xls file has no sheets".to_string());
     }
+    timer.lap("calamine_open");
 
     // BIFF scan runs in parallel with calamine's own parse — it re-opens
     // the CFB container and walks record types calamine doesn't surface
     // (COLINFO, ROW, PANE, WINDOW2). Best-effort; an empty XlsShape just
     // means everything falls back to IronCalc defaults.
     let shape = scan_xls_shape(path);
+    timer.lap("biff_scan");
 
     // Sheet names that need quoting when referenced from formulas.
     // Excel's grammar: any non-alphanumeric-underscore char, or a name
@@ -205,6 +231,7 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
             .add_sheet(name)
             .map_err(|e| format!("add_sheet({name}): {e}"))?;
     }
+    timer.lap("model_init");
 
     // Load defined names before cells so formulas that reference them
     // resolve rather than evaluating to #REF!. Two BIFF quirks to
@@ -254,6 +281,7 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
         let quoted = quote_sheet_refs(&normalized, &names_needing_quotes);
         let _ = model.new_defined_name(raw_name, None, &quoted);
     }
+    timer.lap("defined_names");
 
     for (sheet_idx, name) in sheet_names.iter().enumerate() {
         let formulas = wb.worksheet_formula(name).ok();
@@ -481,6 +509,7 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
             }
         }
     }
+    timer.lap("cell_loop");
 
     // Per-cell styling from the BIFF XF + FONT + PALETTE scan. For each
     // cell with an XF, pull the referenced font and apply bold/italic/
@@ -516,37 +545,77 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
         .map(|f| f.name.clone())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "Arial".to_string());
+    // Style + number-format application, in a single pass with a per-ixfe
+    // index cache.
+    //
+    // The naive version (the previous two loops) called
+    // `Model::set_cell_style(&Style)` once per cell, and that internally
+    // does an O(unique_styles) linear scan with a Style clone+compare per
+    // step in `get_style_index_or_create`. On a 30k-styled-cell workbook
+    // with ~200 unique XFs that's ~6M Style clones; Hetairos paid 2.5s
+    // total for this dance.
+    //
+    // Now: build the merged Style fresh ONCE per unique ixfe, register
+    // it once via `get_style_index_or_create`, cache the returned i32,
+    // and write the index directly to each subsequent cell via the cheap
+    // worksheet-level setter. The cache key is just `ixfe` because all
+    // cells start at default style 0 at this point in load — the only
+    // exception is date-typed cells that already had a numfmt applied
+    // earlier (see Data::DateTime branch in the cell loop), which take
+    // the slow per-cell path so their pre-existing fields aren't lost.
+    //
+    // Numfmt application is folded into the same pass — the previous
+    // separate loop was paying the same get/set cost a second time.
+    //
+    // IronCalc's formatter rejects some BIFF format strings (conditional
+    // `[Red]`, locale prefixes, custom text literals) and turns the cell
+    // into `#ERROR!`. Heuristic-gate to "safe" strings: digit-grouping,
+    // decimals, percent, currency, and date tokens. Force-apply
+    // everything via FASTSHEET_XLS_APPLY_NUMFMT=all for diagnostics.
+    let force_all_numfmt = std::env::var("FASTSHEET_XLS_APPLY_NUMFMT")
+        .map(|v| v == "all")
+        .unwrap_or(false);
+    let mut style_cache: HashMap<u16, i32> = HashMap::new();
     for (&(sheet, row, col), &ixfe) in &shape.cell_xfs {
         let xf = match shape.xfs.get(ixfe as usize) {
             Some(x) => x,
             None => continue,
         };
-        // Resolve the effective font_idx via XF inheritance. If this
-        // cell XF has fAtrFnt=0 it doesn't override the parent style
-        // XF's font — many real-world templates use that pattern for
-        // "bordered but otherwise default" cells, which previously
-        // rendered at the XF's literal font (Arial 14 bold) instead
-        // of the inherited default (Calibri 11).
-        // Real-world Excel templates routinely store cell XFs whose
-        // font_idx points to a font with bold/italic/etc flipped
-        // versus the parent style font but `fAtrFnt` cleared anyway.
-        // A strict spec-only resolver picks one of the two and ends
-        // up wrong; we use a tiered rule that matches what Excel
-        // actually renders:
-        //
-        //   1. If cell.font_idx == 0 (the BIFF "use workbook default"
-        //      placeholder), use font[0] directly — ignore the parent
-        //      style chain entirely. This is the dominant case for
-        //      cost-summary numeric cells like Main!J3:J12 whose
-        //      style XFs walk to a Calibri 9 parent that was used for
-        //      borders/fills only, not for sizing the actual text.
-        //   2. Otherwise (cell.font_idx > 0), the cell author meant
-        //      something non-default — use bold/italic/underline/
-        //      strike/color from the cell font, but size + face from
-        //      the parent style font (so cells that flip on bold via
-        //      a stale font_idx like Arial 14 don't visually balloon
-        //      compared to their neighbours; Excel renders these at
-        //      the surrounding 11pt with bold added).
+
+        // Resolve the numfmt to apply for this XF, if any.
+        let numfmt_override: Option<&str> = shape
+            .formats
+            .get(&xf.fmt_idx)
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty() && *s != "General")
+            .filter(|s| force_all_numfmt || is_safe_numfmt(s));
+
+        // Fast path: cell hasn't been styled yet, and we already built
+        // the merged Style for this ixfe. Just write the cached index.
+        let pre_existing_idx = model.get_cell_style_index(sheet, row, col).unwrap_or(0);
+        if pre_existing_idx == 0 {
+            if let Some(&cached) = style_cache.get(&ixfe) {
+                if let Ok(ws) = model.workbook.worksheet_mut(sheet) {
+                    let _ = ws.set_cell_style(row, col, cached);
+                }
+                continue;
+            }
+        }
+
+        // Slow path: build the merged Style for this XF, register it,
+        // and cache the resulting index for subsequent cells with the
+        // same ixfe. Resolve the effective font_idx via XF inheritance.
+        // If this cell XF has fAtrFnt=0 it doesn't override the parent
+        // style XF's font — many real-world templates use that pattern
+        // for "bordered but otherwise default" cells. Tiered rule:
+        //   1. cell.font_idx == 0 → use workbook default font directly,
+        //      ignore the parent style chain. Dominant case for cost-
+        //      summary numeric cells whose style XFs walk to a font
+        //      that was used for borders/fills only.
+        //   2. cell.font_idx > 0 → bold/italic/underline/strike/color
+        //      from cell font, size+face from parent style font (so
+        //      cells with stale Arial 14 pointers don't visually
+        //      balloon next to 11pt neighbours).
         //   3. Style XFs themselves keep their resolved font as-is.
         let resolved_font_idx = resolve_xf_font(&shape.xfs, ixfe);
         let resolved_font = match shape.fonts.get(resolved_font_idx as usize) {
@@ -571,16 +640,11 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
             resolved_font.clone()
         };
         let font = &font;
-        // Font has inheritance applied (resolve_xf_font above).
         // Fills, borders, and alignment read from the XF directly —
         // many BIFF writers emit these attributes on cell XFs with
-        // fAtrPat/fAtrBdr/fAtrAlc cleared but still expect them
-        // rendered (the flag-clearing is a "serialized from a theme"
-        // artifact, not a "use the parent" directive). Cross-checked
-        // by comparing fill counts on a real-world template: strict
-        // fAtr* inheritance drops visible fill from ~2000 cells to
-        // ~1361; Excel shows the richer count, so we match the
-        // write-side convention rather than the strict spec.
+        // fAtrPat/fAtrBdr/fAtrAlc cleared but still expect them rendered
+        // (the flag-clearing is a "serialized from a theme" artifact,
+        // not a "use the parent" directive).
         let effective_fill = ResolvedFill {
             fill_pattern: xf.fill_pattern,
             fill_fg: xf.fill_fg,
@@ -614,140 +678,110 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
             || (font.size_pt > 0 && font.size_pt != default_font_size)
             || (font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64)
             || (!font.name.is_empty() && font.name != default_font_name);
-        if !has_fill && !has_border && !has_align && !has_nondefault_font {
+        if !has_fill && !has_border && !has_align && !has_nondefault_font && numfmt_override.is_none() {
             continue;
         }
-        if let Ok(mut style) = model.get_style_for_cell(sheet, row, col) {
-            // Always set size + name from the XF's font — IronCalc's
-            // default is Calibri 13, but xls defaults are typically
-            // Arial 10 or Calibri 11. Applying them uniformly is what
-            // makes text render at the right visual size.
-            //
-            // Bold FONT records sometimes have dy_height=0 (size
-            // unset — inherit the workbook default). If we let that
-            // pass through, IronCalc's 13pt default shows up and
-            // bold cells end up visually 2-3pt taller than the
-            // non-bold 10 or 11pt cells around them. Always fall
-            // back to the workbook default font size.
-            style.font.sz = if font.size_pt > 0 {
-                font.size_pt
-            } else {
-                default_font_size
-            };
-            if !font.name.is_empty() {
-                style.font.name = font.name.clone();
-            } else {
-                style.font.name = default_font_name.clone();
-            }
-            if font.bold { style.font.b = true; }
-            if font.italic { style.font.i = true; }
-            if font.underline { style.font.u = true; }
-            if font.strike { style.font.strike = true; }
-            if font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64 {
-                if let Some(hex) = shape.palette.get(&font.color_idx) {
-                    style.font.color = Some(hex.clone());
-                }
-            }
-            // Fill color — only apply for solid pattern (fls == 1).
-            // Other patterns (hatched, etc.) aren't rendered by fastsheet
-            // anyway, and "no fill" (fls == 0) should leave the default.
-            // Indices 64 ("system window") and 65 ("system bg") mean
-            // "use theme / none" — skip those instead of forcing white.
-            if effective_fill.fill_pattern == 1
-                && effective_fill.fill_fg != 64
-                && effective_fill.fill_fg != 65
-            {
-                if let Some(hex) = shape.palette.get(&effective_fill.fill_fg) {
-                    style.fill.pattern_type = "solid".to_string();
-                    style.fill.fg_color = Some(hex.clone());
-                    style.fill.bg_color = None;
-                }
-            }
-            // Alignment — map BIFF's 3-bit h/v codes to IronCalc's enums.
-            // Use the inherited effective alignment.
-            let h = match effective_align.h_align {
-                1 => Some(HorizontalAlignment::Left),
-                2 => Some(HorizontalAlignment::Center),
-                3 => Some(HorizontalAlignment::Right),
-                4 => Some(HorizontalAlignment::Fill),
-                5 => Some(HorizontalAlignment::Justify),
-                6 => Some(HorizontalAlignment::CenterContinuous),
-                7 => Some(HorizontalAlignment::Distributed),
-                _ => None,
-            };
-            let v = match effective_align.v_align {
-                0 => Some(VerticalAlignment::Top),
-                1 => Some(VerticalAlignment::Center),
-                2 => Some(VerticalAlignment::Bottom),
-                3 => Some(VerticalAlignment::Justify),
-                4 => Some(VerticalAlignment::Distributed),
-                _ => None,
-            };
-            if h.is_some() || (v.is_some() && effective_align.v_align != 2) || effective_align.wrap {
-                let mut a = style.alignment.clone().unwrap_or_default();
-                if let Some(hv) = h { a.horizontal = hv; }
-                if let Some(vv) = v { a.vertical = vv; }
-                if effective_align.wrap { a.wrap_text = true; }
-                if a != Alignment::default() {
-                    style.alignment = Some(a);
-                }
-            }
-            // Borders — only flag presence; xlsx path renders any
-            // Some(BorderItem) as a thin black border (see cells.rs
-            // build_style_view), so match that here.
-            let border_item = || BorderItem {
-                style: BorderStyle::Thin,
-                color: Some("#000000".to_string()),
-            };
-            if effective_border.border_left != 0 && style.border.left.is_none() {
-                style.border.left = Some(border_item());
-            }
-            if effective_border.border_right != 0 && style.border.right.is_none() {
-                style.border.right = Some(border_item());
-            }
-            if effective_border.border_top != 0 && style.border.top.is_none() {
-                style.border.top = Some(border_item());
-            }
-            if effective_border.border_bottom != 0 && style.border.bottom.is_none() {
-                style.border.bottom = Some(border_item());
-            }
-            let _ = model.set_cell_style(sheet, row, col, &style);
+        let Ok(mut style) = model.get_style_for_cell(sheet, row, col) else { continue };
+        // Always set size + name from the XF's font — IronCalc's default
+        // is Calibri 13, but xls defaults are typically Arial 10 or
+        // Calibri 11. Bold FONT records sometimes have dy_height=0 (size
+        // unset — inherit the workbook default).
+        style.font.sz = if font.size_pt > 0 {
+            font.size_pt
+        } else {
+            default_font_size
+        };
+        if !font.name.is_empty() {
+            style.font.name = font.name.clone();
+        } else {
+            style.font.name = default_font_name.clone();
         }
-    }
+        if font.bold { style.font.b = true; }
+        if font.italic { style.font.i = true; }
+        if font.underline { style.font.u = true; }
+        if font.strike { style.font.strike = true; }
+        if font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64 {
+            if let Some(hex) = shape.palette.get(&font.color_idx) {
+                style.font.color = Some(hex.clone());
+            }
+        }
+        // Fill color — only apply for solid pattern (fls == 1). Indices
+        // 64 ("system window") and 65 ("system bg") mean "use theme /
+        // none" — skip those.
+        if has_fill {
+            if let Some(hex) = shape.palette.get(&effective_fill.fill_fg) {
+                style.fill.pattern_type = "solid".to_string();
+                style.fill.fg_color = Some(hex.clone());
+                style.fill.bg_color = None;
+            }
+        }
+        // Alignment — map BIFF's 3-bit h/v codes to IronCalc's enums.
+        let h = match effective_align.h_align {
+            1 => Some(HorizontalAlignment::Left),
+            2 => Some(HorizontalAlignment::Center),
+            3 => Some(HorizontalAlignment::Right),
+            4 => Some(HorizontalAlignment::Fill),
+            5 => Some(HorizontalAlignment::Justify),
+            6 => Some(HorizontalAlignment::CenterContinuous),
+            7 => Some(HorizontalAlignment::Distributed),
+            _ => None,
+        };
+        let v = match effective_align.v_align {
+            0 => Some(VerticalAlignment::Top),
+            1 => Some(VerticalAlignment::Center),
+            2 => Some(VerticalAlignment::Bottom),
+            3 => Some(VerticalAlignment::Justify),
+            4 => Some(VerticalAlignment::Distributed),
+            _ => None,
+        };
+        if h.is_some() || (v.is_some() && effective_align.v_align != 2) || effective_align.wrap {
+            let mut a = style.alignment.clone().unwrap_or_default();
+            if let Some(hv) = h { a.horizontal = hv; }
+            if let Some(vv) = v { a.vertical = vv; }
+            if effective_align.wrap { a.wrap_text = true; }
+            if a != Alignment::default() {
+                style.alignment = Some(a);
+            }
+        }
+        // Borders — only flag presence; xlsx path renders any
+        // Some(BorderItem) as a thin black border.
+        let border_item = || BorderItem {
+            style: BorderStyle::Thin,
+            color: Some("#000000".to_string()),
+        };
+        if effective_border.border_left != 0 && style.border.left.is_none() {
+            style.border.left = Some(border_item());
+        }
+        if effective_border.border_right != 0 && style.border.right.is_none() {
+            style.border.right = Some(border_item());
+        }
+        if effective_border.border_top != 0 && style.border.top.is_none() {
+            style.border.top = Some(border_item());
+        }
+        if effective_border.border_bottom != 0 && style.border.bottom.is_none() {
+            style.border.bottom = Some(border_item());
+        }
+        // Numfmt — folded into the same Style write so the cached index
+        // captures both styling and number format.
+        if let Some(fmt) = numfmt_override {
+            if style.num_fmt != fmt {
+                style.num_fmt = fmt.to_string();
+            }
+        }
 
-    // Number-format application. IronCalc's formatter rejects some
-    // BIFF format strings (conditional `[Red]`, locale prefixes, custom
-    // text literals) and turns the cell into `#ERROR!`. Heuristic-gate
-    // to "safe" strings: digit-grouping, decimals, percent, currency,
-    // and date tokens. Anything with `[`, `@`, or a leading `_` is
-    // skipped — those are the patterns that cracked the formatter in
-    // probe testing. Users can still force-apply everything via the
-    // FASTSHEET_XLS_APPLY_NUMFMT=all env var for diagnostics.
-    let force_all = std::env::var("FASTSHEET_XLS_APPLY_NUMFMT")
-        .map(|v| v == "all")
-        .unwrap_or(false);
-    for (&(sheet, row, col), &ixfe) in &shape.cell_xfs {
-        let xf = match shape.xfs.get(ixfe as usize) {
-            Some(x) => x,
-            None => continue,
-        };
-        let fmt_str = match shape.formats.get(&xf.fmt_idx) {
-            Some(s) => s,
-            None => continue,
-        };
-        if fmt_str.is_empty() || fmt_str == "General" {
-            continue;
+        // Register the merged Style and write its index into the cell.
+        let style_idx = model.workbook.styles.get_style_index_or_create(&style);
+        if let Ok(ws) = model.workbook.worksheet_mut(sheet) {
+            let _ = ws.set_cell_style(row, col, style_idx);
         }
-        if !force_all && !is_safe_numfmt(fmt_str) {
-            continue;
-        }
-        if let Ok(mut style) = model.get_style_for_cell(sheet, row, col) {
-            if style.num_fmt != *fmt_str {
-                style.num_fmt = fmt_str.clone();
-                let _ = model.set_cell_style(sheet, row, col, &style);
-            }
+        // Cache by ixfe — only for cells that started at default style 0.
+        // Date-formatted cells have a non-zero pre_existing_idx and take
+        // the slow path so their pre-applied numfmt isn't dropped.
+        if pre_existing_idx == 0 {
+            style_cache.insert(ixfe, style_idx);
         }
     }
+    timer.lap("style_apply");
 
     // Replicate MY* array formulas across their spill ranges. Mirrors
     // the xlsx path (replicate_my_array_formulas) but sourced from the
@@ -811,6 +845,7 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
             }
         }
     }
+    timer.lap("my_replicate");
 
     // Hidden columns live in the AppState side-channel (IronCalc's Col
     // struct has no hidden field) — hand them back so the caller can
