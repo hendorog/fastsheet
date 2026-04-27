@@ -1,0 +1,96 @@
+# GitHub Actions release workflow.
+#
+# Triggers on:
+#   * Push of a tag matching v* (e.g. v0.1.1, v0.2.0) — creates a
+#     draft GitHub release with the Windows installer + portable .exe
+#     attached.
+#   * Manual workflow_dispatch — useful for verifying the build
+#     pipeline without bumping a tag. Skips the release-creation step
+#     when no tag is present.
+#
+# Tagging recipe:
+#   1. Bump version in package.json + src-tauri/tauri.conf.json
+#      + src-tauri/Cargo.toml so all three match.
+#   2. git tag v0.1.1 && git push --tags
+#   3. The workflow runs, posts a DRAFT release, you publish manually
+#      after sanity-checking the artifacts.
+#
+# Notes:
+#   * Builds on windows-latest using the same tauri-action that the
+#     Tauri team uses for their own releases. This produces a native
+#     MSVC build matching what an end user would get if they built
+#     from source on Windows.
+#   * The .exe is unsigned — Windows SmartScreen will warn users on
+#     first launch ("Windows protected your PC"). They click
+#     "More info" → "Run anyway". Code signing requires an EV cert
+#     (~$200/year) and is out of scope for this stage.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          # No package-lock cache here — npm ci picks it up regardless
+          # and the project root has the package-lock.json.
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build and release
+        # tauri-action runs `tauri build`, collects bundle outputs
+        # (.msi installer + standalone .exe + NSIS setup), and when a
+        # tag-triggered run is present creates a draft GitHub release
+        # with all bundle artefacts attached. The releaseDraft flag
+        # leaves the release in DRAFT so we can sanity-check artefacts
+        # before going live. On workflow_dispatch (no tag), tagName is
+        # left empty and the action just builds without releasing —
+        # useful for smoke-testing the pipeline.
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: 'fastsheet ${{ github.ref_name }}'
+          releaseBody: |
+            See [CHANGELOG](../../blob/main/CHANGELOG.md) or `git log` between releases.
+
+            **Windows install:** download the `*_x64-setup.exe` (NSIS)
+            or `*_x64_en-US.msi` from below and run it. Both install
+            to your user profile — no admin required.
+
+            **Portable:** the standalone `fastsheet.exe` is also
+            attached and runs without installation.
+
+            **First launch:** Windows SmartScreen may show
+            "Windows protected your PC" since this build is unsigned.
+            Click "More info" → "Run anyway".
+
+            **Requires:** Windows 10 1809+ or Windows 11 (WebView2
+            runtime — pre-installed on supported versions).
+          releaseDraft: true
+          prerelease: false
