@@ -8,6 +8,7 @@ mod workbook;
 mod wsl;
 pub mod xls_biff;
 mod xls_load;
+pub mod xls_preserve;
 mod xls_save;
 mod xlsx_load;
 mod xlsx_save;

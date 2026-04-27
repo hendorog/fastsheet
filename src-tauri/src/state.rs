@@ -38,6 +38,12 @@ pub(crate) struct AppState {
     /// drawings get dropped by save_to_xlsx — files without those keep
     /// styles correctly; files with them choose styles over preservation.
     pub(crate) style_dirty: Mutex<HashSet<u32>>,
+    /// VBA / macro storages captured from the source .xls on load. The
+    /// .xls writer (`save_xls`) replays these into the new compound
+    /// file so macros survive a save+reload through Excel. Cleared on
+    /// new_workbook and on any non-.xls open. Set to None when the
+    /// source had no macros — most files.
+    pub(crate) xls_preserved: Mutex<Option<crate::xls_preserve::PreservedXlsData>>,
 }
 
 impl AppState {
@@ -49,6 +55,7 @@ impl AppState {
             dirty: Mutex::new(HashMap::new()),
             hidden_cols: Mutex::new(HashMap::new()),
             style_dirty: Mutex::new(HashSet::new()),
+            xls_preserved: Mutex::new(None),
         }
     }
 }

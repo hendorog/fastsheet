@@ -67,9 +67,11 @@ pub(crate) fn open_workbook(
         .map(|e| e.eq_ignore_ascii_case("xls"))
         .unwrap_or(false);
     let mut xls_hidden_cols: HashMap<u32, HashSet<i32>> = HashMap::new();
+    let mut xls_preserved: crate::xls_preserve::PreservedXlsData = Default::default();
     let mut model = if is_xls {
-        let (m, hc) = load_xls(&path)?;
+        let (m, hc, preserved) = load_xls(&path)?;
         xls_hidden_cols = hc;
+        xls_preserved = preserved;
         m
     } else {
         let mut m = load_xlsx_with_fallback(&path)?;
@@ -109,6 +111,14 @@ pub(crate) fn open_workbook(
     if is_xls {
         *state.loaded.lock().unwrap() = None;
         hidden_cols_init = xls_hidden_cols;
+        // Stash the captured VBA / macro storages from the source so
+        // the writer can replay them on save. Empty when the source
+        // has no macros — common case.
+        *state.xls_preserved.lock().unwrap() = if xls_preserved.is_empty() {
+            None
+        } else {
+            Some(xls_preserved)
+        };
     } else if let Ok(bytes) = std::fs::read(&path) {
         let sheet_paths = extract_sheet_paths(&bytes).unwrap_or_default();
         // Seed the in-memory hidden-column state from the original xlsx so
@@ -158,6 +168,7 @@ pub(crate) fn new_workbook(state: State<'_, AppState>) -> Result<WorkbookInfo, S
     };
     *state.model.lock().unwrap() = Some(model);
     *state.loaded.lock().unwrap() = None;
+    *state.xls_preserved.lock().unwrap() = None;
     state.dirty.lock().unwrap().clear();
     state.hidden_cols.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
@@ -180,7 +191,13 @@ pub(crate) fn save_workbook(
     if is_xls_target {
         let model_guard = state.model.lock().unwrap();
         let model = model_guard.as_ref().ok_or("no workbook open")?;
-        save_xls(model, &path)?;
+        // Inject the VBA / macro storages we captured on load (if
+        // any) so Excel-side macros survive the save. Save-as is OK
+        // too — VBA streams are self-contained, no offset
+        // cross-references with the workbook stream.
+        let preserved_guard = state.xls_preserved.lock().unwrap();
+        crate::xls_save::save_xls_with_preserved(model, &path, preserved_guard.as_ref())?;
+        drop(preserved_guard);
         drop(model_guard);
         state.dirty.lock().unwrap().clear();
         state.style_dirty.lock().unwrap().clear();

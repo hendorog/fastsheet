@@ -2553,8 +2553,23 @@ fn emit_sheet_cells(
 // ---------------------------------------------------------------------------
 
 pub fn save_xls<P: AsRef<Path>>(model: &ironcalc::base::Model, path: P) -> Result<(), String> {
+    save_xls_with_preserved(model, path, None)
+}
+
+/// Save with optional VBA / macro storage preservation. When
+/// `preserved` is `Some`, after the workbook stream is written the
+/// captured storage subtrees from the source file are replayed into
+/// the new CFB. Excel-side macros come back; everything else (charts,
+/// pivots, drawings, conditional formatting, OLE links) is still
+/// dropped — those would need full BIFF-stream offset preservation
+/// (see pending #1).
+pub fn save_xls_with_preserved<P: AsRef<Path>>(
+    model: &ironcalc::base::Model,
+    path: P,
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
+) -> Result<(), String> {
     let bytes = build_workbook_stream(model);
-    write_compound_file(path.as_ref(), &bytes)
+    write_compound_file(path.as_ref(), &bytes, preserved)
 }
 
 /// Build the full workbook-stream byte sequence: globals (header
@@ -2791,7 +2806,11 @@ fn build_workbook_stream(model: &ironcalc::base::Model) -> Vec<u8> {
 /// Root directory". (Reproduced 2026-04-25; reading a v4-CFB-wrapped
 /// xls via calamine returned that error even though cfb-rs
 /// round-tripped the same bytes fine.)
-fn write_compound_file(path: &Path, workbook_bytes: &[u8]) -> Result<(), String> {
+fn write_compound_file(
+    path: &Path,
+    workbook_bytes: &[u8],
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
+) -> Result<(), String> {
     if path.exists() {
         std::fs::remove_file(path).map_err(|e| format!("xls remove existing: {e}"))?;
     }
@@ -2810,6 +2829,12 @@ fn write_compound_file(path: &Path, workbook_bytes: &[u8]) -> Result<(), String>
         stream
             .write_all(workbook_bytes)
             .map_err(|e| format!("xls write stream: {e}"))?;
+    }
+    // Replay preserved VBA / macro storages from the source CFB. Lives
+    // in its own self-contained subtree so verbatim copy is safe — no
+    // offset cross-references with the workbook stream we just wrote.
+    if let Some(p) = preserved {
+        crate::xls_preserve::inject(&mut comp, p);
     }
     comp.flush().map_err(|e| format!("xls flush: {e}"))?;
     Ok(())
@@ -3115,7 +3140,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_r1c1.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         let v_rt = reloaded.get_formatted_cell_value(0, 25, 3).unwrap();
         assert_eq!(v_rt, "30", "round-trip preserves the divide");
@@ -3143,7 +3168,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_dn.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         assert_eq!(
             reloaded.get_formatted_cell_value(0, 5, 1).unwrap(),
@@ -3177,7 +3202,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_quote.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         assert_eq!(
             reloaded.get_formatted_cell_value(0, 1, 1).unwrap(),
@@ -3212,7 +3237,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_iferror.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         assert_eq!(
             reloaded.get_formatted_cell_value(0, 1, 1).unwrap(),
@@ -3240,7 +3265,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_3d.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         assert_eq!(
             reloaded.get_formatted_cell_value(0, 1, 1).unwrap(),
@@ -3267,7 +3292,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_divide.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         let v_rt = reloaded.get_formatted_cell_value(0, 3, 2).unwrap();
         assert_eq!(v_rt, "6", "after round-trip the divide should still apply");
@@ -3293,7 +3318,7 @@ mod tests {
 
         // Reload through our own xls reader.
         let path_str = path.to_string_lossy().into_owned();
-        let (mut reloaded, _hidden) = load_xls(&path_str).expect("load_xls");
+        let (mut reloaded, _hidden, _preserved) = load_xls(&path_str).expect("load_xls");
         reloaded.evaluate();
 
         // Pull cells back. IronCalc's get_formatted_cell_value gives us

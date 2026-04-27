@@ -42,6 +42,7 @@ use crate::xls_biff::{
     decode_array_formula as fastsheet_lib_decode_array, decode_full_formula,
     scan_xls_shape,
 };
+use crate::xls_preserve::{extract as extract_preserved, PreservedXlsData};
 
 /// Second return value is the hidden-column map that should be stored in
 /// AppState — it lives outside the Model because IronCalc's Col struct
@@ -139,7 +140,9 @@ impl PhaseTimer {
     }
 }
 
-pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>>), String> {
+pub fn load_xls(
+    path: &str,
+) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>>, PreservedXlsData), String> {
     let mut timer = PhaseTimer::new();
     crate::util::profile_log(&format!("[load_xls] === path={path}"));
     // Read the file ONCE, then drive both calamine and the BIFF
@@ -154,6 +157,13 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
     let bytes = std::fs::read(path)
         .map_err(|e| format!("read {path}: {e}"))?;
     timer.lap("read_bytes");
+
+    // Capture the original VBA / macro storages from the source CFB
+    // so the writer can replay them into a saved file. Best-effort —
+    // returns an empty PreservedXlsData when the file has no VBA
+    // (which is most files).
+    let preserved = extract_preserved(&bytes);
+    timer.lap("preserve_extract");
 
     // Calamine 0.26's xls reader unconditionally parses any embedded
     // `_VBA_PROJECT_CUR` directory during `Xls::new`, and its CFB
@@ -825,7 +835,7 @@ pub fn load_xls(path: &str) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>
     // Hidden columns live in the AppState side-channel (IronCalc's Col
     // struct has no hidden field) — hand them back so the caller can
     // seed state.hidden_cols the same way xlsx does.
-    Ok((model, shape.hidden_cols))
+    Ok((model, shape.hidden_cols, preserved))
 }
 
 /// Normalize `A$1:B$1` and `$K$1:$B$65536`-style ranges so the

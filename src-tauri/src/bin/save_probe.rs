@@ -16,7 +16,7 @@ use std::io::Read;
 fn main() {
     let path = std::env::args().nth(1).expect("usage: save_probe <input.xls>");
     println!("=== load {path}");
-    let (mut model, _hidden) = fastsheet_lib::load_xls(&path).expect("load_xls");
+    let (mut model, _hidden, _preserved) = fastsheet_lib::load_xls(&path).expect("load_xls");
     model.evaluate();
 
     // Optional cell-level inspection: set FASTSHEET_PROBE_CELL=sheet:row:col
@@ -96,7 +96,7 @@ fn main() {
     }
 
     println!("=== re-open via load_xls");
-    let (mut reloaded, _) = match fastsheet_lib::load_xls(&out.to_string_lossy()) {
+    let (mut reloaded, _, _) = match fastsheet_lib::load_xls(&out.to_string_lossy()) {
         Ok(t) => t,
         Err(e) => {
             println!("  load_xls FAILED: {e}");

@@ -45,7 +45,7 @@ struct Diff {
 fn round_trip(model: &Model, label: &str) -> RoundTripResult {
     let out = std::env::temp_dir().join(format!("fastsheet_rt_{label}.xls"));
     fastsheet_lib::save_xls(model, &out).expect("save_xls");
-    let (mut reloaded, _) =
+    let (mut reloaded, _, _) =
         fastsheet_lib::load_xls(&out.to_string_lossy()).expect("load_xls");
     reloaded.evaluate();
     let mut result = RoundTripResult { total: 0, mismatches: vec![] };
@@ -236,7 +236,7 @@ fn rt_column_widths_and_row_heights() {
 
     let out = std::env::temp_dir().join("fastsheet_rt_widths.xls");
     fastsheet_lib::save_xls(&m, &out).expect("save");
-    let (reloaded, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
     // get_column_width returns chars * 12 (internal form). Round to
     // tolerate u16 quantization on the BIFF wire.
     let w1 = reloaded.get_column_width(0, 1).unwrap_or(0.0).round();
@@ -285,7 +285,7 @@ fn rt_external_fixture() {
         .unwrap_or(0);
 
     eprintln!("running round-trip on {}", path.display());
-    let (mut original, _) = fastsheet_lib::load_xls(&path.to_string_lossy()).expect("load");
+    let (mut original, _, _) = fastsheet_lib::load_xls(&path.to_string_lossy()).expect("load");
     original.evaluate();
     let r = round_trip(&original, "external");
     eprintln!(
@@ -331,9 +331,9 @@ fn rt_mutation_only_touches_one_cell() {
     fastsheet_lib::save_xls(&m, &mutated_path).expect("mutated save");
 
     // Reload both and diff.
-    let (mut baseline, _) =
+    let (mut baseline, _, _) =
         fastsheet_lib::load_xls(&baseline_path.to_string_lossy()).expect("reload baseline");
-    let (mut mutated, _) =
+    let (mut mutated, _, _) =
         fastsheet_lib::load_xls(&mutated_path.to_string_lossy()).expect("reload mutated");
     baseline.evaluate();
     mutated.evaluate();
@@ -355,4 +355,107 @@ fn rt_mutation_only_touches_one_cell() {
 
     std::fs::remove_file(&baseline_path).ok();
     std::fs::remove_file(&mutated_path).ok();
+}
+
+// ---------------------------------------------------------------------------
+// 4. Macro / VBA preservation — captured on load, replayed on save.
+//    Verifies the storage tree comes through bit-identical so Excel-side
+//    macros survive a fastsheet save+reload.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rt_vba_macros_preserved() {
+    use std::io::{Cursor, Read, Write};
+
+    // Build a synthetic .xls in memory: minimal /Workbook stream
+    // (not parseable by IronCalc — that's fine, this test is purely
+    // about the storage round-trip) plus a fake VBA storage tree.
+    // We then re-read via cfb to verify our extract+inject works
+    // end-to-end without going through the BIFF writer.
+    let src_path = std::env::temp_dir().join("fastsheet_rt_vba_src.xls");
+    let _ = std::fs::remove_file(&src_path);
+
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true).write(true).create_new(true)
+            .open(&src_path).unwrap();
+        let mut comp = cfb::CompoundFile::create_with_version(cfb::Version::V3, f).unwrap();
+        // /Workbook needs SOMETHING; the content is irrelevant here.
+        comp.create_stream("/Workbook").unwrap()
+            .write_all(b"\x09\x08\x10\x00\x00\x06\x05\x00").unwrap();
+        // Build the VBA tree we want preserved.
+        comp.create_storage("/_VBA_PROJECT_CUR").unwrap();
+        comp.create_storage("/_VBA_PROJECT_CUR/VBA").unwrap();
+        comp.create_stream("/_VBA_PROJECT_CUR/VBA/_VBA_PROJECT").unwrap()
+            .write_all(b"FAKE_VBA_PROJECT_STREAM_BYTES_AAAABBBBCCCC").unwrap();
+        comp.create_stream("/_VBA_PROJECT_CUR/VBA/Module1").unwrap()
+            .write_all(b"Attribute VB_Name = \"Module1\"\nSub Hello()\nEnd Sub").unwrap();
+        comp.create_stream("/_VBA_PROJECT_CUR/VBA/dir").unwrap()
+            .write_all(b"DIR_STREAM_BYTES").unwrap();
+        comp.flush().unwrap();
+    }
+
+    // Extract from the source bytes.
+    let bytes = std::fs::read(&src_path).unwrap();
+    let preserved = fastsheet_lib::xls_preserve::extract(&bytes);
+    assert!(!preserved.is_empty(), "expected VBA entries to be captured");
+
+    // Build a target CFB and inject. Includes a /Workbook stream like
+    // the real writer would, so we exercise the same shape.
+    let dst_path = std::env::temp_dir().join("fastsheet_rt_vba_dst.xls");
+    let _ = std::fs::remove_file(&dst_path);
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true).write(true).create_new(true)
+            .open(&dst_path).unwrap();
+        let mut comp = cfb::CompoundFile::create_with_version(cfb::Version::V3, f).unwrap();
+        comp.create_stream("/Workbook").unwrap()
+            .write_all(b"\x09\x08\x10\x00\x00\x06\x05\x00").unwrap();
+        fastsheet_lib::xls_preserve::inject(&mut comp, &preserved);
+        comp.flush().unwrap();
+    }
+
+    // Re-read the destination and confirm every preserved stream is
+    // present with byte-identical content.
+    let dst_bytes = std::fs::read(&dst_path).unwrap();
+    let mut dst_cfb = cfb::CompoundFile::open(Cursor::new(dst_bytes)).unwrap();
+    for entry in &preserved.entries {
+        if entry.is_storage {
+            assert!(dst_cfb.is_storage(&entry.path),
+                "missing preserved storage: {:?}", entry.path);
+        } else {
+            assert!(dst_cfb.is_stream(&entry.path),
+                "missing preserved stream: {:?}", entry.path);
+            let mut got = Vec::new();
+            dst_cfb.open_stream(&entry.path).unwrap().read_to_end(&mut got).unwrap();
+            assert_eq!(&got, entry.data.as_ref().unwrap(),
+                "stream {:?} did not round-trip identically", entry.path);
+        }
+    }
+
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn rt_vba_absent_when_source_has_none() {
+    use std::io::Write;
+    // Source with NO VBA storages → extract returns empty bundle,
+    // inject is a no-op, and the writer produces a clean CFB without
+    // any VBA debris.
+    let src_path = std::env::temp_dir().join("fastsheet_rt_vba_empty.xls");
+    let _ = std::fs::remove_file(&src_path);
+    {
+        let f = std::fs::OpenOptions::new()
+            .read(true).write(true).create_new(true)
+            .open(&src_path).unwrap();
+        let mut comp = cfb::CompoundFile::create_with_version(cfb::Version::V3, f).unwrap();
+        comp.create_stream("/Workbook").unwrap()
+            .write_all(b"\x09\x08\x10\x00\x00\x06\x05\x00").unwrap();
+        comp.flush().unwrap();
+    }
+    let bytes = std::fs::read(&src_path).unwrap();
+    let preserved = fastsheet_lib::xls_preserve::extract(&bytes);
+    assert!(preserved.is_empty(), "no-VBA source should yield empty bundle");
+    std::fs::remove_file(&src_path).ok();
 }
