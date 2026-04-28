@@ -109,11 +109,14 @@ pub(crate) fn query_recents(
     let guard = state.index.lock().unwrap();
     let conn = guard.as_ref().ok_or("index not open")?;
     let q = query.trim().to_lowercase();
+    // Sort by most-recently-opened. Hits is still tracked for
+    // historical reasons but no longer drives ordering — recency is
+    // a better signal for "what does the user actually want now".
     let mut stmt = if q.is_empty() {
         conn.prepare(
             "SELECT path, basename, dir, hits, opened_at
              FROM files
-             ORDER BY hits DESC, opened_at DESC
+             ORDER BY opened_at DESC
              LIMIT ?1",
         )
         .map_err(|e| e.to_string())?
@@ -122,7 +125,7 @@ pub(crate) fn query_recents(
             "SELECT path, basename, dir, hits, opened_at
              FROM files
              WHERE LOWER(basename) LIKE ?1 OR LOWER(path) LIKE ?1
-             ORDER BY hits DESC, opened_at DESC
+             ORDER BY opened_at DESC
              LIMIT ?2",
         )
         .map_err(|e| e.to_string())?
@@ -149,6 +152,72 @@ pub(crate) fn query_recents(
                 dir: row.get(2)?,
                 hits: row.get(3)?,
                 opened_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?
+    };
+    Ok(rows)
+}
+
+#[derive(Serialize)]
+pub(crate) struct RecentDir {
+    pub(crate) dir: String,
+    pub(crate) opened_at: i64,
+}
+
+/// Distinct directories of recently-opened files, sorted by the
+/// most-recent open in each directory. Used by the navigator to let
+/// the user jump to a known recent location without re-typing the
+/// path. `query` filters by directory substring (case-insensitive).
+#[tauri::command]
+pub(crate) fn query_recent_dirs(
+    query: String,
+    limit: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<RecentDir>, String> {
+    open_index_db(&state)?;
+    let guard = state.index.lock().unwrap();
+    let conn = guard.as_ref().ok_or("index not open")?;
+    let q = query.trim().to_lowercase();
+    let mut stmt = if q.is_empty() {
+        conn.prepare(
+            "SELECT dir, MAX(opened_at) AS last_opened
+             FROM files
+             WHERE dir <> ''
+             GROUP BY dir
+             ORDER BY last_opened DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        conn.prepare(
+            "SELECT dir, MAX(opened_at) AS last_opened
+             FROM files
+             WHERE dir <> '' AND LOWER(dir) LIKE ?1
+             GROUP BY dir
+             ORDER BY last_opened DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let rows: Vec<RecentDir> = if q.is_empty() {
+        stmt.query_map([limit as i64], |row| {
+            Ok(RecentDir {
+                dir: row.get(0)?,
+                opened_at: row.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?
+    } else {
+        let pattern = format!("%{q}%");
+        stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            Ok(RecentDir {
+                dir: row.get(0)?,
+                opened_at: row.get(1)?,
             })
         })
         .map_err(|e| e.to_string())?

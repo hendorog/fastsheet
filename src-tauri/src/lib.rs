@@ -98,6 +98,7 @@ pub fn run() {
             navigator::home_dir_path,
             navigator::list_dir,
             index::query_recents,
+            index::query_recent_dirs,
             hidden::debug_hidden_cols,
         ])
         .run(tauri::generate_context!())

@@ -56,11 +56,19 @@ export type RecentEntry = {
   opened_at: number;
 };
 
-/// A unified entry shown in the navigator list — either a recent file
-/// from the index (with `kind: "recent"`) or a directory entry from the
-/// filesystem listing.
+export type RecentDir = {
+  dir: string;
+  opened_at: number;
+};
+
+/// A unified entry shown in the navigator list — a recent file from
+/// the index (`kind: "recent"`), a recent directory (`kind: "recent_dir"`),
+/// or a directory entry from the current filesystem listing
+/// (`kind: "entry"`). Both recent kinds are hidden after the user
+/// navigates away from the start dir; entries are always shown.
 export type NavRow =
   | { kind: "recent"; recent: RecentEntry }
+  | { kind: "recent_dir"; recent_dir: RecentDir }
   | { kind: "entry"; entry: DirEntry };
 
 export type MenuItem = {

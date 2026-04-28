@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount, tick } from "svelte";
-  import type { DirListing, RecentEntry, NavRow, DirEntry } from "./types";
+  import type { DirListing, RecentEntry, RecentDir, NavRow, DirEntry } from "./types";
 
   type Props = {
     mode: "open" | "save";
@@ -25,13 +25,15 @@
   let filter = $state("");
   let selectedIdx = $state(0);
   let recents = $state<RecentEntry[]>([]);
+  let recentDirs = $state<RecentDir[]>([]);
   let filterEl: HTMLInputElement | null = $state(null);
-  /// Recents are shown on the initial open so users can re-pick a
-  /// frequently-used file without browsing. Once they start typing or
-  /// navigate to a different directory the recents stop being
-  /// useful — hide them so the entry list isn't padded with
-  /// duplicates and tab-style filtering (e.g. `u` → `ubuntu`)
-  /// resolves to a single match.
+  /// Recents and recent dirs are shown on the initial open so users
+  /// can re-pick a frequently-used file or jump to a known location
+  /// without browsing. Once they navigate to a different directory
+  /// these lists stop being useful — hide them so the entry list
+  /// isn't padded with stale rows and tab-style filtering (e.g. `u`
+  /// → `ubuntu`) resolves to a single match. Same flag gates both
+  /// lists.
   let hasInteracted = $state(false);
 
   /// Recognise filter strings that mean "navigate to this location" rather
@@ -68,12 +70,15 @@
 
   async function refreshRecents() {
     try {
-      recents = await invoke<RecentEntry[]>("query_recents", {
-        query: filter,
-        limit: 8,
-      });
+      const [files, dirs] = await Promise.all([
+        invoke<RecentEntry[]>("query_recents", { query: filter, limit: 8 }),
+        invoke<RecentDir[]>("query_recent_dirs", { query: filter, limit: 7 }),
+      ]);
+      recents = files;
+      recentDirs = dirs;
     } catch {
       recents = [];
+      recentDirs = [];
     }
   }
 
@@ -93,7 +98,12 @@
   let rows = $derived.by<NavRow[]>(() => {
     const out: NavRow[] = [];
     if (!hasInteracted) {
+      // Recent files first (newest open first, sorted server-side).
+      // Then recent directories — a fallback "I want to go to a place
+      // I've been recently" list. Both hidden once the user crosses
+      // into a new directory.
       for (const r of recents) out.push({ kind: "recent", recent: r });
+      for (const d of recentDirs) out.push({ kind: "recent_dir", recent_dir: d });
     }
     if (!listing) return out;
     const q = filter.trim().toLowerCase();
@@ -165,6 +175,13 @@
   async function activateRow(row: NavRow) {
     if (row.kind === "recent") {
       await onOpenFile(row.recent.path);
+      return;
+    }
+    if (row.kind === "recent_dir") {
+      // Re-base navigation at the chosen directory; navTo flips
+      // hasInteracted so both recents lists collapse and the user
+      // continues browsing from there. No file is opened yet.
+      await navTo(row.recent_dir.dir, null);
       return;
     }
     await activateEntry(row.entry);
@@ -253,7 +270,7 @@
       autofocus
     />
     <div class="nav-list" role="listbox">
-      {#each rows as row, i (row.kind + ":" + (row.kind === "recent" ? row.recent.path : row.entry.name) + ":" + i)}
+      {#each rows as row, i (row.kind + ":" + (row.kind === "recent" ? row.recent.path : row.kind === "recent_dir" ? row.recent_dir.dir : row.entry.name) + ":" + i)}
         {#if row.kind === "recent"}
           <div
             class="nav-row recent"
@@ -266,7 +283,18 @@
             <span class="nav-tag">recent</span>
             <span class="nav-name">{row.recent.basename}</span>
             <span class="nav-dim">{row.recent.dir}</span>
-            <span class="nav-size">×{row.recent.hits}</span>
+          </div>
+        {:else if row.kind === "recent_dir"}
+          <div
+            class="nav-row recent-dir"
+            class:sel={i === selectedIdx}
+            onclick={() => {
+              selectedIdx = i;
+              activateRow(row);
+            }}
+          >
+            <span class="nav-tag dir-tag">recent dir</span>
+            <span class="nav-name">{row.recent_dir.dir}</span>
           </div>
         {:else}
           <div
@@ -353,15 +381,30 @@
   .nav-row.sel .nav-size {
     color: #d0e0ff;
   }
-  .nav-row.recent {
+  .nav-row.recent,
+  .nav-row.recent-dir {
     gap: 0.6rem;
+  }
+  .nav-row.recent-dir .nav-name {
+    color: #1f6feb;
+    font-weight: 600;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .nav-row.recent-dir.sel .nav-name {
+    color: #fff;
   }
   .nav-tag {
     color: #b88a00;
     font-size: 10px;
     text-transform: uppercase;
     font-weight: 700;
-    min-width: 3.5rem;
+    min-width: 5rem;
+  }
+  .nav-tag.dir-tag {
+    color: #1f6feb;
   }
   .nav-row.sel .nav-tag {
     color: #fff;
