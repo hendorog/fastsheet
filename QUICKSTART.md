@@ -235,10 +235,14 @@ keyboard reference inside the popup.
 
 ### Open
 
-`/F R` opens the file navigator. Type to filter the listing or your
-recent files. Enter on a file opens it; Enter on a directory descends
-into it. `..` goes up. `\\` jumps to the WSL UNC root if you're on
-Windows.
+`/F R` opens the file navigator. The first view shows recently opened
+files (most-recent first) and the last 7 directories you've used.
+Enter on a file opens it; Enter on a directory descends into it.
+`..` goes up. `\\` jumps to the WSL UNC root if you're on Windows.
+
+Type to filter across the listing, recent files, and recent dirs.
+As soon as you cross into a different directory, both recent lists
+collapse and only the current directory's entries show.
 
 ### Save
 
