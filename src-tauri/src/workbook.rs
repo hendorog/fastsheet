@@ -143,6 +143,10 @@ pub(crate) fn open_workbook(
     *state.hidden_cols.lock().unwrap() = hidden_cols_init;
     state.dirty.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
+    // Loading a fresh workbook invalidates any active compare —
+    // diffing the new model against the previous right side would
+    // confuse more than help.
+    *state.compare.lock().unwrap() = None;
     let _ = record_open_internal(&state, &path);
     lap(&mut t, "state_install");
     crate::util::profile_log(&format!(
@@ -172,6 +176,7 @@ pub(crate) fn new_workbook(state: State<'_, AppState>) -> Result<WorkbookInfo, S
     state.dirty.lock().unwrap().clear();
     state.hidden_cols.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
+    *state.compare.lock().unwrap() = None;
     Ok(info)
 }
 
@@ -357,6 +362,74 @@ fn collect_layout_snapshots(state: &State<'_, AppState>) -> HashMap<u32, SheetLa
 #[tauri::command]
 pub(crate) fn file_exists(path: String) -> bool {
     std::path::Path::new(&path).exists()
+}
+
+/// Load a second workbook from `path` and diff it against the active
+/// model. Returns the diff list + missing-sheet summary; the right
+/// model stays in `state.compare` for trace integration. The active
+/// workbook is unchanged (this is a read-only side-load).
+///
+/// Loading uses the same pipeline as `open_workbook` so palette
+/// preprocessing, array-marker stripping, MY* replication, and the
+/// xls VBA-strip recovery all apply. We do NOT replicate the right-
+/// side workbook's xls hidden cols / preserved VBA — compare doesn't
+/// need them and they'd just consume memory.
+#[tauri::command]
+pub(crate) fn compare_open(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<crate::compare::CompareResult, String> {
+    let is_xls = std::path::Path::new(&path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.eq_ignore_ascii_case("xls"))
+        .unwrap_or(false);
+    let mut right = if is_xls {
+        let (m, _hc, _preserved) = load_xls(&path)?;
+        m
+    } else {
+        let mut m = load_xlsx_with_fallback(&path)?;
+        if let Ok(bytes) = std::fs::read(&path) {
+            let _ = replicate_my_array_formulas(&mut m, &bytes);
+        }
+        m
+    };
+    right.evaluate();
+
+    let model_guard = state.model.lock().unwrap();
+    let left = model_guard.as_ref().ok_or("no workbook open")?;
+    let (session, result) = crate::compare::diff_workbooks(left, right, path);
+    drop(model_guard);
+    *state.compare.lock().unwrap() = Some(session);
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn compare_close(state: State<'_, AppState>) -> Result<(), String> {
+    *state.compare.lock().unwrap() = None;
+    Ok(())
+}
+
+/// Returns the right-side formatted value at a left-coords address,
+/// or null when no compare session is active or the cell isn't on
+/// the right side. Used by trace nodes that want to render
+/// `left | right` without the frontend re-walking the dep tree.
+#[tauri::command]
+pub(crate) fn compare_value_at(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let compare_guard = state.compare.lock().unwrap();
+    let Some(session) = compare_guard.as_ref() else {
+        return Ok(None);
+    };
+    let model_guard = state.model.lock().unwrap();
+    let Some(left) = model_guard.as_ref() else {
+        return Ok(None);
+    };
+    Ok(session.right_value_at(left, sheet, row, col))
 }
 
 #[tauri::command]

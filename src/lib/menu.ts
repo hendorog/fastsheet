@@ -62,6 +62,9 @@ export type MenuCallbacks = {
   traceFormula: () => void | Promise<void>;
   traceGoto: () => void | Promise<void>;
   traceNames: () => void | Promise<void>;
+  // /File/Compare — workbook comparison.
+  compareOpen: () => void | Promise<void>;
+  compareExit: () => void | Promise<void>;
 };
 
 export type FormatKind =
@@ -223,7 +226,15 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
       children: [
         { letter: "R", label: "Retrieve", description: "Retrieve (open) a worksheet file from disk", action: cb.openRetrieveNavigator },
         { letter: "S", label: "Save", description: "Save the current worksheet", action: cb.fileSaveFlow },
-        { letter: "C", label: "Combine", description: "Combine another file into the current one", action: stb("File/Combine") },
+        {
+          letter: "C", label: "Compare",
+          description: "Compare the current workbook against another file (values + formulas)",
+          children: [
+            { letter: "O", label: "Open", description: "Pick a file to compare against — diffs get listed in the dock", action: cb.compareOpen },
+            { letter: "X", label: "Exit", description: "Close the comparison and clear the dock", action: cb.compareExit },
+          ],
+        },
+        { letter: "J", label: "Combine", description: "Combine another file into the current one", action: stb("File/Combine") },
         { letter: "X", label: "Xtract", description: "Extract part of the worksheet to a new file", action: stb("File/Xtract") },
         { letter: "E", label: "Erase", description: "Erase a file from disk", action: stb("File/Erase") },
         { letter: "L", label: "List", description: "List worksheet files in the directory", action: stb("File/List") },

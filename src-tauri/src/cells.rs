@@ -364,7 +364,14 @@ pub(crate) fn trace_formula(
 ) -> Result<crate::trace::TraceNode, String> {
     let guard = state.model.lock().unwrap();
     let model = guard.as_ref().ok_or("no workbook open")?;
-    Ok(crate::trace::trace(model, sheet, row, col))
+    let compare_guard = state.compare.lock().unwrap();
+    Ok(crate::trace::trace(
+        model,
+        sheet,
+        row,
+        col,
+        compare_guard.as_ref(),
+    ))
 }
 
 /// List every defined name in the workbook with its resolved formula

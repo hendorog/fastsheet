@@ -64,16 +64,36 @@ pub struct TraceNode {
     pub cycle: bool,
     /// True if recursion stopped here because the depth cap was hit.
     pub truncated: bool,
+    /// Right-side formatted value, when a compare session is active.
+    /// None outside compare mode; Some("") for cells that exist in
+    /// the left model but are empty/missing on the right.
+    pub compare_value: Option<String>,
+    /// True iff `compare_value` differs from `value`. Lets the
+    /// frontend tint trace nodes whose right-side disagrees without
+    /// re-doing the comparison client-side.
+    pub compare_differs: bool,
     pub deps: Vec<TraceNode>,
 }
 
 /// Top-level entry: trace the formula at (sheet, row, col). Returns a
 /// rooted tree. Cells without formulas come back as a single node
 /// with `kind: "literal"` and no deps.
-pub fn trace(model: &Model, sheet: u32, row: i32, col: i32) -> TraceNode {
+///
+/// `compare`, when present, populates each cell-kind node's
+/// `compare_value` with the right-side formatted value so the
+/// frontend can render `left | right` next to deps. Range / name /
+/// literal nodes don't carry a compare value (the right-side address
+/// resolution would be ambiguous).
+pub fn trace(
+    model: &Model,
+    sheet: u32,
+    row: i32,
+    col: i32,
+    compare: Option<&crate::compare::CompareSession>,
+) -> TraceNode {
     let mut visited = HashSet::new();
     visited.insert((sheet, row, col));
-    trace_cell(model, sheet, row, col, &mut visited, 0, MAX_DEPTH)
+    trace_cell(model, sheet, row, col, &mut visited, 0, MAX_DEPTH, compare)
 }
 
 const MAX_DEPTH: u32 = 8;
@@ -88,6 +108,7 @@ fn trace_cell(
     visited: &mut HashSet<(u32, i32, i32)>,
     depth: u32,
     max_depth: u32,
+    compare: Option<&crate::compare::CompareSession>,
 ) -> TraceNode {
     let sheet_name = model
         .workbook
@@ -109,6 +130,10 @@ fn trace_cell(
     let parsed = formula_index(model, sheet, row, col)
         .and_then(|f| model.parsed_formulas.get(sheet as usize).and_then(|v| v.get(f)));
 
+    let compare_value = compare.and_then(|c| c.right_value_at(model, sheet, row, col));
+    let compare_differs = compare_value
+        .as_ref()
+        .is_some_and(|cv| cv != &value);
     let mut node = TraceNode {
         address,
         kind: if formula_text.is_some() { "cell" } else { "literal" },
@@ -121,6 +146,8 @@ fn trace_cell(
         is_error,
         cycle: false,
         truncated: false,
+        compare_value,
+        compare_differs,
         deps: Vec::new(),
     };
 
@@ -139,7 +166,7 @@ fn trace_cell(
         // shouldn't generate two child nodes.
         refs = dedupe_refs(refs);
         for r in refs.into_iter().take(MAX_SIBLINGS) {
-            node.deps.push(build_dep_node(model, &r, visited, depth, max_depth));
+            node.deps.push(build_dep_node(model, &r, visited, depth, max_depth, compare));
         }
     }
     node
@@ -243,6 +270,7 @@ fn build_dep_node(
     visited: &mut HashSet<(u32, i32, i32)>,
     depth: u32,
     max_depth: u32,
+    compare: Option<&crate::compare::CompareSession>,
 ) -> TraceNode {
     match r {
         CollectedRef::Cell { sheet, row, col } => {
@@ -253,6 +281,8 @@ fn build_dep_node(
                 let value = model
                     .get_formatted_cell_value(*sheet, *row, *col)
                     .unwrap_or_default();
+                let compare_value = compare.and_then(|c| c.right_value_at(model, *sheet, *row, *col));
+                let compare_differs = compare_value.as_ref().is_some_and(|cv| cv != &value);
                 return TraceNode {
                     address,
                     kind: "cell",
@@ -265,11 +295,13 @@ fn build_dep_node(
                     note: Some("(circular — already on path)".into()),
                     cycle: true,
                     truncated: false,
+                    compare_value,
+                    compare_differs,
                     deps: Vec::new(),
                 };
             }
             visited.insert(key);
-            let n = trace_cell(model, *sheet, *row, *col, visited, depth + 1, max_depth);
+            let n = trace_cell(model, *sheet, *row, *col, visited, depth + 1, max_depth, compare);
             visited.remove(&key);
             n
         }
@@ -294,6 +326,8 @@ fn build_dep_node(
                 is_error: false,
                 cycle: false,
                 truncated: false,
+                compare_value: None,
+                compare_differs: false,
                 deps: Vec::new(),
             }
         }
@@ -319,6 +353,8 @@ fn build_dep_node(
                 is_error: false,
                 cycle: false,
                 truncated: false,
+                compare_value: None,
+                compare_differs: false,
                 deps: Vec::new(),
             }
         }

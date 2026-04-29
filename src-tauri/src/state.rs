@@ -44,6 +44,14 @@ pub(crate) struct AppState {
     /// new_workbook and on any non-.xls open. Set to None when the
     /// source had no macros — most files.
     pub(crate) xls_preserved: Mutex<Option<crate::xls_preserve::PreservedXlsData>>,
+    /// Active compare session: a right-side workbook loaded for diff
+    /// purposes. Held in state so the trace command can enrich each
+    /// node with the right-side value, and so the GUI can survive
+    /// arbitrary edits without re-loading the right model. Cleared
+    /// on `compare_close`, on `new_workbook`, and on any `open_workbook`
+    /// (the new workbook becomes the new "left" — a stale comparison
+    /// against a different file would just confuse the user).
+    pub(crate) compare: Mutex<Option<crate::compare::CompareSession>>,
 }
 
 impl AppState {
@@ -56,6 +64,7 @@ impl AppState {
             hidden_cols: Mutex::new(HashMap::new()),
             style_dirty: Mutex::new(HashSet::new()),
             xls_preserved: Mutex::new(None),
+            compare: Mutex::new(None),
         }
     }
 }

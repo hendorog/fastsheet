@@ -177,7 +177,9 @@ commits, Esc cancels.
 ```
 /F R      Retrieve — open file picker. .xls and .xlsx supported.
 /F S      Save — see "Files" below for the picker dialog
-/F C      Combine                ⚠ not yet
+/F C O    Compare against another file — opens a docked diff list
+/F C X    Compare exit — close the comparison and clear the dock
+/F J      Combine                ⚠ not yet
 /F X      Xtract                 ⚠ not yet
 /F E      Erase a file from disk ⚠ not yet
 /F L      List files             ⚠ not yet
@@ -185,6 +187,30 @@ commits, Esc cancels.
 /F D      Change directory       ⚠ not yet
 /F A      Admin                  ⚠ not yet
 ```
+
+#### Compare mode
+
+`/F C O` picks a second workbook and diffs it against the active one
+(values + formulas; sheets matched by name). Each cell where the
+formatted display value or formula text differs gets highlighted in
+the grid (red = value, blue = formula, gold = missing on one side)
+and listed in a docked panel on the right.
+
+While compare is active:
+- `↑ ↓` move through the diff list
+- `Enter` jump cursor to the highlighted diff
+- `H` hide the panel — keeps compare highlights on the grid but
+  returns the keyboard to the grid (useful to type around)
+- `Esc` exit compare mode (same as `/F C X`)
+- The `/T T` trace popup picks up right-side values: each dep
+  renders `left | right`, and rows where the two sides disagree are
+  flagged in red/green so you can drill into a `#N/A` and see which
+  branch produced it on each side.
+
+Sheet matching is by name. Sheets that exist on only one side appear
+as headers at the top of the diff list. Style/format/width
+differences are not reported — only values and formulas are in
+scope.
 
 ### `/P` Print
 

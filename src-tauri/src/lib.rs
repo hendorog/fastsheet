@@ -1,4 +1,5 @@
 mod cells;
+pub mod compare;
 mod hidden;
 mod index;
 mod navigator;
@@ -62,6 +63,9 @@ pub fn run() {
             workbook::save_workbook,
             workbook::file_exists,
             workbook::backup_and_save,
+            workbook::compare_open,
+            workbook::compare_close,
+            workbook::compare_value_at,
             workbook::add_sheet,
             workbook::add_sheet_named,
             workbook::rename_sheet,

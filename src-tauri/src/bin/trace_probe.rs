@@ -36,7 +36,7 @@ fn main() {
     };
     model.evaluate();
 
-    let tree = fastsheet_lib::trace::trace(&model, s, r, c);
+    let tree = fastsheet_lib::trace::trace(&model, s, r, c, None);
     print_tree(&tree, 0);
 }
 

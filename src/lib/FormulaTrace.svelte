@@ -273,7 +273,15 @@
           <span class="icon kind-{row.node.kind}">{iconFor(row.node)}</span>
           <span class="addr">{row.node.address}</span>
           <span class="eq">=</span>
-          <span class="value">{row.node.value || "(empty)"}</span>
+          <span class="value" class:diff={row.node.compare_differs}
+            >{row.node.value || "(empty)"}</span
+          >
+          {#if row.node.compare_value !== null}
+            <span class="cmp-sep">|</span>
+            <span class="cmp-value" class:diff={row.node.compare_differs}
+              >{row.node.compare_value || "(empty)"}</span
+            >
+          {/if}
           {#if row.node.formula}
             <span class="formula">{row.node.formula}</span>
           {/if}
@@ -440,6 +448,23 @@
     overflow: hidden;
     text-overflow: ellipsis;
     max-width: 320px;
+  }
+  .value.diff {
+    color: #f88;
+  }
+  .cmp-sep {
+    color: #666;
+    margin: 0 4px;
+  }
+  .cmp-value {
+    color: #888;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 320px;
+  }
+  .cmp-value.diff {
+    color: #6c6;
+    font-weight: bold;
   }
   .formula {
     color: #6cf;

@@ -8,6 +8,7 @@
   import Navigator from "$lib/Navigator.svelte";
   import SheetTabs from "$lib/SheetTabs.svelte";
   import FormulaTrace from "$lib/FormulaTrace.svelte";
+  import CompareDiff from "$lib/CompareDiff.svelte";
   import {
     buildMenu,
     saveMenuItems,
@@ -24,6 +25,9 @@
     BackupResult,
     TraceNode,
     NamedRangeInfo,
+    CompareResult,
+    CompareDiff as CompareDiffType,
+    CompareSheetMissing,
   } from "$lib/types";
   import {
     addr,
@@ -97,6 +101,15 @@
   /// grid without dropping trace state.
   let traceDocked = $state(false);
   let traceHidden = $state(false);
+  /// Active workbook comparison. Null = compare mode off. The dock
+  /// shows the diff list; trace popups in this mode pick up
+  /// compare_value on each node so deps render `left | right`.
+  let compareResult = $state<CompareResult | null>(null);
+  let compareHidden = $state(false);
+  /// When true the navigator is being used to pick the right-side
+  /// file for a compare; on activate, it routes to compareOpen instead
+  /// of opening the workbook.
+  let navCompareTarget = $state(false);
   /// Snapshot of (sheet, cursor) at the moment the trace popup
   /// opened. Restored on Esc close so the user lands back where they
   /// started. Cleared if they Enter-jump to a previewed cell instead.
@@ -808,6 +821,110 @@
       statusMsg = `Recalc failed: ${e}`;
     }
   }
+
+  /// /File Compare Open — pick a file via the navigator, then load+diff.
+  function compareOpen() {
+    navMode = "open";
+    navCompareTarget = true;
+    navOpen = true;
+    statusMsg = "Pick a file to compare against";
+  }
+
+  async function compareOpenWith(p: string) {
+    try {
+      const r = await invoke<CompareResult>("compare_open", { path: p });
+      compareResult = r;
+      compareHidden = false;
+      const cap = r.diffs_capped ? ` (showing ${r.diffs.length})` : "";
+      statusMsg = `Compare: ${r.total_diffs} diff${r.total_diffs === 1 ? "" : "s"}${cap}`;
+    } catch (e) {
+      statusMsg = `Compare failed: ${e}`;
+      compareResult = null;
+    }
+  }
+
+  /// /File Compare Exit — close the comparison and clear the dock.
+  async function compareExit() {
+    if (!compareResult) {
+      statusMsg = "No active comparison";
+      return;
+    }
+    try {
+      await invoke("compare_close");
+    } catch (e) {
+      // Backend should never fail to close; not worth blocking the UI.
+      console.warn("compare_close failed:", e);
+    }
+    compareResult = null;
+    compareHidden = false;
+    statusMsg = "Compare closed";
+    focusGrid();
+  }
+
+  /// Jump cursor to a diff cell. Switches sheet if the diff is on a
+  /// different one, then moves selection.
+  async function compareJumpTo(d: CompareDiffType) {
+    if (d.sheet_idx === null) return;
+    if (d.sheet_idx !== activeSheet) {
+      await switchSheet(d.sheet_idx);
+    }
+    selRow = d.row;
+    selCol = d.col;
+    rangeEndRow = d.row;
+    rangeEndCol = d.col;
+    growViewportToInclude(d.row, d.col);
+  }
+
+  /// Preview = highlight without moving cursor. Just like trace
+  /// preview: switch the active sheet so the user sees context, but
+  /// leave the actual selection alone (it's restored when compare
+  /// exits via the trace popup's origin-snapshot pattern is not
+  /// applicable here — the user explicitly entered compare mode).
+  async function comparePreview(d: CompareDiffType) {
+    if (d.sheet_idx === null) return;
+    if (d.sheet_idx !== activeSheet) {
+      await switchSheet(d.sheet_idx);
+    }
+    growViewportToInclude(d.row, d.col);
+    // Fire a one-shot scroll target so the grid centers on the diff
+    // cell without changing the cursor.
+    scrollTarget = { row: d.row, col: d.col };
+  }
+
+  /// Highlight overlays for every visible diff on the active sheet.
+  /// Color tints by kind so the user can spot value vs formula vs
+  /// missing at a glance. Capped at the diff list size — not
+  /// lazy-rendered yet because the grid handles ~5000 overlays fine
+  /// (see existing refHighlights pipeline).
+  let compareHighlights = $derived.by(() => {
+    if (!compareResult) return [];
+    const out: typeof refHighlights = [];
+    for (const d of compareResult.diffs) {
+      if (d.sheet_idx === null) continue;
+      let color: string;
+      switch (d.kind) {
+        case "value":
+          color = "#f88";
+          break;
+        case "formula":
+          color = "#6cf";
+          break;
+        case "missing-left":
+        case "missing-right":
+          color = "#c8a060";
+          break;
+      }
+      out.push({
+        sheet: d.sheet_idx,
+        r1: d.row,
+        c1: d.col,
+        r2: d.row,
+        c2: d.col,
+        color,
+      });
+    }
+    return out;
+  });
 
   /// /Trace Trace — open the dependency-tree popup for the current cell.
   async function traceFormula() {
@@ -2856,6 +2973,8 @@
     traceFormula,
     traceGoto,
     traceNames,
+    compareOpen,
+    compareExit,
   });
 
   let levelItems = $derived(
@@ -2975,6 +3094,12 @@
     // hidden the popup is collapsed to a tiny status bar and gives
     // up the keyboard, so the grid runs as normal.
     if (traceRoot && !traceHidden) {
+      return;
+    }
+    // Compare panel is also keyboard-modal when visible. When hidden
+    // (its tiny bar) it gives up keys to the grid the same way the
+    // trace popup does — H brings it back.
+    if (compareResult && !compareHidden) {
       return;
     }
     // Pending /Copy or /Move — arrow keys steer the destination, Enter
@@ -3341,7 +3466,12 @@
       {currentPath}
       onOpenFile={async (p) => {
         navOpen = false;
-        await openWorkbookFromPath(p);
+        if (navCompareTarget) {
+          navCompareTarget = false;
+          await compareOpenWith(p);
+        } else {
+          await openWorkbookFromPath(p);
+        }
       }}
       onSaveFile={async (p) => {
         navOpen = false;
@@ -3384,6 +3514,20 @@
     />
   {/if}
 
+  {#if compareResult}
+    <CompareDiff
+      diffs={compareResult.diffs}
+      missingSheets={compareResult.missing_sheets}
+      rightPath={compareResult.right_path}
+      totalDiffs={compareResult.total_diffs}
+      capped={compareResult.diffs_capped}
+      onClose={compareExit}
+      onJump={compareJumpTo}
+      onPreview={comparePreview}
+      bind:hidden={compareHidden}
+    />
+  {/if}
+
   <Grid
     {cells}
     {colWidths}
@@ -3394,7 +3538,10 @@
     {frozenCols}
     {mergedRanges}
     {ghostRange}
-    highlights={refHighlights.filter((h) => h.sheet === activeSheet)}
+    highlights={[
+      ...refHighlights.filter((h) => h.sheet === activeSheet),
+      ...compareHighlights.filter((h) => h.sheet === activeSheet),
+    ]}
     {scrollTarget}
     bind:selRow
     bind:selCol

@@ -99,7 +99,38 @@ export type TraceNode = {
   is_error: boolean;
   cycle: boolean;
   truncated: boolean;
+  /// Right-side formatted value when a compare session is active.
+  /// null otherwise.
+  compare_value: string | null;
+  /// True iff `compare_value` differs from `value`.
+  compare_differs: boolean;
   deps: TraceNode[];
+};
+
+export type CompareDiff = {
+  sheet: string;
+  sheet_idx: number | null;
+  row: number;
+  col: number;
+  address: string;
+  left_value: string;
+  right_value: string;
+  left_formula: string | null;
+  right_formula: string | null;
+  kind: "value" | "formula" | "missing-left" | "missing-right";
+};
+
+export type CompareSheetMissing = {
+  sheet: string;
+  side: "left" | "right";
+};
+
+export type CompareResult = {
+  right_path: string;
+  diffs: CompareDiff[];
+  missing_sheets: CompareSheetMissing[];
+  total_diffs: number;
+  diffs_capped: boolean;
 };
 
 export type NamedRangeInfo = {
