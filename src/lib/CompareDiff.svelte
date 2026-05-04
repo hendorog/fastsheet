@@ -289,6 +289,20 @@
         return "+L";
     }
   }
+
+  /// Single-character badge by category — what the filter buckets on.
+  /// Distinct from kindLabel so the panel's badge colors line up with
+  /// the active filter.
+  function categoryLabel(c: CompareDiff["category"]): string {
+    switch (c) {
+      case "value":
+        return "≠";
+      case "formula":
+        return "ƒ";
+      case "other":
+        return "↯";
+    }
+  }
 </script>
 
 {#if hidden}
@@ -386,7 +400,7 @@
           {:else}
             {@const d = row.diff}
             <div
-              class="row kind-{d.kind}"
+              class="row cat-{d.category}"
               class:hl={i === highlight}
               data-idx={i}
               role="button"
@@ -399,16 +413,32 @@
                 highlight = i;
               }}
             >
-              <span class="badge">{kindLabel(d.kind)}</span>
+              <span class="badge">{categoryLabel(d.category)}</span>
               <span class="addr">{d.address}</span>
-              <span class="left-value">{d.left_value || "(empty)"}</span>
-              <span class="arrow">→</span>
-              <span class="right-value">{d.right_value || "(empty)"}</span>
-              {#if d.kind === "formula"}
-                <span class="formula-hint"
-                  >{d.left_formula} → {d.right_formula}</span
-                >
-              {/if}
+              <div class="cell-detail">
+                <div class="value-line">
+                  <span class="left-value">{d.left_value || "(empty)"}</span>
+                  <span class="arrow">→</span>
+                  <span class="right-value">{d.right_value || "(empty)"}</span>
+                </div>
+                {#if d.category === "formula"}
+                  <div class="formula-line">
+                    <span class="formula-side"
+                      >{d.left_formula ?? "(no formula)"}</span
+                    >
+                    <span class="arrow">→</span>
+                    <span class="formula-side"
+                      >{d.right_formula ?? "(no formula)"}</span
+                    >
+                  </div>
+                {:else if d.category === "other"}
+                  <div class="formula-line">
+                    <span class="formula-shared"
+                      >same formula: {d.left_formula ?? d.right_formula ?? ""}</span
+                    >
+                  </div>
+                {/if}
+              </div>
             </div>
           {/if}
         {/each}
@@ -578,12 +608,46 @@
   }
   .row {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 6px;
     padding: 2px 12px;
     cursor: pointer;
     white-space: nowrap;
     user-select: none;
+  }
+  .cell-detail {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+  }
+  .value-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .formula-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #aaa;
+    font-style: italic;
+    font-size: 12px;
+    margin-top: 1px;
+    min-width: 0;
+  }
+  .formula-side {
+    color: #6cf;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+  }
+  .formula-shared {
+    color: #888;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 420px;
   }
   .row.hl {
     background: #3a2a2a;
@@ -596,14 +660,13 @@
     font-size: 11px;
     font-weight: bold;
   }
-  .row.kind-value .badge {
+  .row.cat-value .badge {
     color: #f88;
   }
-  .row.kind-formula .badge {
+  .row.cat-formula .badge {
     color: #6cf;
   }
-  .row.kind-missing-left .badge,
-  .row.kind-missing-right .badge {
+  .row.cat-other .badge {
     color: #c8a060;
   }
   .addr {
