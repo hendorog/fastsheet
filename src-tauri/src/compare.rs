@@ -47,6 +47,15 @@ pub struct CompareDiff {
     /// "formula" — formatted value matches but formula text differs.
     /// "missing-left" / "missing-right" — cell present on only one side.
     pub kind: &'static str,
+    /// High-level bucket for filtering. "value" iff NEITHER side
+    /// carries a formula at this cell — i.e. the diff is purely
+    /// between literal values. "formula" iff EITHER side carries a
+    /// formula. The Compare dock toggles `value` / `formula` /
+    /// `both` against this field so the filter behaviour matches the
+    /// user's mental model ("show me only the formula diffs"
+    /// excludes pure value mismatches even when those exist on
+    /// formula cells, and vice versa).
+    pub category: &'static str,
 }
 
 /// Sheet-level summary entries placed at the top of the diff list
@@ -274,6 +283,17 @@ fn diff_sheet(
             // though the displayed answer is the same.
             "formula"
         };
+        // Category filter bucket: formula iff either side has a
+        // formula, else value. Keeps "missing on right where left
+        // had a formula" classified as a formula diff (the
+        // formula is the substantive content lost), and "missing
+        // on right where left was a literal" as value (loss of a
+        // value).
+        let category: &'static str = if left_formula.is_some() || right_formula.is_some() {
+            "formula"
+        } else {
+            "value"
+        };
 
         *total += 1;
         if out.len() >= MAX_DIFFS {
@@ -293,6 +313,7 @@ fn diff_sheet(
             left_formula,
             right_formula,
             kind,
+            category,
         });
     }
 }

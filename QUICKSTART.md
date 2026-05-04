@@ -199,6 +199,14 @@ and listed in a docked panel on the right.
 While compare is active:
 - `↑ ↓` move through the diff list
 - `Enter` jump cursor to the highlighted diff
+- `← / →` collapse / expand the current row's sheet group
+- `* / /` expand-all / collapse-all sheet groups
+- `V` cycle filter: both → value-only → formula-only → both. Value
+  diffs are cells where neither side has a formula; formula diffs
+  are cells where either side has a formula (so changing `=A1+B1`
+  to `=A1+B2` is a formula diff regardless of whether the result
+  changes). The header row also has clickable filter buttons with
+  per-bucket counts.
 - `H` hide the panel — keeps compare highlights on the grid but
   returns the keyboard to the grid (useful to type around)
 - `Esc` exit compare mode (same as `/F C X`)

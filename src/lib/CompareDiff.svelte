@@ -8,8 +8,12 @@
   ///   Esc      close compare mode entirely
   ///   ↑ / ↓    move highlight between diffs
   ///   Enter    jump cursor to the highlighted diff
+  ///   ←        collapse the current row's sheet group
+  ///   →        expand the current row's sheet group
+  ///   *        expand all sheets
+  ///   /        collapse all sheets
+  ///   V        cycle filter: both → value-only → formula-only → both
   ///   H        hide / show this dock (compare mode stays active)
-  ///   D        toggle dock width (currently fixed; reserved)
 
   import { onMount, tick } from "svelte";
   import type { CompareDiff, CompareSheetMissing } from "./types";
@@ -38,11 +42,37 @@
   }: Props = $props();
 
   let highlight = $state(0);
+  /// Filter modes:
+  ///   "both"    — show value diffs and formula diffs (default)
+  ///   "value"   — only diffs where neither side has a formula
+  ///   "formula" — only diffs where either side has a formula
+  let filterMode = $state<"both" | "value" | "formula">("both");
+  /// Sheet names whose diff group is currently collapsed in the
+  /// list. Headers stay visible (with a count); their diff rows
+  /// are hidden.
+  let collapsedSheets = $state(new Set<string>());
+
+  /// Diffs that pass the current filter. Used both for grouping in
+  /// the rows derivation and for the "showing N of M" count.
+  let filteredDiffs = $derived.by(() => {
+    if (filterMode === "both") return diffs;
+    return diffs.filter((d) => d.category === filterMode);
+  });
+
+  /// Per-sheet count from the FILTERED set — what the user sees in
+  /// the list, not the full count from the backend.
+  let countsBySheet = $derived.by(() => {
+    const m = new Map<string, number>();
+    for (const d of filteredDiffs) {
+      m.set(d.sheet, (m.get(d.sheet) ?? 0) + 1);
+    }
+    return m;
+  });
 
   /// Group diffs by sheet for display, but preserve a flat row index
   /// so keyboard navigation and onPreview wiring stays simple.
   type FlatRow =
-    | { kind: "header"; sheet: string }
+    | { kind: "header"; sheet: string; count: number; collapsed: boolean }
     | { kind: "diff"; diff: CompareDiff }
     | { kind: "missing"; missing: CompareSheetMissing };
 
@@ -52,14 +82,76 @@
       out.push({ kind: "missing", missing: m });
     }
     let lastSheet: string | null = null;
-    for (const d of diffs) {
+    for (const d of filteredDiffs) {
       if (d.sheet !== lastSheet) {
-        out.push({ kind: "header", sheet: d.sheet });
+        out.push({
+          kind: "header",
+          sheet: d.sheet,
+          count: countsBySheet.get(d.sheet) ?? 0,
+          collapsed: collapsedSheets.has(d.sheet),
+        });
         lastSheet = d.sheet;
       }
+      // Suppress diff rows whose sheet is collapsed — header keeps
+      // showing so the user can re-expand and the count is still
+      // visible.
+      if (collapsedSheets.has(d.sheet)) continue;
       out.push({ kind: "diff", diff: d });
     }
     return out;
+  });
+
+  /// Sheet name for the row at index i, walking backwards to the
+  /// nearest header. Used by the ← / → keyboard handlers so
+  /// collapse-on-current-row knows which sheet to act on.
+  function sheetOfRow(i: number): string | null {
+    for (let j = i; j >= 0; j--) {
+      const r = rows[j];
+      if (r?.kind === "header") return r.sheet;
+      if (r?.kind === "diff") return r.diff.sheet;
+    }
+    return null;
+  }
+
+  function toggleSheet(name: string) {
+    const next = new Set(collapsedSheets);
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    collapsedSheets = next;
+  }
+
+  function collapseAll() {
+    const next = new Set<string>();
+    for (const d of filteredDiffs) next.add(d.sheet);
+    collapsedSheets = next;
+  }
+
+  function expandAll() {
+    collapsedSheets = new Set();
+  }
+
+  function cycleFilter() {
+    filterMode =
+      filterMode === "both"
+        ? "value"
+        : filterMode === "value"
+          ? "formula"
+          : "both";
+  }
+
+  /// Re-anchor the highlight on the first diff row whenever the
+  /// visible row set changes (filter or collapse). Without this,
+  /// hiding the row under the highlight leaves the user pointing at
+  /// nothing and Enter becomes a no-op.
+  $effect(() => {
+    rows;
+    if (rows[highlight]?.kind === "diff") return;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].kind === "diff") {
+        highlight = i;
+        return;
+      }
+    }
   });
 
   /// Keep highlight pointing at a "diff" row — skip headers when
@@ -109,6 +201,38 @@
       e.preventDefault();
       e.stopPropagation();
       activate(highlight);
+      return;
+    }
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      e.stopPropagation();
+      const name = sheetOfRow(highlight);
+      if (name && !collapsedSheets.has(name)) toggleSheet(name);
+      return;
+    }
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      e.stopPropagation();
+      const name = sheetOfRow(highlight);
+      if (name && collapsedSheets.has(name)) toggleSheet(name);
+      return;
+    }
+    if (e.key === "*") {
+      e.preventDefault();
+      e.stopPropagation();
+      expandAll();
+      return;
+    }
+    if (e.key === "/") {
+      e.preventDefault();
+      e.stopPropagation();
+      collapseAll();
+      return;
+    }
+    if (e.key === "v" || e.key === "V") {
+      e.preventDefault();
+      e.stopPropagation();
+      cycleFilter();
       return;
     }
   }
@@ -182,12 +306,36 @@
         <span class="path">vs {basename(rightPath)}</span>
       </div>
       <div class="meta">
-        <span
-          >{totalDiffs} diff{totalDiffs === 1 ? "" : "s"}{capped
-            ? ` (showing ${diffs.length})`
-            : ""}</span
-        >
-        <span class="hint">↑↓ Enter · H hide · Esc exit</span>
+        <span class="counts">
+          <button
+            type="button"
+            class="filter-btn"
+            class:active={filterMode === "both"}
+            onclick={() => (filterMode = "both")}
+            >both ({diffs.length})</button
+          >
+          <button
+            type="button"
+            class="filter-btn"
+            class:active={filterMode === "value"}
+            onclick={() => (filterMode = "value")}
+            >value ({diffs.filter((d) => d.category === "value").length})</button
+          >
+          <button
+            type="button"
+            class="filter-btn"
+            class:active={filterMode === "formula"}
+            onclick={() => (filterMode = "formula")}
+            >formula ({diffs.filter((d) => d.category === "formula")
+              .length})</button
+          >
+        </span>
+        {#if capped}
+          <span class="capped-note">backend cap: {totalDiffs}+</span>
+        {/if}
+      </div>
+      <div class="hint">
+        ↑↓ Enter · ←/→ collapse/expand · * / · V filter · H hide · Esc exit
       </div>
     </div>
     {#if rows.length === 0}
@@ -199,7 +347,26 @@
       <div class="list" bind:this={listEl}>
         {#each rows as row, i}
           {#if row.kind === "header"}
-            <div class="sheet-header" data-idx={i}>{row.sheet}</div>
+            <div
+              class="sheet-header"
+              class:collapsed={row.collapsed}
+              data-idx={i}
+              role="button"
+              tabindex="-1"
+              onclick={() => toggleSheet(row.sheet)}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  toggleSheet(row.sheet);
+                }
+              }}
+            >
+              <span class="caret"
+                >{row.collapsed ? "▶" : "▼"}</span
+              >
+              <span class="sheet-name">{row.sheet}</span>
+              <span class="sheet-count">({row.count})</span>
+            </div>
           {:else if row.kind === "missing"}
             <div class="missing-row" data-idx={i}>
               {row.missing.side === "left"
@@ -322,8 +489,38 @@
     color: #aaa;
     font-size: 11px;
   }
+  .counts {
+    display: flex;
+    gap: 4px;
+  }
+  .filter-btn {
+    background: transparent;
+    color: #aaa;
+    border: 1px solid #333;
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-family: monospace;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .filter-btn:hover {
+    background: #2a2a2a;
+    color: #ddd;
+  }
+  .filter-btn.active {
+    background: #3a2a2a;
+    color: #f99;
+    border-color: #553;
+  }
+  .capped-note {
+    color: #c8a060;
+    font-size: 10px;
+    font-style: italic;
+  }
   .hint {
     color: #888;
+    font-size: 11px;
+    padding-top: 2px;
   }
   .empty {
     padding: 24px 16px;
@@ -339,6 +536,30 @@
     color: #6cf;
     font-weight: bold;
     border-top: 1px solid #2a2a2a;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .sheet-header:hover {
+    background: #1f2a35;
+  }
+  .sheet-header.collapsed {
+    color: #5a8;
+  }
+  .sheet-header .caret {
+    color: #888;
+    font-size: 10px;
+    width: 10px;
+  }
+  .sheet-name {
+    color: inherit;
+  }
+  .sheet-count {
+    color: #888;
+    font-weight: normal;
+    font-size: 11px;
   }
   .missing-row {
     padding: 4px 12px;

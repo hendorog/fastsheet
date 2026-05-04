@@ -118,6 +118,10 @@ export type CompareDiff = {
   left_formula: string | null;
   right_formula: string | null;
   kind: "value" | "formula" | "missing-left" | "missing-right";
+  /// Filter bucket: "formula" if either side has a formula at this
+  /// cell, "value" if neither does. Kept separate from `kind` so
+  /// `missing-right` of a formula cell still filters as "formula".
+  category: "value" | "formula";
 };
 
 export type CompareSheetMissing = {
