@@ -201,12 +201,17 @@ While compare is active:
 - `Enter` jump cursor to the highlighted diff
 - `← / →` collapse / expand the current row's sheet group
 - `* / /` expand-all / collapse-all sheet groups
-- `V` cycle filter: both → value-only → formula-only → both. Value
-  diffs are cells where neither side has a formula; formula diffs
-  are cells where either side has a formula (so changing `=A1+B1`
-  to `=A1+B2` is a formula diff regardless of whether the result
-  changes). The header row also has clickable filter buttons with
-  per-bucket counts.
+- `V` cycle filter: all → value → formula → other → all. The
+  header row also has clickable filter buttons with per-bucket
+  counts. Buckets:
+  - **value**: neither side has a formula; the literal values
+    differ.
+  - **formula**: the formula text actually differs (e.g. `=A1+B1`
+    vs `=A1+B2`). A formula on one side and a literal on the
+    other counts here too.
+  - **other**: both sides have the *same* formula but it
+    evaluates to different values — usually a downstream symptom
+    of an upstream input change.
 - `H` hide the panel — keeps compare highlights on the grid but
   returns the keyboard to the grid (useful to type around)
 - `Esc` exit compare mode (same as `/F C X`)

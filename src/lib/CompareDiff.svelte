@@ -12,7 +12,7 @@
   ///   →        expand the current row's sheet group
   ///   *        expand all sheets
   ///   /        collapse all sheets
-  ///   V        cycle filter: both → value-only → formula-only → both
+  ///   V        cycle filter: all → value → formula → other → all
   ///   H        hide / show this dock (compare mode stays active)
 
   import { onMount, tick } from "svelte";
@@ -43,10 +43,16 @@
 
   let highlight = $state(0);
   /// Filter modes:
-  ///   "both"    — show value diffs and formula diffs (default)
-  ///   "value"   — only diffs where neither side has a formula
-  ///   "formula" — only diffs where either side has a formula
-  let filterMode = $state<"both" | "value" | "formula">("both");
+  ///   "all"     — every diff (default)
+  ///   "value"   — only literal-vs-literal value diffs (neither
+  ///               side has a formula)
+  ///   "formula" — only diffs where the formula TEXT differs
+  ///               (None vs Some counts; same formula evaluating
+  ///               to different values is NOT here)
+  ///   "other"   — same formula on both sides, value differs.
+  ///               These are downstream symptoms of an upstream
+  ///               input change.
+  let filterMode = $state<"all" | "value" | "formula" | "other">("all");
   /// Sheet names whose diff group is currently collapsed in the
   /// list. Headers stay visible (with a count); their diff rows
   /// are hidden.
@@ -55,7 +61,7 @@
   /// Diffs that pass the current filter. Used both for grouping in
   /// the rows derivation and for the "showing N of M" count.
   let filteredDiffs = $derived.by(() => {
-    if (filterMode === "both") return diffs;
+    if (filterMode === "all") return diffs;
     return diffs.filter((d) => d.category === filterMode);
   });
 
@@ -131,12 +137,9 @@
   }
 
   function cycleFilter() {
-    filterMode =
-      filterMode === "both"
-        ? "value"
-        : filterMode === "value"
-          ? "formula"
-          : "both";
+    const order = ["all", "value", "formula", "other"] as const;
+    const i = order.indexOf(filterMode);
+    filterMode = order[(i + 1) % order.length];
   }
 
   /// Re-anchor the highlight on the first diff row whenever the
@@ -310,9 +313,9 @@
           <button
             type="button"
             class="filter-btn"
-            class:active={filterMode === "both"}
-            onclick={() => (filterMode = "both")}
-            >both ({diffs.length})</button
+            class:active={filterMode === "all"}
+            onclick={() => (filterMode = "all")}
+            >all ({diffs.length})</button
           >
           <button
             type="button"
@@ -328,6 +331,13 @@
             onclick={() => (filterMode = "formula")}
             >formula ({diffs.filter((d) => d.category === "formula")
               .length})</button
+          >
+          <button
+            type="button"
+            class="filter-btn"
+            class:active={filterMode === "other"}
+            onclick={() => (filterMode = "other")}
+            >other ({diffs.filter((d) => d.category === "other").length})</button
           >
         </span>
         {#if capped}

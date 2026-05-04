@@ -47,14 +47,20 @@ pub struct CompareDiff {
     /// "formula" — formatted value matches but formula text differs.
     /// "missing-left" / "missing-right" — cell present on only one side.
     pub kind: &'static str,
-    /// High-level bucket for filtering. "value" iff NEITHER side
-    /// carries a formula at this cell — i.e. the diff is purely
-    /// between literal values. "formula" iff EITHER side carries a
-    /// formula. The Compare dock toggles `value` / `formula` /
-    /// `both` against this field so the filter behaviour matches the
-    /// user's mental model ("show me only the formula diffs"
-    /// excludes pure value mismatches even when those exist on
-    /// formula cells, and vice versa).
+    /// High-level bucket for filtering. Three values:
+    ///   "formula" — the FORMULA TEXT differs between the two
+    ///               sides. None vs Some counts as different too,
+    ///               so a formula on one side and a literal on the
+    ///               other lands here.
+    ///   "value"   — neither side has a formula; the literal
+    ///               values differ.
+    ///   "other"   — both sides have the SAME formula text, but
+    ///               the formula evaluates to different values.
+    ///               This usually means an upstream input differs
+    ///               and the diff is downstream of where the real
+    ///               change lives.
+    /// The Compare dock filters on this field (All / Value /
+    /// Formula / Other).
     pub category: &'static str,
 }
 
@@ -283,16 +289,19 @@ fn diff_sheet(
             // though the displayed answer is the same.
             "formula"
         };
-        // Category filter bucket: formula iff either side has a
-        // formula, else value. Keeps "missing on right where left
-        // had a formula" classified as a formula diff (the
-        // formula is the substantive content lost), and "missing
-        // on right where left was a literal" as value (loss of a
-        // value).
-        let category: &'static str = if left_formula.is_some() || right_formula.is_some() {
+        // Category filter bucket — see CompareDiff::category for the
+        // full rule. Order matters: formula-text differs covers
+        // None-vs-Some too, so "missing where the other side had a
+        // formula" lands in formula. Otherwise neither side has a
+        // formula → value. Else both have the same formula text but
+        // the evaluated value differs → other (the diff is
+        // downstream of an upstream input change).
+        let category: &'static str = if !formulas_equal {
             "formula"
-        } else {
+        } else if left_formula.is_none() && right_formula.is_none() {
             "value"
+        } else {
+            "other"
         };
 
         *total += 1;
