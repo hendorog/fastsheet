@@ -10,6 +10,7 @@
   import FormulaTrace from "$lib/FormulaTrace.svelte";
   import CompareDiff from "$lib/CompareDiff.svelte";
   import FormatCellsDialog from "$lib/FormatCellsDialog.svelte";
+  import ColorPicker from "$lib/ColorPicker.svelte";
   import {
     buildMenu,
     saveMenuItems,
@@ -107,6 +108,19 @@
   // selection but the form seeds from the active cell.
   let formatModalOpen = $state(false);
   let formatModalCell = $state({ row: 1, col: 1, r1: 1, c1: 1, r2: 1, c2: 1 });
+
+  /// Generic color picker overlay. Replaces the old hex-only prompt
+  /// for /R F B and /R F X. The handlers (onSelect / onClear) are set
+  /// at the call site so one component can serve both fill and text
+  /// flows. `recents` is freshly queried each time the picker opens
+  /// so newly-applied colors appear immediately.
+  let colorPickerOpen = $state(false);
+  let colorPickerTitle = $state("Pick a colour");
+  let colorPickerInitial = $state("");
+  let colorPickerRecents = $state<string[]>([]);
+  let colorPickerAllowClear = $state(true);
+  let colorPickerOnSelect = $state<(hex: string) => void | Promise<void>>((_h) => {});
+  let colorPickerOnClear = $state<(() => void | Promise<void>) | null>(null);
 
   /// Formula trace popup — set to a TraceNode to show the popup,
   /// null to close. Driven by the /T menu items.
@@ -2692,23 +2706,43 @@
     applyStyleOp(op, label);
   }
 
-  function promptColor(label: string, onColor: (color: string) => void, onClear: () => void) {
-    openMenuPrompt(label, "#FFD966", (v) => {
-      const t = v.trim();
-      if (t === "") {
-        onClear();
-      } else if (/^#[0-9A-Fa-f]{6}$/.test(t)) {
-        onColor(t.toUpperCase());
-      } else {
-        statusMsg = `Invalid colour: ${v} (use #RRGGBB or leave empty)`;
-        focusGrid();
-      }
-    });
+  /// Open the autocomplete color picker. Replaces the old hex-only
+  /// prompt — the picker handles named-color autocomplete + custom
+  /// HSL editing internally. `recents` are seeded from the workbook's
+  /// in-use colors so the user can match the existing palette.
+  async function promptColor(
+    title: string,
+    initial: string,
+    onColor: (color: string) => void | Promise<void>,
+    onClear: () => void | Promise<void>,
+  ) {
+    let recents: string[] = [];
+    try {
+      recents = await invoke<string[]>("list_workbook_colors");
+    } catch {
+      recents = [];
+    }
+    colorPickerTitle = title;
+    colorPickerInitial = initial;
+    colorPickerRecents = recents;
+    colorPickerAllowClear = true;
+    colorPickerOnSelect = (hex) => {
+      colorPickerOpen = false;
+      onColor(hex);
+      focusGrid();
+    };
+    colorPickerOnClear = () => {
+      colorPickerOpen = false;
+      onClear();
+      focusGrid();
+    };
+    colorPickerOpen = true;
   }
 
   function setFillColor() {
     promptColor(
-      "Fill colour (#RRGGBB, empty to clear):",
+      "Fill colour",
+      "#FFD966",
       (color) => applyStyleOp({ kind: "set_fill_color", color }, `Filled`),
       () => applyStyleOp({ kind: "clear_fill_color" }, `Cleared fill`),
     );
@@ -2720,7 +2754,8 @@
 
   function setTextColor() {
     promptColor(
-      "Text colour (#RRGGBB, empty to clear):",
+      "Text colour",
+      "#000000",
       (color) => applyStyleOp({ kind: "set_text_color", color }, `Set text colour`),
       () => applyStyleOp({ kind: "clear_text_color" }, `Cleared text colour`),
     );
@@ -3170,7 +3205,7 @@
       // Only open the goto prompt when nothing else owns the keyboard.
       if (
         e.key === "F5" &&
-        !menuPrompt && !navOpen && !menuOpen && !pendingMove && !pendingAxisPick && !editing && !formatModalOpen
+        !menuPrompt && !navOpen && !menuOpen && !pendingMove && !pendingAxisPick && !editing && !formatModalOpen && !colorPickerOpen
       ) {
         openF5GotoPrompt();
       }
@@ -3238,6 +3273,12 @@
     // Format Cells dialog owns its own keyboard — let it handle Esc /
     // Enter / Ctrl+1..5 internally without the grid intercepting.
     if (formatModalOpen) {
+      return;
+    }
+    // Color picker owns its own keyboard (typing filters, arrows
+    // navigate, Enter picks, Esc cancels). Don't let the grid eat
+    // those keys.
+    if (colorPickerOpen) {
       return;
     }
     // Cell editing — handle Enter/Esc here. Must come BEFORE the generic
@@ -3675,6 +3716,21 @@
         await refreshRows(formatModalCell.r1, formatModalCell.r2);
       }}
       onStatus={(m) => (statusMsg = m)}
+    />
+  {/if}
+
+  {#if colorPickerOpen}
+    <ColorPicker
+      title={colorPickerTitle}
+      initial={colorPickerInitial}
+      recents={colorPickerRecents}
+      allowClear={colorPickerAllowClear}
+      onSelect={colorPickerOnSelect}
+      onClear={colorPickerOnClear ?? undefined}
+      onCancel={() => {
+        colorPickerOpen = false;
+        focusGrid();
+      }}
     />
   {/if}
 

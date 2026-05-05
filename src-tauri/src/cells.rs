@@ -687,6 +687,42 @@ pub(crate) fn set_range_number_format(
     Ok(n)
 }
 
+/// Distinct hex colors actually used anywhere in the workbook's
+/// style table. Used by the ColorPicker as the "recents" row so the
+/// user can match an existing palette without retyping a hex string.
+/// Only `#RRGGBB` values pass through — theme references and indexed
+/// palette entries (legacy xlsx) are skipped, since the picker's
+/// custom editor works in HSL space and needs a literal RGB.
+#[tauri::command]
+pub(crate) fn list_workbook_colors(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    use std::collections::BTreeSet;
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    let mut seen = BTreeSet::new();
+    let mut push = |c: &Option<String>| {
+        if let Some(s) = c {
+            if s.starts_with('#') && s.len() == 7 {
+                seen.insert(s.to_uppercase());
+            }
+        }
+    };
+    for f in &model.workbook.styles.fonts {
+        push(&f.color);
+    }
+    for f in &model.workbook.styles.fills {
+        push(&f.fg_color);
+        push(&f.bg_color);
+    }
+    for b in &model.workbook.styles.borders {
+        if let Some(s) = &b.left { push(&s.color); }
+        if let Some(s) = &b.right { push(&s.color); }
+        if let Some(s) = &b.top { push(&s.color); }
+        if let Some(s) = &b.bottom { push(&s.color); }
+        if let Some(s) = &b.diagonal { push(&s.color); }
+    }
+    Ok(seen.into_iter().collect())
+}
+
 /// Comprehensive style snapshot for the Format Cells modal. Pulls
 /// num_fmt + alignment + font + fill + borders from a single cell so
 /// the dialog can populate all tabs in one read.

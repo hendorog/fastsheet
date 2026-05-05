@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount, tick } from "svelte";
+  import ColorPicker from "./ColorPicker.svelte";
 
   type Props = {
     sheet: number;
@@ -79,6 +80,24 @@
   let alignH = $state<"general" | "left" | "center" | "right" | "justify">("general");
   let alignV = $state<"top" | "middle" | "bottom">("bottom");
   let wrap = $state(false);
+
+  /// Color picker overlay state. Re-used for both Font and Fill tabs;
+  /// `pickerTarget` selects which form-state field receives the
+  /// chosen colour. Recents come from list_workbook_colors so the
+  /// dialog matches the existing palette as the user iterates.
+  let pickerOpen = $state(false);
+  let pickerTarget = $state<"font" | "fill">("font");
+  let pickerRecents = $state<string[]>([]);
+
+  async function openPicker(target: "font" | "fill") {
+    pickerTarget = target;
+    try {
+      pickerRecents = await invoke<string[]>("list_workbook_colors");
+    } catch {
+      pickerRecents = [];
+    }
+    pickerOpen = true;
+  }
 
   onMount(async () => {
     try {
@@ -356,6 +375,11 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    // While the colour picker is open inside this dialog, let it
+    // own the keyboard — Esc inside the picker should close JUST the
+    // picker, not the parent dialog, and arrows should drive the
+    // swatch grid rather than be no-ops here.
+    if (pickerOpen) return;
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
@@ -507,14 +531,20 @@
           <label class="check">
             <input type="checkbox" bind:checked={strike} /> <span style="text-decoration: line-through">Strike</span>
           </label>
-          <label class="color-row">
-            Text colour
-            <input type="text" placeholder="#RRGGBB or empty" bind:value={fontColor} />
-            <span class="swatch" style:background={isHexColor(fontColor) ? fontColor : "transparent"}></span>
-          </label>
+          <div class="color-row">
+            <span class="color-row-label">Text colour</span>
+            <button type="button" class="color-pick-btn" onclick={() => openPicker("font")}>
+              <span class="swatch" style:background={isHexColor(fontColor) ? fontColor : "transparent"}></span>
+              <span class="color-pick-text">{fontColor || "(default)"}</span>
+              <span class="color-pick-action">Pick…</span>
+            </button>
+            {#if fontColor}
+              <button type="button" class="color-clear-btn" onclick={() => (fontColor = "")}>Clear</button>
+            {/if}
+          </div>
           <p class="hint">
             Font face + size are sourced from the file's defaults. Use the
-            colour field to override per-cell text colour.
+            colour picker to override per-cell text colour.
           </p>
         </div>
       {:else if activeTab === "border"}
@@ -535,22 +565,22 @@
         </div>
       {:else if activeTab === "fill"}
         <div class="fill-grid">
-          <label class="color-row">
-            Fill colour
-            <input type="text" placeholder="#RRGGBB or empty" bind:value={fillColor} />
-            <span class="swatch" style:background={isHexColor(fillColor) ? fillColor : "transparent"}></span>
-          </label>
-          <div class="swatches">
-            {#each ["#FFD966", "#F4B084", "#A9D08E", "#9BC2E6", "#FFC0CB", "#D9D9D9", "#000000", "#FFFFFF"] as c (c)}
-              <button
-                class="sw"
-                style:background={c}
-                aria-label={`Set fill to ${c}`}
-                onclick={() => (fillColor = c)}
-              ></button>
-            {/each}
+          <div class="color-row">
+            <span class="color-row-label">Fill colour</span>
+            <button type="button" class="color-pick-btn" onclick={() => openPicker("fill")}>
+              <span class="swatch" style:background={isHexColor(fillColor) ? fillColor : "transparent"}></span>
+              <span class="color-pick-text">{fillColor || "(no fill)"}</span>
+              <span class="color-pick-action">Pick…</span>
+            </button>
+            {#if fillColor}
+              <button type="button" class="color-clear-btn" onclick={() => (fillColor = "")}>Clear</button>
+            {/if}
           </div>
-          <p class="hint">Leave empty to clear fill.</p>
+          <p class="hint">
+            Pick a fill colour with autocomplete + named swatches. Use the
+            picker's Custom… entry to nudge a hue/saturation/lightness if
+            no swatch matches.
+          </p>
         </div>
       {:else if activeTab === "alignment"}
         <div class="align-grid">
@@ -586,6 +616,26 @@
     </footer>
   </div>
 </div>
+
+{#if pickerOpen}
+  <ColorPicker
+    title={pickerTarget === "font" ? "Text colour" : "Fill colour"}
+    initial={pickerTarget === "font" ? fontColor : fillColor}
+    recents={pickerRecents}
+    allowClear={true}
+    onSelect={(hex) => {
+      if (pickerTarget === "font") fontColor = hex;
+      else fillColor = hex;
+      pickerOpen = false;
+    }}
+    onClear={() => {
+      if (pickerTarget === "font") fontColor = "";
+      else fillColor = "";
+      pickerOpen = false;
+    }}
+    onCancel={() => (pickerOpen = false)}
+  />
+{/if}
 
 <style>
   .overlay {
@@ -764,30 +814,54 @@
     gap: 8px;
     margin-bottom: 8px;
   }
-  .color-row input[type="text"] {
+  .color-row-label {
+    flex: 0 0 auto;
+    color: #444;
+    min-width: 86px;
+  }
+  /* Pick button looks like an inline form control, not a heavy CTA. */
+  .color-pick-btn {
     flex: 1;
-    padding: 4px 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
     border: 1px solid #ccc;
     border-radius: 2px;
+    background: #fff;
+    cursor: pointer;
     font: inherit;
+    color: inherit;
+    text-align: left;
   }
+  .color-pick-btn:hover { background: #f5f5f5; }
+  .color-pick-text {
+    flex: 1;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: #444;
+  }
+  .color-pick-action {
+    color: #2c6cb0;
+    font-size: 11px;
+  }
+  .color-clear-btn {
+    flex: 0 0 auto;
+    padding: 4px 10px;
+    border: 1px solid #ccc;
+    border-radius: 2px;
+    background: #f5f5f5;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    color: #555;
+  }
+  .color-clear-btn:hover { background: #ebebeb; }
   .swatch {
     display: inline-block;
     width: 22px;
     height: 22px;
     border: 1px solid #888;
-  }
-  .swatches {
-    display: flex;
-    gap: 4px;
-    flex-wrap: wrap;
-  }
-  .sw {
-    width: 22px;
-    height: 22px;
-    border: 1px solid #888;
-    cursor: pointer;
-    padding: 0;
   }
   fieldset {
     border: 1px solid #ddd;

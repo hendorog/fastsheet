@@ -115,6 +115,7 @@ pub fn run() {
             cells::set_range_style,
             cells::apply_style_indices,
             cells::get_cell_format,
+            cells::list_workbook_colors,
             cells::define_name,
             cells::delete_name,
             cells::list_names,
