@@ -24,6 +24,23 @@ pub use xlsx_load::{load_xlsx_with_fallback, replicate_my_array_formulas};
 
 use state::AppState;
 
+/// Pluck the first non-flag argv entry — Windows passes the file
+/// path as a single positional arg when launching via "Open with"
+/// or shell association. We intentionally ignore anything starting
+/// with `-` so future CLI flags don't accidentally get treated as
+/// paths. Returns None when nothing was passed.
+fn capture_startup_path() -> Option<String> {
+    std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .filter(|a| !a.is_empty())
+}
+
+#[tauri::command]
+fn take_startup_path(state: tauri::State<'_, AppState>) -> Option<String> {
+    state.startup_path.lock().unwrap().take()
+}
+
 /// Frontend-callable: log a timestamp + label to the profile log,
 /// reporting elapsed-since-process-start so we can measure boot
 /// latency from launch to first interactive frame. Active only when
@@ -44,9 +61,14 @@ pub fn run() {
         "wsl_workaround",
         util::app_start_instant().elapsed().as_secs_f64() * 1000.0
     ));
+    let startup = capture_startup_path();
+    let app_state = AppState::new();
+    if let Some(p) = startup {
+        *app_state.startup_path.lock().unwrap() = Some(p);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState::new())
+        .manage(app_state)
         .setup(|_app| {
             let elapsed_ms = util::app_start_instant().elapsed().as_secs_f64() * 1000.0;
             util::profile_log(&format!(
@@ -58,6 +80,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             profile_mark,
+            take_startup_path,
             workbook::open_workbook,
             workbook::new_workbook,
             workbook::save_workbook,

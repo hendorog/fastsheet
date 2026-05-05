@@ -69,5 +69,33 @@ else
   echo "→ shortcut already present at: $SHORTCUT"
 fi
 
+# --- 5. file association (HKCU, no admin) ---
+# Registers fastsheet under "Open with" for .xls and .xlsx so a
+# right-click → "Open with → fastsheet" works in Explorer. All edits
+# are per-user (HKCU), so no UAC prompt and no system-wide changes.
+# Idempotent — Set-ItemProperty overwrites existing values; New-Item
+# -Force creates missing keys without erroring on existing ones.
+echo "→ registering Open With association for .xls / .xlsx..."
+
+# The shell command Windows runs when invoking us: quoted exe path
+# followed by quoted %1 placeholder. Without the inner quotes, paths
+# with spaces (Documents, OneDrive, WSL UNC, etc.) split incorrectly
+# at the argv boundary.
+OPEN_CMD="\"$TARGET_WIN\" \"%1\""
+
+"$PWSH" -NoProfile -Command "
+  \$cmd = '$OPEN_CMD'
+  New-Item -Path 'HKCU:\\Software\\Classes\\Applications\\fastsheet.exe'                          -Force | Out-Null
+  New-Item -Path 'HKCU:\\Software\\Classes\\Applications\\fastsheet.exe\\shell\\open\\command'    -Force | Out-Null
+  New-Item -Path 'HKCU:\\Software\\Classes\\Applications\\fastsheet.exe\\SupportedTypes'          -Force | Out-Null
+  New-Item -Path 'HKCU:\\Software\\Classes\\.xls\\OpenWithList\\fastsheet.exe'                    -Force | Out-Null
+  New-Item -Path 'HKCU:\\Software\\Classes\\.xlsx\\OpenWithList\\fastsheet.exe'                   -Force | Out-Null
+  Set-ItemProperty -Path 'HKCU:\\Software\\Classes\\Applications\\fastsheet.exe' -Name 'FriendlyAppName' -Value 'Fastsheet'
+  Set-ItemProperty -Path 'HKCU:\\Software\\Classes\\Applications\\fastsheet.exe\\shell\\open\\command' -Name '(default)' -Value \$cmd
+  Set-ItemProperty -Path 'HKCU:\\Software\\Classes\\Applications\\fastsheet.exe\\SupportedTypes' -Name '.xls'  -Value ''
+  Set-ItemProperty -Path 'HKCU:\\Software\\Classes\\Applications\\fastsheet.exe\\SupportedTypes' -Name '.xlsx' -Value ''
+" >/dev/null
+echo "→ Open With registered (HKCU). May take a session restart for Explorer to refresh."
+
 echo
 echo "Done. Press Win key, type 'fastsheet', hit Enter."

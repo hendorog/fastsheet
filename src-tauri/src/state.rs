@@ -52,6 +52,12 @@ pub(crate) struct AppState {
     /// (the new workbook becomes the new "left" — a stale comparison
     /// against a different file would just confuse the user).
     pub(crate) compare: Mutex<Option<crate::compare::CompareSession>>,
+    /// File path passed on the command line (e.g. when Windows
+    /// Explorer launches fastsheet via "Open with"). Captured once
+    /// in `run()` from `std::env::args` and consumed by the frontend
+    /// on mount via `take_startup_path` — taking it clears the slot
+    /// so a hot reload doesn't reopen the file.
+    pub(crate) startup_path: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -65,6 +71,7 @@ impl AppState {
             style_dirty: Mutex::new(HashSet::new()),
             xls_preserved: Mutex::new(None),
             compare: Mutex::new(None),
+            startup_path: Mutex::new(None),
         }
     }
 }

@@ -3334,17 +3334,29 @@
     window.addEventListener("keydown", onKey);
     window.addEventListener("contextmenu", blockContextMenu);
     invoke("profile_mark", { label: "onMount" }).catch(() => {});
-    // Seed a blank workbook on launch. Without this, the grid renders
-    // a "ghost" blank — looks like an empty spreadsheet but `workbook`
-    // is null on the frontend and no Model exists on the backend, so
-    // save fails and the selection overlay misaligns (colWidths /
-    // rowHeights are empty maps; the overlay's cumulative-offset math
-    // reads zeros). Auto-creating an untitled workbook makes the
-    // launch state immediately usable: type, save (-> Save As), open,
-    // anything works.
-    newWorkbook().catch((e) =>
-      console.warn("initial newWorkbook failed:", e),
-    );
+    // Seed something usable on launch — either the file passed via
+    // "Open with" / shell association or, failing that, a blank
+    // untitled workbook. Without one of these, the grid renders a
+    // "ghost" blank: looks like an empty spreadsheet but `workbook`
+    // is null on the frontend and no Model exists on the backend,
+    // so save fails and the selection overlay misaligns (colWidths
+    // and rowHeights are empty maps).
+    invoke<string | null>("take_startup_path")
+      .then(async (p) => {
+        if (p) {
+          await openWorkbookFromPath(p);
+          // If openWorkbookFromPath failed (file missing, parse
+          // error, ...) workbook is still null — drop into a blank
+          // so the launch state stays usable.
+          if (!workbook) await newWorkbook();
+        } else {
+          await newWorkbook();
+        }
+      })
+      .catch((e) => {
+        console.warn("initial workbook seed failed:", e);
+        newWorkbook().catch(() => {});
+      });
     // After first paint — the moment the user can actually see and
     // interact with the grid. This is the metric they care about.
     tick().then(() => {
