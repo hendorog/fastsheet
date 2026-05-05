@@ -947,13 +947,17 @@
     /* No background here — empty cells must be transparent so a long
        string in a left neighbor can spill visually through them. */
     position: relative;
-    /* Each cell is an independent layout boundary — changes inside one
-       cell can't force layout of others. `paint` is intentionally NOT
-       included: it would clip descendants' overflow at the cell's
-       padding box, breaking Excel-style text spill into empty
-       neighbours. The layout-only containment still gives most of the
-       scroll-perf win. */
-    contain: layout;
+    /* No `contain` here. `contain: paint` clips descendant overflow at
+       the cell's padding box and kills the text spill outright. Less
+       obvious: `contain: layout` ALSO breaks spill into bg-bearing
+       neighbours, because it makes each cell its own stacking context
+       — at which point the CSS table painting model can no longer
+       split "all cell backgrounds first, then all cell content"
+       across siblings, so B1's opaque bg paints over A1's overflowing
+       text. Without containment, the natural table model applies and
+       spill paints on top of every neighbour's bg, the way Excel
+       renders it. The keyboard hot path's perf doesn't depend on cell
+       containment — none of the seven techniques in CLAUDE.md need it. */
   }
   /* Spacer rows that absorb the rows skipped by row virtualisation.
      Their height keeps the table's total geometry equal to the sum of
