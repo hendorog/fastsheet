@@ -68,6 +68,11 @@ pub(crate) fn open_workbook(
         .unwrap_or(false);
     let mut xls_hidden_cols: HashMap<u32, HashSet<i32>> = HashMap::new();
     let mut xls_preserved: crate::xls_preserve::PreservedXlsData = Default::default();
+    // For xlsx we read the file bytes once and reuse them for both
+    // MY* array-formula replication and the in-memory LoadedFile
+    // snapshot used by save_preserving. Two reads of the same large
+    // file across a WSL UNC share is the slowest path on cold open.
+    let xlsx_bytes: Option<Vec<u8>> = if is_xls { None } else { std::fs::read(&path).ok() };
     let mut model = if is_xls {
         let (m, hc, preserved) = load_xls(&path)?;
         xls_hidden_cols = hc;
@@ -81,8 +86,8 @@ pub(crate) fn open_workbook(
         // file can't be re-read (we already loaded it once). Doesn't apply to
         // .xls (no `t="array"` markers; calamine returns each spill cell's
         // formula text directly).
-        if let Ok(bytes) = std::fs::read(&path) {
-            let _ = replicate_my_array_formulas(&mut m, &bytes);
+        if let Some(b) = &xlsx_bytes {
+            let _ = replicate_my_array_formulas(&mut m, b);
         }
         m
     };
@@ -119,7 +124,7 @@ pub(crate) fn open_workbook(
         } else {
             Some(xls_preserved)
         };
-    } else if let Ok(bytes) = std::fs::read(&path) {
+    } else if let Some(bytes) = xlsx_bytes {
         let sheet_paths = extract_sheet_paths(&bytes).unwrap_or_default();
         // Seed the in-memory hidden-column state from the original xlsx so
         // get_layout doesn't have to re-scrape the zip on every refresh,

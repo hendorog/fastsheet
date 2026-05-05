@@ -35,8 +35,11 @@ fn app_data_dir() -> Result<PathBuf, String> {
 }
 
 fn open_index_db(state: &State<'_, AppState>) -> Result<(), String> {
-    let mut guard = state.index.lock().unwrap();
-    if guard.is_some() {
+    // Fast path: lock just long enough to check whether the handle is
+    // already installed, then drop the guard. The slow path (cold
+    // boot, no DB yet) does its filesystem + SQLite work without the
+    // mutex held — Rule 5 says don't hold a lock across blocking I/O.
+    if state.index.lock().unwrap().is_some() {
         return Ok(());
     }
     let dir = app_data_dir()?;
@@ -54,7 +57,15 @@ fn open_index_db(state: &State<'_, AppState>) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS files_basename_idx ON files(basename);",
     )
     .map_err(|e| e.to_string())?;
-    *guard = Some(conn);
+    // Re-take the lock and check-and-set. If a concurrent caller
+    // raced us through the slow path (won't happen with Tauri's
+    // single-threaded command dispatch today, but the contract should
+    // hold regardless), keep their handle and drop ours. Either way
+    // the slot ends up populated.
+    let mut guard = state.index.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(conn);
+    }
     Ok(())
 }
 

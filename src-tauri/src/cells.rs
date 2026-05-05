@@ -172,6 +172,13 @@ pub(crate) fn get_cells(
     let model = guard.as_ref().ok_or("no workbook open")?;
     let mut out =
         Vec::with_capacity(((end_row - start_row + 1) * (end_col - start_col + 1)) as usize);
+    // Workbook-default font size + face are invariant for the
+    // duration of this call. Hoist out of the per-cell loops so a
+    // 200×100 viewport doesn't repeat the same .first() lookup
+    // 20 000 times.
+    let default_font = model.workbook.styles.fonts.first();
+    let default_sz = default_font.map(|f| f.sz).unwrap_or(13);
+    let default_name = default_font.map(|f| f.name.as_str()).unwrap_or("Calibri");
     for row in start_row..=end_row {
         for col in start_col..=end_col {
             let text = model
@@ -183,20 +190,6 @@ pub(crate) fn get_cells(
             let is_formula = input.starts_with('=');
             // Per-cell style — None when the cell uses the workbook default,
             // saving a chunk of payload size on big viewports.
-            let default_sz = model
-                .workbook
-                .styles
-                .fonts
-                .first()
-                .map(|f| f.sz)
-                .unwrap_or(13);
-            let default_name = model
-                .workbook
-                .styles
-                .fonts
-                .first()
-                .map(|f| f.name.as_str())
-                .unwrap_or("Calibri");
             let style = model
                 .get_style_for_cell(sheet, row as i32, col as i32)
                 .ok()

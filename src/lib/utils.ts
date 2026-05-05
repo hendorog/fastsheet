@@ -124,9 +124,12 @@ export function cellStyle(cell: CellView | undefined): string {
     if (s.border_right) parts.push("border-right:1px solid #000");
   }
   if (!s?.align_h) {
-    const numeric =
-      cell.text !== "" && !cell.is_formula && !isNaN(Number(cell.text));
-    if (numeric || (cell.is_formula && !isNaN(Number(cell.text)))) {
+    // Excel default: numeric values right-align, text left-aligns.
+    // Includes formula cells whose evaluated text parses as a
+    // number. The `text !== ""` guard is critical — `Number("")`
+    // returns 0, so without it an empty formula result would
+    // spuriously right-align.
+    if (cell.text !== "" && !isNaN(Number(cell.text))) {
       parts.push("text-align:right");
     }
   }
