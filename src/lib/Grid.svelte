@@ -946,18 +946,17 @@
     padding: 0;
     /* No background here — empty cells must be transparent so a long
        string in a left neighbor can spill visually through them. */
-    position: relative;
-    /* No `contain` here. `contain: paint` clips descendant overflow at
-       the cell's padding box and kills the text spill outright. Less
-       obvious: `contain: layout` ALSO breaks spill into bg-bearing
-       neighbours, because it makes each cell its own stacking context
-       — at which point the CSS table painting model can no longer
-       split "all cell backgrounds first, then all cell content"
-       across siblings, so B1's opaque bg paints over A1's overflowing
-       text. Without containment, the natural table model applies and
-       spill paints on top of every neighbour's bg, the way Excel
-       renders it. The keyboard hot path's perf doesn't depend on cell
-       containment — none of the seven techniques in CLAUDE.md need it. */
+    /* No `position: relative`, no `contain`. Both turn each cell into
+       a self-contained painting unit that paints in DOM order, which
+       breaks the CSS table painting model that normally splits "all
+       cell backgrounds first (step 6), all cell content second (step
+       7)" across siblings. Once that split is preserved, A1's
+       overflowing text in `.cell-content` paints at step 7 on top of
+       B1's bg painted at step 6 — which is exactly Excel's spill
+       behaviour. The earlier reasons we'd reached for `position:
+       relative` (`.cell-content { position: absolute; inset: 0 }`)
+       and `contain: layout` (perf) both turned out to break this
+       interaction silently. */
   }
   /* Spacer rows that absorb the rows skipped by row virtualisation.
      Their height keeps the table's total geometry equal to the sum of
@@ -1003,8 +1002,16 @@
     visibility: collapse;
   }
   .cell-content {
-    position: absolute;
-    inset: 0;
+    /* Normal flow, NOT absolute. `position: absolute` requires
+       `position: relative` on the parent `.cell`, and that forces
+       table cells out of the table painting model that puts cell
+       backgrounds before cell content — breaking spill into bg-
+       styled neighbours. Filling the cell via height: 100% works
+       because the parent <tr> sets a fixed pixel height, so the
+       <td>'s height resolves and the percentage child can compute. */
+    box-sizing: border-box;
+    height: 100%;
+    width: 100%;
     padding: 1px 4px;
     white-space: nowrap;
     overflow: visible;
