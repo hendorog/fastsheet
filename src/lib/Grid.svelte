@@ -710,11 +710,12 @@
       data-r={rowIdx}
       data-c={colIdx}
       style={(isFrozenRow ? `top:${rowTop}px;` : "") +
-        (isFrozenCol ? `left:${colLeft}px;` : "")}
+        (isFrozenCol ? `left:${colLeft}px;` : "") +
+        (cell && !cell.text ? cellStyle(cell) : "")}
     >
-      {#if cell?.text || cell?.style?.bg}
+      {#if cell?.text}
         <div class="cell-content" style={cellStyle(cell)}>
-          {cell?.text ?? ""}
+          {cell.text}
         </div>
       {/if}
     </td>
