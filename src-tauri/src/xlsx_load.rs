@@ -245,7 +245,11 @@ pub fn replicate_my_array_formulas(
 /// Slice off the trailing anchor argument and the closing `)`.
 /// `MYUNIQUE(temp7, B22)` → `MYUNIQUE(temp7`. Caller appends `, dr, dc)`.
 /// Returns None on malformed input.
-fn strip_trailing_anchor(formula: &str) -> Option<String> {
+///
+/// `pub(crate)` so the xls loader can import it instead of carrying a
+/// byte-for-byte copy — both pipelines need the same anchor-stripping
+/// logic for MY* array-formula replication.
+pub(crate) fn strip_trailing_anchor(formula: &str) -> Option<String> {
     let open = formula.find('(')?;
     let bytes = formula.as_bytes();
     let mut depth: i32 = 0;

@@ -362,13 +362,19 @@
   /// that slice are left out of the Map; they render as empty, which is
   /// usually correct. Horizontal scroll triggers a separate path
   /// (handleColBandChange) that refreshes the loaded col window when
-  /// the visible band moves outside it.
-  async function fetchRowBand(r1: number, r2: number) {
-    if (!workbook || r1 > r2 || loadedColStart > loadedColEnd) return;
+  /// Co-fetch get_cells + get_layout for a (r1..r2, c1..c2) window
+  /// against the currently active sheet, with a stale-result guard:
+  /// returns null if the user switched sheets / triggered a fresh
+  /// load while the IPC was in flight, so the caller can early-return
+  /// and avoid merging data from the wrong sheet into `cells`.
+  async function fetchBand(
+    r1: number,
+    r2: number,
+    c1: number,
+    c2: number,
+  ): Promise<{ list: CellView[]; layout: LayoutData } | null> {
     const sheetAtFetch = activeSheet;
     const genAtFetch = loadGen;
-    const c1 = loadedColStart;
-    const c2 = loadedColEnd;
     const [list, layout] = await Promise.all([
       invoke<CellView[]>("get_cells", {
         sheet: sheetAtFetch,
@@ -385,7 +391,18 @@
         endCol: c2,
       }),
     ]);
-    if (sheetAtFetch !== activeSheet || genAtFetch !== loadGen) return;
+    if (sheetAtFetch !== activeSheet || genAtFetch !== loadGen) return null;
+    return { list, layout };
+  }
+
+  /// the visible band moves outside it.
+  async function fetchRowBand(r1: number, r2: number) {
+    if (!workbook || r1 > r2 || loadedColStart > loadedColEnd) return;
+    const c1 = loadedColStart;
+    const c2 = loadedColEnd;
+    const result = await fetchBand(r1, r2, c1, c2);
+    if (!result) return;
+    const { list, layout } = result;
     // Drop any previously-cached cells in (r1..r2, c1..c2) first so
     // deletions / formula re-evaluations propagate (an empty-cell-elided
     // cell that BECAME empty would otherwise persist).
@@ -505,7 +522,6 @@
       // Compute which slice(s) of cols still need fetching. Most
       // common case is "scrolled right by one viewport" → one slice
       // on the right; can be either side or both.
-      const sheetAtFetch = activeSheet;
       const r1 = Math.max(1, bandStart);
       const r2 = Math.min(viewportRows, bandEnd);
       const slices: Array<[number, number]> = [];
@@ -522,34 +538,18 @@
       }
       const newColStart = Math.min(loadedColStart, want_start);
       const newColEnd = Math.max(loadedColEnd, want_end);
-      const genAtFetch = loadGen;
       // Fetch each missing col slice across the currently-visible row
       // band only. Other rows scroll into view via handleBandChange,
       // which now sees an expanded loaded col window and fetches the
       // right span without dropping anything.
       for (const [c1, c2] of slices) {
-        const [list, layout] = await Promise.all([
-          invoke<CellView[]>("get_cells", {
-            sheet: sheetAtFetch,
-            startRow: r1,
-            endRow: r2,
-            startCol: c1,
-            endCol: c2,
-          }),
-          invoke<LayoutData>("get_layout", {
-            sheet: sheetAtFetch,
-            startRow: r1,
-            endRow: r2,
-            startCol: c1,
-            endCol: c2,
-          }),
-        ]);
-        if (sheetAtFetch !== activeSheet || genAtFetch !== loadGen) return;
+        const result = await fetchBand(r1, r2, c1, c2);
+        if (!result) return;
         const newCells = new Map(cells);
-        for (const c of list) newCells.set(key(c.row, c.col), c);
+        for (const c of result.list) newCells.set(key(c.row, c.col), c);
         cells = newCells;
         const newRH = new Map(rowHeights);
-        for (const [r, h] of layout.row_heights) newRH.set(r, rowHeightPx(h));
+        for (const [r, h] of result.layout.row_heights) newRH.set(r, rowHeightPx(h));
         rowHeights = newRH;
       }
       // Now the new col span is loaded for the visible row band; the
@@ -1478,7 +1478,7 @@
     for (let r = r1; r <= r2; r++) {
       const cols: string[] = [];
       for (let c = c1; c <= c2; c++) {
-        const cell = cells.get(`${r}:${c}`);
+        const cell = cells.get(key(r, c));
         cols.push(cell?.text ?? "");
       }
       lines.push(cols.join("\t"));
@@ -1958,7 +1958,7 @@
     const sheet = activeSheet;
     const edits: EditOp[] = [];
     for (const m of matches) {
-      const cv = cells.get(`${m.row}:${m.col}`);
+      const cv = cells.get(key(m.row, m.col));
       if (!cv) continue;
       const prev = cv.input;
       // Case-preserving substring replace via case-insensitive scan.
@@ -2064,8 +2064,8 @@
         if (r >= src.r1 && r <= src.r2 && c >= src.c1 && c <= src.c2) continue;
         const srcR = src.r1 + (((r - src.r1) % srcH) + srcH) % srcH;
         const srcC = src.c1 + (((c - src.c1) % srcW) + srcW) % srcW;
-        const srcVal = cells.get(`${srcR}:${srcC}`)?.input ?? "";
-        const prev = cells.get(`${r}:${c}`)?.input ?? "";
+        const srcVal = cells.get(key(srcR, srcC))?.input ?? "";
+        const prev = cells.get(key(r, c))?.input ?? "";
         if (prev !== srcVal) edits.push({ row: r, col: c, prev, next: srcVal });
       }
     }
@@ -2206,7 +2206,7 @@
             [target.col, names[i][0]],
             [target.col + 1, names[i][1]],
           ] as [number, string][]) {
-            const prev = cells.get(`${r}:${c}`)?.input ?? "";
+            const prev = cells.get(key(r, c))?.input ?? "";
             if (prev !== val) edits.push({ row: r, col: c, prev, next: val });
           }
         }
@@ -2255,7 +2255,7 @@
         for (let r = r1; r <= r2; r++) {
           for (let c = c1; c <= c2; c++) {
             const next = String(start + i * step);
-            const prev = cells.get(`${r}:${c}`)?.input ?? "";
+            const prev = cells.get(key(r, c))?.input ?? "";
             if (prev !== next) edits.push({ row: r, col: c, prev, next });
             i++;
           }
@@ -2311,7 +2311,7 @@
         for (let r = r1; r <= r2; r++) {
           const vals: string[] = [];
           for (let c = c1; c <= c2; c++) {
-            vals.push(cells.get(`${r}:${c}`)?.input ?? "");
+            vals.push(cells.get(key(r, c))?.input ?? "");
           }
           snap.push({ origRow: r, vals });
         }
@@ -2336,7 +2336,7 @@
           const targetR = r1 + i;
           for (let c = 0; c < snap[i].vals.length; c++) {
             const targetC = c1 + c;
-            const prev = cells.get(`${targetR}:${targetC}`)?.input ?? "";
+            const prev = cells.get(key(targetR, targetC))?.input ?? "";
             const next = snap[i].vals[c];
             if (prev !== next) edits.push({ row: targetR, col: targetC, prev, next });
           }
@@ -2367,7 +2367,7 @@
     const edits: EditOp[] = [];
     for (let r = r1; r <= r2; r++) {
       for (let c = c1; c <= c2; c++) {
-        const cv = cells.get(`${r}:${c}`);
+        const cv = cells.get(key(r, c));
         if (!cv?.is_formula) continue;
         const prev = cv.input;
         const next = cv.text;
@@ -2404,7 +2404,7 @@
     for (let r = 0; r < h; r++) {
       const row: string[] = [];
       for (let c = 0; c < w; c++) {
-        row.push(cells.get(`${r1 + r}:${c1 + c}`)?.input ?? "");
+        row.push(cells.get(key(r1 + r, c1 + c))?.input ?? "");
       }
       src.push(row);
     }
@@ -2415,7 +2415,7 @@
       for (let c = 0; c < newW; c++) {
         const targetR = r1 + r;
         const targetC = c1 + c;
-        const prev = cells.get(`${targetR}:${targetC}`)?.input ?? "";
+        const prev = cells.get(key(targetR, targetC))?.input ?? "";
         // Transposed source[c][r]
         const next = src[c]?.[r] ?? "";
         if (prev !== next) edits.push({ row: targetR, col: targetC, prev, next });
@@ -2427,7 +2427,7 @@
       for (let c = c1; c <= c2; c++) {
         const within = r < r1 + newH && c < c1 + newW;
         if (!within) {
-          const prev = cells.get(`${r}:${c}`)?.input ?? "";
+          const prev = cells.get(key(r, c))?.input ?? "";
           if (prev !== "") edits.push({ row: r, col: c, prev, next: "" });
         }
       }
@@ -2506,10 +2506,10 @@
     const edits: EditOp[] = [];
     for (let r = 0; r < h; r++) {
       for (let c = 0; c < w; c++) {
-        const srcVal = cells.get(`${source.r1 + r}:${source.c1 + c}`)?.input ?? "";
+        const srcVal = cells.get(key(source.r1 + r, source.c1 + c))?.input ?? "";
         const tgtR = anchor.row + r;
         const tgtC = anchor.col + c;
-        const prev = cells.get(`${tgtR}:${tgtC}`)?.input ?? "";
+        const prev = cells.get(key(tgtR, tgtC))?.input ?? "";
         if (prev !== srcVal) edits.push({ row: tgtR, col: tgtC, prev, next: srcVal });
       }
     }
@@ -2520,7 +2520,7 @@
             r >= anchor.row && r < anchor.row + h &&
             c >= anchor.col && c < anchor.col + w;
           if (overlap) continue;
-          const prev = cells.get(`${r}:${c}`)?.input ?? "";
+          const prev = cells.get(key(r, c))?.input ?? "";
           if (prev !== "") edits.push({ row: r, col: c, prev, next: "" });
         }
       }
@@ -3408,7 +3408,7 @@
     let sum = 0;
     for (let r = r1; r <= r2; r++) {
       for (let c = c1; c <= c2; c++) {
-        const cell = cells.get(`${r}:${c}`);
+        const cell = cells.get(key(r, c));
         const t = cell?.text;
         if (!t) continue;
         count++;

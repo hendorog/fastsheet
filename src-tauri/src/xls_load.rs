@@ -38,6 +38,7 @@ use ironcalc::base::types::{
 use ironcalc::base::Model;
 
 use crate::util::col_letter_i;
+use crate::xlsx_load::strip_trailing_anchor;
 use crate::xls_biff::{
     decode_array_formula as fastsheet_lib_decode_array, decode_full_formula,
     scan_xls_shape,
@@ -1538,42 +1539,6 @@ fn parse_xlfn_head(formula: &str, start: usize) -> Option<(String, usize)> {
 
 fn is_ident_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Duplicated from xlsx_load — we can't import directly without making
-/// it pub, and this keeps the xls path self-contained. Slices off the
-/// trailing anchor argument and the closing `)` so the caller can
-/// append per-cell `, dr, dc)` offsets.
-fn strip_trailing_anchor(formula: &str) -> Option<String> {
-    let open = formula.find('(')?;
-    let bytes = formula.as_bytes();
-    let mut depth: i32 = 0;
-    let mut close: Option<usize> = None;
-    let mut last_comma: Option<usize> = None;
-    let mut in_str = false;
-    for i in (open + 1)..bytes.len() {
-        let c = bytes[i] as char;
-        if c == '"' {
-            in_str = !in_str;
-            continue;
-        }
-        if in_str {
-            continue;
-        }
-        match c {
-            '(' => depth += 1,
-            ')' if depth == 0 => {
-                close = Some(i);
-                break;
-            }
-            ')' => depth -= 1,
-            ',' if depth == 0 => last_comma = Some(i),
-            _ => {}
-        }
-    }
-    let _close = close?;
-    let cut = last_comma?;
-    Some(formula[..cut].to_string())
 }
 
 /// True if a sheet name needs to be wrapped in single quotes when

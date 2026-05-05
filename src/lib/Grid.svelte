@@ -555,58 +555,16 @@
   // visibleBand derivation sees the new position in the same reactive
   // cycle as the selRow change (the later scroll event becomes a
   // no-op).
-  function scrollSelIntoView() {
-    if (!gridWrapEl) return;
-    const wrap = gridWrapEl;
-    const cellTop = rowOffsets[selRow] + colhdrH;
-    const cellBottom = rowOffsets[selRow + 1] + colhdrH;
-    const cellLeft = colLefts[selCol];
-    const cellRight = colLefts[selCol + 1];
-    const sTop = wrap.scrollTop;
-    const sLeft = wrap.scrollLeft;
-    const visTop = sTop + colhdrH;
-    const visBottom = sTop + viewportH;
-    const visLeft = sLeft + ROWHDR_W;
-    const visRight = sLeft + viewportW;
-    let dy = 0;
-    if (cellTop < visTop) dy = cellTop - visTop;
-    else if (cellBottom > visBottom) dy = cellBottom - visBottom;
-    let dx = 0;
-    if (cellLeft < visLeft) dx = cellLeft - visLeft;
-    else if (cellRight > visRight) dx = cellRight - visRight;
-    if (dx !== 0 || dy !== 0) {
-      scrollTop = sTop + dy;
-      scrollLeft = sLeft + dx;
-      // Flush Svelte's pending reactive updates synchronously so the
-      // new band rows exist in the DOM BEFORE we scroll the browser.
-      // Without this the browser scrolls first, paints empty rows, and
-      // Svelte fills them in a frame later — visible "blank flash".
-      flushSync();
-      wrap.scrollBy({ left: dx, top: dy, behavior: "instant" as ScrollBehavior });
-    }
-  }
-
-  // Only fire scrollSelIntoView when selRow/selCol *change* — not when
-  // the reactive reads INSIDE scrollSelIntoView (rowOffsets, colhdrH,
-  // viewportH, ...) invalidate. Without `untrack` the parent's
-  // band-driven rowHeights map mutation during a mouse-wheel scroll
-  // re-derives rowOffsets, which re-fires this effect, which scrolls
-  // the cursor back into view — visible "snap back" while the user is
-  // mid-wheel.
-  $effect(() => {
-    selRow;
-    selCol;
-    untrack(() => {
-      if (!gridWrapEl) return;
-      scrollSelIntoView();
-    });
-  });
-
-  /// Scroll a (row, col) into view WITHOUT touching the selection.
-  /// Mirrors scrollSelIntoView but reads the target from `scrollTarget`
-  /// so the trace-preview / F2-highlight flows can keep their target
-  /// cell visible while the user keeps their original cursor.
-  function scrollToTarget(row: number, col: number) {
+  /// Scroll a (row, col) into view, mutating `scrollTop`/`scrollLeft`
+  /// and the wrap's scroll position. Caller is responsible for
+  /// passing valid 1-based indices; out-of-range indices fall back to
+  /// 0 via `?? 0` so a stale call doesn't throw mid-render.
+  ///
+  /// `flushSync()` before `scrollBy` is load-bearing — without it the
+  /// browser scrolls before Svelte's pending reactive updates land,
+  /// paints empty rows for one frame, then fills them in. The blank
+  /// flash is visible at any scroll speed.
+  function scrollCellIntoView(row: number, col: number) {
     if (!gridWrapEl) return;
     const wrap = gridWrapEl;
     const cellTop = (rowOffsets[row] ?? 0) + colhdrH;
@@ -633,12 +591,33 @@
     }
   }
 
+  function scrollSelIntoView() {
+    scrollCellIntoView(selRow, selCol);
+  }
+
+  // Only fire scrollSelIntoView when selRow/selCol *change* — not when
+  // the reactive reads INSIDE scrollSelIntoView (rowOffsets, colhdrH,
+  // viewportH, ...) invalidate. Without `untrack` the parent's
+  // band-driven rowHeights map mutation during a mouse-wheel scroll
+  // re-derives rowOffsets, which re-fires this effect, which scrolls
+  // the cursor back into view — visible "snap back" while the user is
+  // mid-wheel.
+  $effect(() => {
+    selRow;
+    selCol;
+    untrack(() => {
+      if (!gridWrapEl) return;
+      scrollSelIntoView();
+    });
+  });
+
+
   $effect(() => {
     if (!scrollTarget) return;
     const { row, col } = scrollTarget;
     untrack(() => {
       if (!gridWrapEl) return;
-      scrollToTarget(row, col);
+      scrollCellIntoView(row, col);
     });
   });
 
