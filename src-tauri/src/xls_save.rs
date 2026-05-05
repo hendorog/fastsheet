@@ -2660,6 +2660,14 @@ fn build_workbook_stream(model: &ironcalc::base::Model) -> Vec<u8> {
     w.write_record(R_DATEMODE, &build_datemode_1900());
     w.write_record(R_PRECISION, &build_precision_full());
     w.write_record(R_BACKUP, &build_backup_off());
+    // WINDOW1 — required globals record per [MS-XLS] 2.4.346. Missing
+    // it triggered Excel's "file format or extension is not valid" /
+    // corrupt-file warning on round-trip even though the workbook
+    // stream parsed cleanly via calamine + cfb. Carries window
+    // geometry, the active sheet index (itabCur), and the selected-
+    // sheet count. Static defaults are fine — Excel re-saves with
+    // its real geometry on first save anyway.
+    w.write_record(R_WINDOW1, &build_window1());
 
     // BOUNDSHEET8 — one per sheet. Track each lbPlyPos byte offset so
     // we can patch in the real sheet-BOF byte position later.
@@ -2901,6 +2909,9 @@ mod tests {
         assert_eq!(globals.iter().filter(|&&t| t == R_BOUNDSHEET8).count(), 1);
         assert!(globals.contains(&R_SST));
         assert!(globals.contains(&R_EXTSST));
+        // WINDOW1 — required globals record. Missing it triggered
+        // Excel's corrupt-file warning on round-trip.
+        assert!(globals.contains(&R_WINDOW1), "globals must include WINDOW1");
 
         // After globals EOF: sheet substream BOF / DIMENSIONS / WINDOW2 /
         // EOF must be present in order.
