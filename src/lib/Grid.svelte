@@ -967,11 +967,13 @@
     /* No background here — empty cells must be transparent so a long
        string in a left neighbor can spill visually through them. */
     position: relative;
-    /* Each cell is an independent layout/paint boundary — changes inside
-       one cell can't force layout/paint of others. Big win on scroll
-       because the browser only repaints the newly-visible rows, not
-       the ones that merely moved. */
-    contain: layout paint;
+    /* Each cell is an independent layout boundary — changes inside one
+       cell can't force layout of others. `paint` is intentionally NOT
+       included: it would clip descendants' overflow at the cell's
+       padding box, breaking Excel-style text spill into empty
+       neighbours. The layout-only containment still gives most of the
+       scroll-perf win. */
+    contain: layout;
   }
   /* Spacer rows that absorb the rows skipped by row virtualisation.
      Their height keeps the table's total geometry equal to the sum of
