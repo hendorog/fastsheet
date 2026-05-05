@@ -409,6 +409,13 @@
                 highlight = i;
                 activate(i);
               }}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  highlight = i;
+                  activate(i);
+                }
+              }}
               onmouseenter={() => {
                 highlight = i;
               }}

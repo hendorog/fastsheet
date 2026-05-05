@@ -9,6 +9,7 @@
   import SheetTabs from "$lib/SheetTabs.svelte";
   import FormulaTrace from "$lib/FormulaTrace.svelte";
   import CompareDiff from "$lib/CompareDiff.svelte";
+  import FormatCellsDialog from "$lib/FormatCellsDialog.svelte";
   import {
     buildMenu,
     saveMenuItems,
@@ -74,9 +75,18 @@
   let editValue = $state("");
   let editorEl: HTMLInputElement | null = $state(null);
   let gridWrapEl: HTMLDivElement | null = $state(null);
-  let dirtyEdits = $state(0);
+  let pendingRecalcEdits = $state(0);
+  /// Recalc mode mirror of AppState.auto_recalc. Default true (matches
+  /// Excel + Lotus automatic mode). The status bar shows a "CALC"
+  /// indicator while in manual mode + dirty cells exist (Lotus
+  /// convention) so the user remembers to F9.
+  let autoRecalc = $state(true);
   let statusMsg = $state("Ready. Press / for menu.");
   let currentPath = $state("");
+
+  function noteRecalcPending(count: number) {
+    if (!autoRecalc && count > 0) pendingRecalcEdits += count;
+  }
 
   // /-menu state
   let menuOpen = $state(false);
@@ -91,6 +101,12 @@
   // file navigator state
   let navOpen = $state(false);
   let navMode = $state<"open" | "save">("open");
+
+  // Format Cells modal (Ctrl+1). Holds the selection rectangle and
+  // active cell at the time the modal opens — applies hit the whole
+  // selection but the form seeds from the active cell.
+  let formatModalOpen = $state(false);
+  let formatModalCell = $state({ row: 1, col: 1, r1: 1, c1: 1, r2: 1, c2: 1 });
 
   /// Formula trace popup — set to a TraceNode to show the popup,
   /// null to close. Driven by the /T menu items.
@@ -578,6 +594,7 @@
     history = [];
     historyIdx = 0;
     sheetCursors = new Map();
+    pendingRecalcEdits = 0;
     await resizeViewportToSheet();
     await refreshViewport({ clear: true });
     await refreshNameCache();
@@ -601,6 +618,7 @@
       history = [];
       historyIdx = 0;
       sheetCursors = new Map();
+      pendingRecalcEdits = 0;
       await resizeViewportToSheet();
       await refreshViewport({ clear: true });
       await refreshNameCache();
@@ -616,13 +634,17 @@
   }
 
   function describeSave(r: SaveResult): string {
+    const backupSuffix = r.backup_path ? ` · backup: ${r.backup_path}` : "";
     if (r.mode === "preserved") {
       return `Saved ${r.path} · ${r.cells_patched} cell${r.cells_patched === 1 ? "" : "s"} patched in place (charts/pivots/drawings preserved)`;
     }
     if (r.mode === "xls") {
-      return `Saved ${r.path} · BIFF8 .xls (formulas currently saved as cached values; charts/macros not preserved)`;
+      const macros = r.vba_preserved
+        ? "VBA / macros preserved; charts and other unsupported features not preserved"
+        : "charts and other unsupported features not preserved";
+      return `Saved ${r.path} · BIFF8 .xls (${macros})${backupSuffix}`;
     }
-    return `Saved ${r.path} · ⚠ written via IronCalc — features it doesn't understand (charts, pivots, drawings) were lost`;
+    return `Saved ${r.path} · ⚠ written via IronCalc — features it doesn't understand (charts, pivots, drawings) were lost${backupSuffix}`;
   }
 
   async function saveWorkbookToPath(path: string) {
@@ -743,7 +765,7 @@
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
       }
       await refreshRows(r1, r2);
-      dirtyEdits += edits.length;
+      noteRecalcPending(edits.length);
       const span =
         r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
       pushHistory({ description: `Erase ${span}`, sheet, edits });
@@ -772,7 +794,7 @@
     try {
       await invoke<string>("set_cell", { sheet, row: r, col: c, value: next });
       await refreshRows(r, r);
-      dirtyEdits += 1;
+      noteRecalcPending(1);
       if (prev !== next) {
         pushHistory({
           description: `Set ${addr(r, c)}`,
@@ -780,7 +802,9 @@
           edits: [{ row: r, col: c, prev, next }],
         });
       }
-      statusMsg = `Set ${addr(r, c)} = ${next} · F9 to recalc`;
+      statusMsg = autoRecalc
+        ? `Set ${addr(r, c)} = ${next}`
+        : `Set ${addr(r, c)} = ${next} · F9 to recalc`;
     } catch (e) {
       statusMsg = `Set failed: ${e}`;
     }
@@ -815,10 +839,33 @@
     try {
       const ms = await invoke<number>("recalc");
       await refreshViewport();
-      dirtyEdits = 0;
+      pendingRecalcEdits = 0;
       statusMsg = `Recalc done in ${ms} ms`;
     } catch (e) {
       statusMsg = `Recalc failed: ${e}`;
+    }
+  }
+
+  /// Lotus `/W G R A` / `/W G R M`. Toggles the backend's auto-recalc
+  /// flag; switching back to Automatic also fires an immediate recalc
+  /// so any cells edited during manual mode get fresh values without
+  /// the user needing a separate F9.
+  async function setRecalcMode(mode: "automatic" | "manual") {
+    const enabled = mode === "automatic";
+    try {
+      await invoke("set_auto_recalc", { enabled });
+      autoRecalc = enabled;
+      if (enabled && pendingRecalcEdits > 0) {
+        const caughtUp = pendingRecalcEdits;
+        await recalcWorkbook();
+        statusMsg = `Recalc: Automatic (caught up on ${caughtUp} pending edits)`;
+      } else {
+        statusMsg = enabled
+          ? "Recalc: Automatic — formulas evaluate after every edit"
+          : "Recalc: Manual — press F9 to evaluate; CALC indicator shows pending edits";
+      }
+    } catch (e) {
+      statusMsg = `Set recalc mode failed: ${e}`;
     }
   }
 
@@ -1439,7 +1486,7 @@
         entry.sheet,
         entry.edits.map((e) => ({ row: e.row, col: e.col, value: e.prev })),
       );
-      dirtyEdits += entry.edits.length;
+      noteRecalcPending(entry.edits.length);
     } else {
       await applyStyleIndices(entry.sheet, entry.edit, "prev");
     }
@@ -1456,7 +1503,7 @@
         entry.sheet,
         entry.edits.map((e) => ({ row: e.row, col: e.col, value: e.next })),
       );
-      dirtyEdits += entry.edits.length;
+      noteRecalcPending(entry.edits.length);
     } else {
       await applyStyleIndices(entry.sheet, entry.edit, "next");
     }
@@ -1505,7 +1552,7 @@
         } catch {}
       }
       await refreshRows(r1, r2);
-      dirtyEdits += edits.length;
+      noteRecalcPending(edits.length);
       const span =
         r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
       pushHistory({ description: `Cut ${span}`, sheet, edits });
@@ -1555,14 +1602,16 @@
       const editR2 = Math.max(...edits.map((e) => e.row));
       await refreshRows(editR1, editR2);
     }
-    dirtyEdits += edits.length;
+    noteRecalcPending(edits.length);
     const w = rows[0]?.split("\t").length ?? 0;
     pushHistory({
       description: `Paste ${rows.length}×${w} at ${addr(selRow, selCol)}`,
       sheet,
       edits,
     });
-    statusMsg = `Pasted ${rows.length}×${w} range · F9 to recalc`;
+    statusMsg = autoRecalc
+      ? `Pasted ${rows.length}×${w} range`
+      : `Pasted ${rows.length}×${w} range · F9 to recalc`;
   }
 
   async function refreshWorkbookInfo() {
@@ -1982,7 +2031,7 @@
       } catch {}
     }
     await refreshViewport();
-    dirtyEdits += edits.length;
+    noteRecalcPending(edits.length);
     if (edits.length > 0) {
       pushHistory({
         description: `Replace "${needle}" → "${replacement}"`,
@@ -1992,6 +2041,19 @@
     }
     statusMsg = `Replaced ${edits.length} occurrence${edits.length === 1 ? "" : "s"}`;
     focusGrid();
+  }
+
+  function openFormatCellsModal() {
+    if (!workbook) {
+      statusMsg = "Open or create a workbook first.";
+      return;
+    }
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    formatModalCell = { row: selRow, col: selCol, r1, c1, r2, c2 };
+    formatModalOpen = true;
   }
 
   function openFindReplace() {
@@ -2048,6 +2110,10 @@
     if (decimals <= 0) return "0%";
     return "0." + "0".repeat(Math.min(15, decimals)) + "%";
   }
+  function buildScientificFormat(decimals: number): string {
+    if (decimals <= 0) return "0E+00";
+    return "0." + "0".repeat(Math.min(15, decimals)) + "E+00";
+  }
 
   /// Drag-fill: source pattern wraps to fill the extended range, skipping
   /// cells inside the source itself (they keep their values).
@@ -2075,7 +2141,7 @@
       } catch {}
     }
     await refreshRows(dest.r1, dest.r2);
-    dirtyEdits += edits.length;
+    noteRecalcPending(edits.length);
     pushHistory({
       description: `Fill from ${addr(src.r1, src.c1)}:${addr(src.r2, src.c2)}`,
       sheet,
@@ -2216,7 +2282,7 @@
           } catch {}
         }
         await refreshViewport();
-        dirtyEdits += edits.length;
+        noteRecalcPending(edits.length);
         pushHistory({
           description: `Insert ${names.length} name${names.length === 1 ? "" : "s"} list`,
           sheet,
@@ -2266,7 +2332,7 @@
           } catch {}
         }
         await refreshViewport();
-        dirtyEdits += edits.length;
+        noteRecalcPending(edits.length);
         const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
         pushHistory({
           description: `Fill ${span} (${start}, +${step})`,
@@ -2347,7 +2413,7 @@
           } catch {}
         }
         await refreshViewport();
-        dirtyEdits += edits.length;
+        noteRecalcPending(edits.length);
         const span = `${addr(r1, c1)}:${addr(r2, c2)}`;
         pushHistory({ description: `Sort ${span} by ${t} ${desc ? "desc" : "asc"}`, sheet, edits });
         statusMsg = `Sorted ${span} by ${t} ${desc ? "↓" : "↑"}`;
@@ -2380,7 +2446,7 @@
       } catch {}
     }
     await refreshRows(r1, r2);
-    dirtyEdits += edits.length;
+    noteRecalcPending(edits.length);
     const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
     if (edits.length > 0) {
       pushHistory({ description: `Convert ${span} to values`, sheet, edits });
@@ -2440,7 +2506,7 @@
     // Transpose can write outside the original rectangle when newH > h
     // or newW > w, so refresh the union of the source and target boxes.
     await refreshRows(r1, Math.max(r2, r1 + newH - 1));
-    dirtyEdits += edits.length;
+    noteRecalcPending(edits.length);
     const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
     pushHistory({ description: `Transpose ${span}`, sheet, edits });
     rangeEndRow = r1 + newH - 1;
@@ -2536,7 +2602,7 @@
       Math.min(source.r1, anchor.row),
       Math.max(source.r2, anchor.row + h - 1),
     );
-    dirtyEdits += edits.length;
+    noteRecalcPending(edits.length);
     const span = source.r1 === source.r2 && source.c1 === source.c2
       ? addr(source.r1, source.c1)
       : `${addr(source.r1, source.c1)}:${addr(source.r2, source.c2)}`;
@@ -2614,6 +2680,18 @@
     applyStyleOp(map[h], `Aligned ${h}`);
   }
 
+  function attrRange(kind: "bold" | "italic" | "underline" | "strike" | "reset") {
+    const map = {
+      bold:      { op: { kind: "toggle_bold" },      label: "Toggled bold" },
+      italic:    { op: { kind: "toggle_italic" },    label: "Toggled italic" },
+      underline: { op: { kind: "toggle_underline" }, label: "Toggled underline" },
+      strike:    { op: { kind: "toggle_strike" },    label: "Toggled strike" },
+      reset:     { op: { kind: "reset_attributes" }, label: "Reset attributes on" },
+    } as const;
+    const { op, label } = map[kind];
+    applyStyleOp(op, label);
+  }
+
   function promptColor(label: string, onColor: (color: string) => void, onClear: () => void) {
     openMenuPrompt(label, "#FFD966", (v) => {
       const t = v.trim();
@@ -2666,6 +2744,7 @@
       currency: buildCurrencyFormat,
       comma: buildCommaFormat,
       percent: buildPercentFormat,
+      scientific: buildScientificFormat,
     };
     const builder = builders[kind];
     openMenuPrompt(`Decimals (0..15) for ${kind}:`, "2", async (v) => {
@@ -2966,6 +3045,7 @@
     formatRange,
     searchRange: openFindReplace,
     alignRange,
+    attrRange,
     setFillColor,
     setTextColor,
     rangeValue,
@@ -2986,6 +3066,8 @@
     traceNames,
     compareOpen,
     compareExit,
+    setRecalcMode,
+    recalcNow: recalcWorkbook,
   });
 
   let levelItems = $derived(
@@ -3088,7 +3170,7 @@
       // Only open the goto prompt when nothing else owns the keyboard.
       if (
         e.key === "F5" &&
-        !menuPrompt && !navOpen && !menuOpen && !pendingMove && !pendingAxisPick && !editing
+        !menuPrompt && !navOpen && !menuOpen && !pendingMove && !pendingAxisPick && !editing && !formatModalOpen
       ) {
         openF5GotoPrompt();
       }
@@ -3151,6 +3233,11 @@
     }
     // Navigator owns all keys while open (it has its own filter input).
     if (navOpen) {
+      return;
+    }
+    // Format Cells dialog owns its own keyboard — let it handle Esc /
+    // Enter / Ctrl+1..5 internally without the grid intercepting.
+    if (formatModalOpen) {
       return;
     }
     // Cell editing — handle Enter/Esc here. Must come BEFORE the generic
@@ -3245,6 +3332,16 @@
             e.preventDefault();
             applyStyleOp({ kind: "toggle_underline" }, "Toggled underline");
             return;
+          case "5":
+            // Excel convention: Ctrl+5 = strike-through.
+            e.preventDefault();
+            applyStyleOp({ kind: "toggle_strike" }, "Toggled strike");
+            return;
+          case "1":
+            // Excel convention: Ctrl+1 = Format Cells dialog.
+            e.preventDefault();
+            openFormatCellsModal();
+            return;
         }
       } else {
         // Ctrl+Shift+Z is the alternative redo binding (matches the
@@ -3253,6 +3350,42 @@
           e.preventDefault();
           redo();
           return;
+        }
+        // Ctrl+Shift+1..6 — Excel's number-format presets. Use e.code
+        // (Digit1..Digit6) so the binding is keyboard-layout
+        // independent (UK + US Shift+1 produces "!" but Shift+2
+        // differs across layouts).
+        switch (e.code) {
+          case "Digit1":
+            e.preventDefault();
+            applyNumberFormat("#,##0.00");
+            statusMsg = "Format: Number";
+            return;
+          case "Digit2":
+            e.preventDefault();
+            applyNumberFormat("h:mm AM/PM");
+            statusMsg = "Format: Time";
+            return;
+          case "Digit3":
+            e.preventDefault();
+            applyNumberFormat("d-mmm-yy");
+            statusMsg = "Format: Date";
+            return;
+          case "Digit4":
+            e.preventDefault();
+            applyNumberFormat("$#,##0.00");
+            statusMsg = "Format: Currency";
+            return;
+          case "Digit5":
+            e.preventDefault();
+            applyNumberFormat("0%");
+            statusMsg = "Format: Percent";
+            return;
+          case "Digit6":
+            e.preventDefault();
+            applyNumberFormat("0.00E+00");
+            statusMsg = "Format: Scientific";
+            return;
         }
       }
     }
@@ -3345,6 +3478,12 @@
     window.addEventListener("keydown", onKey);
     window.addEventListener("contextmenu", blockContextMenu);
     invoke("profile_mark", { label: "onMount" }).catch(() => {});
+    // Sync the recalc mode from the backend default (true). Held in
+    // a separate state so we don't have to round-trip on every status
+    // bar update.
+    invoke<boolean>("get_auto_recalc")
+      .then((v) => (autoRecalc = v))
+      .catch(() => {});
     // Seed something usable on launch — either the file passed via
     // "Open with" / shell association or, failing that, a blank
     // untitled workbook. Without one of these, the grid renders a
@@ -3388,7 +3527,7 @@
     const sep = currentPath.includes("\\") ? "\\" : "/";
     const idx = currentPath.lastIndexOf(sep);
     const base = currentPath ? currentPath.slice(idx + 1) : "untitled";
-    const dirty = dirtyEdits > 0 ? "● " : "";
+    const dirty = pendingRecalcEdits > 0 ? "● " : "";
     if (typeof document !== "undefined") {
       document.title = `${dirty}${base} — fastsheet`;
     }
@@ -3514,6 +3653,26 @@
       onClose={() => {
         navOpen = false;
         focusGrid();
+      }}
+      onStatus={(m) => (statusMsg = m)}
+    />
+  {/if}
+
+  {#if formatModalOpen}
+    <FormatCellsDialog
+      sheet={activeSheet}
+      cellRow={formatModalCell.row}
+      cellCol={formatModalCell.col}
+      rangeR1={formatModalCell.r1}
+      rangeC1={formatModalCell.c1}
+      rangeR2={formatModalCell.r2}
+      rangeC2={formatModalCell.c2}
+      onClose={() => {
+        formatModalOpen = false;
+        focusGrid();
+      }}
+      onApplied={async () => {
+        await refreshRows(formatModalCell.r1, formatModalCell.r2);
       }}
       onStatus={(m) => (statusMsg = m)}
     />
@@ -3652,9 +3811,14 @@
       {workbook?.sheet_names[activeSheet] ?? ""}!{addr(selRow, selCol)}
     </span>
     {#if currentPath}<span class="path-tag">{currentPath}</span>{/if}
-    {#if dirtyEdits > 0}
+    {#if pendingRecalcEdits > 0}
       <span class="dirty-tag"
-        >● {dirtyEdits} edit{dirtyEdits > 1 ? "s" : ""} pending recalc (F9)</span
+        >● {pendingRecalcEdits} edit{pendingRecalcEdits > 1 ? "s" : ""} pending recalc (F9)</span
+      >
+    {/if}
+    {#if !autoRecalc}
+      <span class="calc-tag" title="Manual recalc mode — press F9 to evaluate"
+        >CALC</span
       >
     {/if}
     {#if selectionSummary}
@@ -3853,6 +4017,19 @@
   .dirty-tag {
     color: #d4691e;
     font-weight: 600;
+  }
+  /* Lotus-style "CALC" indicator. Shown only in manual recalc mode.
+     Distinct colour from .dirty-tag so the user can tell at a glance
+     whether the workbook is stale ("● 3 edits pending") vs. just in
+     manual mode with no edits ("CALC" alone). */
+  .calc-tag {
+    color: #fff;
+    background: #b04040;
+    padding: 0 6px;
+    font-weight: 700;
+    font-size: 10px;
+    letter-spacing: 0.5px;
+    border-radius: 2px;
   }
   .sel-summary {
     color: #1f6feb;

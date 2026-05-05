@@ -275,9 +275,18 @@
           <div
             class="nav-row recent"
             class:sel={i === selectedIdx}
+            role="option"
+            aria-selected={i === selectedIdx}
+            tabindex="-1"
             onclick={() => {
               selectedIdx = i;
               activateRow(row);
+            }}
+            onkeydown={(e) => {
+              if (e.key === "Enter") {
+                selectedIdx = i;
+                activateRow(row);
+              }
             }}
           >
             <span class="nav-tag">recent</span>
@@ -288,9 +297,18 @@
           <div
             class="nav-row recent-dir"
             class:sel={i === selectedIdx}
+            role="option"
+            aria-selected={i === selectedIdx}
+            tabindex="-1"
             onclick={() => {
               selectedIdx = i;
               activateRow(row);
+            }}
+            onkeydown={(e) => {
+              if (e.key === "Enter") {
+                selectedIdx = i;
+                activateRow(row);
+              }
             }}
           >
             <span class="nav-tag dir-tag">recent dir</span>
@@ -301,9 +319,18 @@
             class="nav-row"
             class:sel={i === selectedIdx}
             class:dir={row.entry.is_dir}
+            role="option"
+            aria-selected={i === selectedIdx}
+            tabindex="-1"
             onclick={() => {
               selectedIdx = i;
               activateRow(row);
+            }}
+            onkeydown={(e) => {
+              if (e.key === "Enter") {
+                selectedIdx = i;
+                activateRow(row);
+              }
             }}
           >
             <span class="nav-name"

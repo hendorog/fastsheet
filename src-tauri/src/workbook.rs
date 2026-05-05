@@ -9,7 +9,6 @@ use crate::hidden::extract_hidden_col_ranges;
 use crate::index::record_open_internal;
 use crate::state::{AppState, LoadedFile};
 use crate::xls_load::load_xls;
-use crate::xls_save::save_xls;
 use crate::xlsx_load::{load_xlsx_with_fallback, replicate_my_array_formulas};
 use crate::xlsx_save::{extract_sheet_paths, save_preserving, SheetLayoutSnapshot};
 
@@ -24,16 +23,36 @@ pub(crate) struct SaveResult {
     path: String,
     /// "preserved" — patched the original xlsx in place (charts/pivots/etc kept).
     /// "ironcalc"  — wrote a fresh xlsx via IronCalc (unsupported features lost).
-    /// "xls"       — wrote a fresh BIFF8 .xls via fastsheet's xls writer
-    ///               (formulas currently round-trip as cached values; see
-    ///               xls_save.rs phase notes).
+    /// "xls"       — wrote a fresh BIFF8 .xls via fastsheet's xls writer.
+    ///               VBA / macros are preserved when the original file was
+    ///               loaded with them (see `vba_preserved`); other unsupported
+    ///               features (charts, pivots, drawings, conditional
+    ///               formatting) are not.
     mode: &'static str,
     cells_patched: usize,
+    /// When the save would lose features that exist in the file being
+    /// overwritten, we make a `.bak` copy first (or `.bak.N` when
+    /// `.bak` already exists). None when the save was lossless or when
+    /// no existing file was overwritten (i.e. saving to a brand-new
+    /// path). The frontend surfaces this so the user knows where to
+    /// recover from on regret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_path: Option<String>,
+    /// True for .xls saves whose source had VBA / macro storages, so
+    /// the UI can report "VBA preserved" instead of the generic
+    /// "macros not preserved" copy.
+    #[serde(skip_serializing_if = "is_false")]
+    vba_preserved: bool,
 }
 
-/// Backup the existing file at `path` to `path.bak` (overwriting any
-/// previous .bak), then save the workbook to `path`. Returns the .bak
-/// path so the UI can report it.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Backup the existing file at `path` to a fresh `.bak` / `.bak.N`, then
+/// save the workbook to `path`. Returns the backup path so the UI can
+/// report it. The inner save is told a backup already exists so lossy
+/// save paths don't create a second backup.
 #[derive(Serialize)]
 pub(crate) struct BackupResult {
     save: SaveResult,
@@ -148,6 +167,7 @@ pub(crate) fn open_workbook(
     *state.hidden_cols.lock().unwrap() = hidden_cols_init;
     state.dirty.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
+    *state.structural_dirty.lock().unwrap() = false;
     // Loading a fresh workbook invalidates any active compare —
     // diffing the new model against the previous right side would
     // confuse more than help.
@@ -181,6 +201,7 @@ pub(crate) fn new_workbook(state: State<'_, AppState>) -> Result<WorkbookInfo, S
     state.dirty.lock().unwrap().clear();
     state.hidden_cols.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
+    *state.structural_dirty.lock().unwrap() = false;
     *state.compare.lock().unwrap() = None;
     Ok(info)
 }
@@ -189,6 +210,14 @@ pub(crate) fn new_workbook(state: State<'_, AppState>) -> Result<WorkbookInfo, S
 pub(crate) fn save_workbook(
     path: String,
     state: State<'_, AppState>,
+) -> Result<SaveResult, String> {
+    save_workbook_inner(path, state, false)
+}
+
+fn save_workbook_inner(
+    path: String,
+    state: State<'_, AppState>,
+    backup_already_created: bool,
 ) -> Result<SaveResult, String> {
     // .xls target → BIFF writer. Skips the xlsx preservation / IronCalc
     // paths entirely. Greenfield-only for now — we don't try to patch
@@ -199,23 +228,46 @@ pub(crate) fn save_workbook(
         .map(|e| e.eq_ignore_ascii_case("xls"))
         .unwrap_or(false);
     if is_xls_target {
-        let model_guard = state.model.lock().unwrap();
-        let model = model_guard.as_ref().ok_or("no workbook open")?;
-        // Inject the VBA / macro storages we captured on load (if
-        // any) so Excel-side macros survive the save. Save-as is OK
-        // too — VBA streams are self-contained, no offset
-        // cross-references with the workbook stream.
-        let preserved_guard = state.xls_preserved.lock().unwrap();
-        crate::xls_save::save_xls_with_preserved(model, &path, preserved_guard.as_ref())?;
-        drop(preserved_guard);
-        drop(model_guard);
+        let (bytes, preserved, vba_preserved) = {
+            let model_guard = state.model.lock().unwrap();
+            let model = model_guard.as_ref().ok_or("no workbook open")?;
+            // Inject the VBA / macro storages we captured on load (if
+            // any) so Excel-side macros survive the save. Save-as is OK
+            // too — VBA streams are self-contained, no offset
+            // cross-references with the workbook stream.
+            let preserved = state.xls_preserved.lock().unwrap().clone();
+            let vba_preserved = preserved
+                .as_ref()
+                .map(|p| !p.is_empty())
+                .unwrap_or(false);
+            // IronCalc's `Col` has no hidden field, so hidden-col state
+            // lives in AppState's side-channel — thread it through so
+            // COLINFO emits the hidden bit on save.
+            let hidden = state.hidden_cols.lock().unwrap().clone();
+            let bytes = crate::xls_save::build_xls_bytes(model, Some(&hidden));
+            (bytes, preserved, vba_preserved)
+        };
+        let backup_path = if backup_already_created {
+            None
+        } else {
+            crate::atomic::backup_if_exists(std::path::Path::new(&path))?
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        crate::xls_save::write_xls_bytes_with_preserved(
+            &path,
+            &bytes,
+            preserved.as_ref().filter(|p| !p.is_empty()),
+        )?;
         state.dirty.lock().unwrap().clear();
         state.style_dirty.lock().unwrap().clear();
+        *state.structural_dirty.lock().unwrap() = false;
         let _ = record_open_internal(&state, &path);
         return Ok(SaveResult {
             path,
             mode: "xls",
             cells_patched: 0,
+            backup_path,
+            vba_preserved,
         });
     }
     // Preservation eligibility (xlsx only):
@@ -223,32 +275,42 @@ pub(crate) fn save_workbook(
     //   2. The save target is the SAME file we loaded from (otherwise it's
     //      a Save As / new file — start fresh from IronCalc)
     //   3. We were able to map sheet_idx → zip entry path on load
+    //   4. No style changes (preservation can't patch styles.xml safely)
+    //   5. No structural changes (insert/delete row/col/sheet shifts
+    //      coordinates — the cell-XML patcher would land edits at the
+    //      wrong row/col, or worse, leave stale rows behind)
     let loaded_guard = state.loaded.lock().unwrap();
     let dirty_guard = state.dirty.lock().unwrap();
     let style_dirty_present = !state.style_dirty.lock().unwrap().is_empty();
+    let structural_dirty_present = *state.structural_dirty.lock().unwrap();
     let mut try_preserve = false;
     if let Some(loaded) = loaded_guard.as_ref() {
         if !loaded.sheet_paths.is_empty()
             && std::path::Path::new(&loaded.path) == std::path::Path::new(&path)
-            // Style changes can't be patched into the original styles.xml
-            // safely yet, so route through save_to_xlsx when present.
             && !style_dirty_present
+            && !structural_dirty_present
         {
             try_preserve = true;
         }
     }
     if try_preserve {
         if let Some(loaded) = loaded_guard.as_ref() {
-            let n = dirty_guard.len();
+            let loaded_snapshot = loaded.clone();
+            let dirty_snapshot = dirty_guard.clone();
+            let n = dirty_snapshot.len();
             // Snapshot the in-memory layout state (cols, rows, frozen
             // panes, hidden col side-channel) for every sheet so
             // save_preserving can project it back into the XML alongside
             // the dirty cells. Cheap clones — Col / Row are small.
             let layouts = collect_layout_snapshots(&state);
-            save_preserving(loaded, &dirty_guard, &layouts, &path)?;
             drop(loaded_guard);
             drop(dirty_guard);
+            save_preserving(&loaded_snapshot, &dirty_snapshot, &layouts, &path)?;
             state.dirty.lock().unwrap().clear();
+            // Defensive: preservation path is gated on structural_dirty
+            // being false, so this would already be false; clear anyway
+            // to keep all save paths uniform.
+            *state.structural_dirty.lock().unwrap() = false;
             // Refresh our in-memory snapshot so subsequent saves keep
             // patching the latest version of the file.
             if let Ok(bytes) = std::fs::read(&path) {
@@ -264,33 +326,60 @@ pub(crate) fn save_workbook(
                 path,
                 mode: "preserved",
                 cells_patched: n,
+                backup_path: None,
+                vba_preserved: false,
             });
         }
     }
     drop(loaded_guard);
     drop(dirty_guard);
-    // Fallback path — IronCalc save (loses unsupported features).
+    // Fallback path — IronCalc save (loses unsupported features:
+    // charts, pivots, comments, conditional formatting, drawings,
+    // shared formulas in some cases). If a file already exists at
+    // the target, snapshot it as `.bak` first so anything we'd lose
+    // is recoverable.
+    {
+        let model_guard = state.model.lock().unwrap();
+        if model_guard.is_none() {
+            return Err("no workbook open".into());
+        }
+    }
+    let backup_path = if backup_already_created {
+        None
+    } else {
+        crate::atomic::backup_if_exists(std::path::Path::new(&path))?
+            .map(|p| p.to_string_lossy().into_owned())
+    };
     let model_guard = state.model.lock().unwrap();
     let model = model_guard.as_ref().ok_or("no workbook open")?;
-    let _ = std::fs::remove_file(&path);
-    save_to_xlsx(model, &path).map_err(|e| e.to_string())?;
+    crate::atomic::write(std::path::Path::new(&path), |tmp| {
+        save_to_xlsx(model, &tmp.to_string_lossy()).map_err(|e| e.to_string())
+    })?;
     drop(model_guard);
     state.dirty.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
+    *state.structural_dirty.lock().unwrap() = false;
     let _ = record_open_internal(&state, &path);
     Ok(SaveResult {
         path,
         mode: "ironcalc",
         cells_patched: 0,
+        backup_path,
+        vba_preserved: false,
     })
 }
 
 /// Append a new sheet (auto-named "SheetN") and return its name + index.
+/// Marks the workbook structural-dirty: sheet add/delete shifts every
+/// subsequent sheet's index, which the xlsx preservation path can't
+/// patch safely (the loaded sheet_paths mapping would desync).
 #[tauri::command]
 pub(crate) fn add_sheet(state: State<'_, AppState>) -> Result<(String, u32), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
     let (name, idx) = model.new_sheet();
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
     Ok((name, idx))
 }
 
@@ -299,7 +388,10 @@ pub(crate) fn add_sheet(state: State<'_, AppState>) -> Result<(String, u32), Str
 pub(crate) fn add_sheet_named(name: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.add_sheet(&name)
+    model.add_sheet(&name)?;
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 #[tauri::command]
@@ -310,14 +402,26 @@ pub(crate) fn rename_sheet(
 ) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.rename_sheet_by_index(sheet, &new_name)
+    model.rename_sheet_by_index(sheet, &new_name)?;
+    drop(guard);
+    // Sheet rename changes the worksheet's name but not its index in
+    // `sheet_paths` — preservation could in principle survive it. But
+    // the original xlsx's workbook.xml + cell formulas reference the
+    // old name; patching that consistently across every sheet's
+    // shared-formulas / defined-names is more work than just routing
+    // through save_to_xlsx for now.
+    *state.structural_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 #[tauri::command]
 pub(crate) fn delete_sheet(sheet: u32, state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.delete_sheet(sheet)
+    model.delete_sheet(sheet)?;
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Refresh the WorkbookInfo (sheet name list) — frontend calls this after
@@ -450,19 +554,9 @@ pub(crate) fn backup_and_save(
     state: State<'_, AppState>,
 ) -> Result<BackupResult, String> {
     let p = std::path::Path::new(&path);
-    let bak = p.with_extension({
-        let cur = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if cur.is_empty() {
-            "bak".to_string()
-        } else {
-            format!("{cur}.bak")
-        }
-    });
-    if p.exists() {
-        let _ = std::fs::remove_file(&bak);
-        std::fs::copy(p, &bak).map_err(|e| format!("backup copy failed: {e}"))?;
-    }
-    let save = save_workbook(path, state)?;
+    let bak = crate::atomic::backup_if_exists(p)?
+        .ok_or_else(|| format!("no existing file to back up: {}", p.display()))?;
+    let save = save_workbook_inner(path, state, true)?;
     Ok(BackupResult {
         save,
         backup_path: bak.to_string_lossy().into_owned(),

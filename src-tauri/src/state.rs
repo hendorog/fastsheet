@@ -7,6 +7,7 @@ use rusqlite::Connection;
 /// Snapshot of the source .xlsx kept in memory so we can patch it in-place
 /// on save and preserve features IronCalc doesn't understand
 /// (charts/pivots/drawings/comments/conditional formatting).
+#[derive(Clone)]
 pub(crate) struct LoadedFile {
     pub(crate) path: String,
     pub(crate) bytes: Vec<u8>,
@@ -38,6 +39,23 @@ pub(crate) struct AppState {
     /// drawings get dropped by save_to_xlsx — files without those keep
     /// styles correctly; files with them choose styles over preservation.
     pub(crate) style_dirty: Mutex<HashSet<u32>>,
+    /// True when an insert/delete row/col, sheet add/delete, or other
+    /// structural edit has run since load. The xlsx preservation path
+    /// patches sheet XML by absolute (row, col) coordinates and would
+    /// silently desync from the underlying data on a structural shift,
+    /// so we route past it through `save_to_xlsx` (which loses
+    /// unsupported features but keeps cell coordinates correct). Cleared
+    /// on save, new_workbook, and successful open.
+    pub(crate) structural_dirty: Mutex<bool>,
+    /// Recalculation mode (Lotus 1-2-3 `/W G R` setting). When `true`,
+    /// every successful `set_cell` triggers `model.evaluate()` so
+    /// formula cells transition out of the un-evaluated `CellFormula`
+    /// variant (which displays as `#ERROR!`) into a real
+    /// `CellFormulaNumber` / `CellFormulaString` / etc. with a cached
+    /// value. When `false`, only F9 (or `recalc`) evaluates — useful
+    /// for very large workbooks where each evaluate is multi-second.
+    /// Defaults to `true` to match Excel + Lotus's automatic mode.
+    pub(crate) auto_recalc: Mutex<bool>,
     /// VBA / macro storages captured from the source .xls on load. The
     /// .xls writer (`save_xls`) replays these into the new compound
     /// file so macros survive a save+reload through Excel. Cleared on
@@ -69,6 +87,8 @@ impl AppState {
             dirty: Mutex::new(HashMap::new()),
             hidden_cols: Mutex::new(HashMap::new()),
             style_dirty: Mutex::new(HashSet::new()),
+            structural_dirty: Mutex::new(false),
+            auto_recalc: Mutex::new(true),
             xls_preserved: Mutex::new(None),
             compare: Mutex::new(None),
             startup_path: Mutex::new(None),

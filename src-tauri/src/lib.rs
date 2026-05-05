@@ -1,3 +1,4 @@
+mod atomic;
 mod cells;
 pub mod compare;
 mod hidden;
@@ -19,7 +20,7 @@ mod xlsx_save;
 // hidden-col scraper as the GUI.
 pub use hidden::extract_hidden_col_ranges;
 pub use xls_load::load_xls;
-pub use xls_save::save_xls;
+pub use xls_save::{save_xls, save_xls_with_preserved};
 pub use xlsx_load::{load_xlsx_with_fallback, replicate_my_array_formulas};
 
 use state::AppState;
@@ -113,10 +114,13 @@ pub fn run() {
             cells::set_range_number_format,
             cells::set_range_style,
             cells::apply_style_indices,
+            cells::get_cell_format,
             cells::define_name,
             cells::delete_name,
             cells::list_names,
             cells::recalc,
+            cells::get_auto_recalc,
+            cells::set_auto_recalc,
             cells::cell_addr,
             cells::jump_edge,
             cells::trace_formula,

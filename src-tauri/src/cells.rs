@@ -312,6 +312,17 @@ pub(crate) fn set_cell(
             .set_user_input(sheet, row as i32, col as i32, value.clone())
             .map_err(|e| e)?;
     }
+    // Recalc when auto-recalc is on — without this, formula edits
+    // leave the cell as `Cell::CellFormula` (un-evaluated), which
+    // `cell.value()` reports as the literal string "#ERROR!" until
+    // the next manual F9. With auto-recalc on the user gets the real
+    // value back immediately and downstream operations like number-
+    // format changes display correctly. The lock is held across the
+    // evaluate; evaluator is single-threaded by design.
+    let auto = *state.auto_recalc.lock().unwrap();
+    if auto {
+        model.evaluate();
+    }
     // Track the edit for in-place preservation on save. We store the user's
     // raw input so the saver can re-classify it (number / formula / string).
     state
@@ -319,12 +330,24 @@ pub(crate) fn set_cell(
         .lock()
         .unwrap()
         .insert((sheet, row as i32, col as i32), value);
-    // No recalc here — IronCalc only exposes a full-workbook evaluate()
-    // which is multi-second on a 40-sheet workbook. Frontend triggers
-    // recalc via F9 (the `recalc` command).
     Ok(model
         .get_formatted_cell_value(sheet, row as i32, col as i32)
         .unwrap_or_default())
+}
+
+/// Get / set auto-recalc state. The frontend uses these for the
+/// `/W G R` menu items and the status-bar indicator. Setting auto-
+/// recalc ON does NOT itself evaluate — pair with `recalc` if the
+/// caller wants stale formulas refreshed at the same time.
+#[tauri::command]
+pub(crate) fn get_auto_recalc(state: State<'_, AppState>) -> bool {
+    *state.auto_recalc.lock().unwrap()
+}
+
+#[tauri::command]
+pub(crate) fn set_auto_recalc(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    *state.auto_recalc.lock().unwrap() = enabled;
+    Ok(())
 }
 
 #[tauri::command]
@@ -447,6 +470,17 @@ pub(crate) enum StyleOp {
     ToggleBold,
     ToggleItalic,
     ToggleUnderline,
+    ToggleStrike,
+    SetBold { enabled: bool },
+    SetItalic { enabled: bool },
+    SetUnderline { enabled: bool },
+    SetStrike { enabled: bool },
+    /// Reset font attributes — clears bold, italic, underline, strike,
+    /// and font color back to the cell's defaults. Preserves number
+    /// format, borders, fill, and alignment so the user can strip
+    /// just the typography without rebuilding the rest of the cell's
+    /// formatting.
+    ResetAttributes,
     AlignLeft,
     AlignCenter,
     AlignRight,
@@ -491,6 +525,7 @@ pub(crate) fn set_range_style(
         StyleOp::ToggleBold => Some(!model.get_style_for_cell(sheet, r1, c1)?.font.b),
         StyleOp::ToggleItalic => Some(!model.get_style_for_cell(sheet, r1, c1)?.font.i),
         StyleOp::ToggleUnderline => Some(!model.get_style_for_cell(sheet, r1, c1)?.font.u),
+        StyleOp::ToggleStrike => Some(!model.get_style_for_cell(sheet, r1, c1)?.font.strike),
         _ => None,
     };
 
@@ -505,6 +540,18 @@ pub(crate) fn set_range_style(
                 StyleOp::ToggleBold => s.font.b = toggle_target.unwrap(),
                 StyleOp::ToggleItalic => s.font.i = toggle_target.unwrap(),
                 StyleOp::ToggleUnderline => s.font.u = toggle_target.unwrap(),
+                StyleOp::ToggleStrike => s.font.strike = toggle_target.unwrap(),
+                StyleOp::SetBold { enabled } => s.font.b = *enabled,
+                StyleOp::SetItalic { enabled } => s.font.i = *enabled,
+                StyleOp::SetUnderline { enabled } => s.font.u = *enabled,
+                StyleOp::SetStrike { enabled } => s.font.strike = *enabled,
+                StyleOp::ResetAttributes => {
+                    s.font.b = false;
+                    s.font.i = false;
+                    s.font.u = false;
+                    s.font.strike = false;
+                    s.font.color = None;
+                }
                 StyleOp::AlignLeft => {
                     let mut a = s.alignment.clone().unwrap_or_default();
                     a.horizontal = HorizontalAlignment::Left;
@@ -640,7 +687,94 @@ pub(crate) fn set_range_number_format(
     Ok(n)
 }
 
+/// Comprehensive style snapshot for the Format Cells modal. Pulls
+/// num_fmt + alignment + font + fill + borders from a single cell so
+/// the dialog can populate all tabs in one read.
+#[derive(Serialize)]
+pub(crate) struct CellFormatInfo {
+    num_fmt: String,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strike: bool,
+    font_size: i32,
+    font_name: String,
+    font_color: Option<String>,
+    fill_color: Option<String>,
+    /// "general" | "left" | "center" | "right" | "justify"
+    align_h: &'static str,
+    /// "top" | "middle" | "bottom"
+    align_v: &'static str,
+    wrap: bool,
+    border_top: bool,
+    border_bottom: bool,
+    border_left: bool,
+    border_right: bool,
+}
+
+#[tauri::command]
+pub(crate) fn get_cell_format(
+    sheet: u32,
+    row: i32,
+    col: i32,
+    state: State<'_, AppState>,
+) -> Result<CellFormatInfo, String> {
+    use ironcalc::base::types::{HorizontalAlignment, VerticalAlignment};
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    let style = model.get_style_for_cell(sheet, row, col)?;
+    let f = &style.font;
+    let align_h = style
+        .alignment
+        .as_ref()
+        .map(|a| match a.horizontal {
+            HorizontalAlignment::Left => "left",
+            HorizontalAlignment::Center | HorizontalAlignment::CenterContinuous => "center",
+            HorizontalAlignment::Right => "right",
+            HorizontalAlignment::Justify | HorizontalAlignment::Distributed => "justify",
+            HorizontalAlignment::Fill | HorizontalAlignment::General => "general",
+        })
+        .unwrap_or("general");
+    let align_v = style
+        .alignment
+        .as_ref()
+        .map(|a| match a.vertical {
+            VerticalAlignment::Top => "top",
+            VerticalAlignment::Center => "middle",
+            VerticalAlignment::Justify | VerticalAlignment::Distributed => "middle",
+            VerticalAlignment::Bottom => "bottom",
+        })
+        .unwrap_or("bottom");
+    let wrap = style.alignment.as_ref().map(|a| a.wrap_text).unwrap_or(false);
+    let fill_color = if style.fill.pattern_type == "solid" {
+        style.fill.fg_color.clone().or(style.fill.bg_color.clone())
+    } else {
+        None
+    };
+    Ok(CellFormatInfo {
+        num_fmt: style.num_fmt.clone(),
+        bold: f.b,
+        italic: f.i,
+        underline: f.u,
+        strike: f.strike,
+        font_size: f.sz,
+        font_name: f.name.clone(),
+        font_color: f.color.clone(),
+        fill_color,
+        align_h,
+        align_v,
+        wrap,
+        border_top: style.border.top.is_some(),
+        border_bottom: style.border.bottom.is_some(),
+        border_left: style.border.left.is_some(),
+        border_right: style.border.right.is_some(),
+    })
+}
+
 /// Insert `count` blank rows at `row`, shifting subsequent rows down.
+/// Sets `structural_dirty` so the next save bypasses the xlsx
+/// preservation path — patching by absolute (row, col) coords would
+/// silently desync from data after a row shift.
 #[tauri::command]
 pub(crate) fn insert_rows(
     sheet: u32,
@@ -650,7 +784,10 @@ pub(crate) fn insert_rows(
 ) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.insert_rows(sheet, row, count)
+    model.insert_rows(sheet, row, count)?;
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Delete `count` rows starting at `row`, shifting subsequent rows up.
@@ -663,7 +800,10 @@ pub(crate) fn delete_rows(
 ) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.delete_rows(sheet, row, count)
+    model.delete_rows(sheet, row, count)?;
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Insert `count` blank cols at `col`, shifting subsequent cols right.
@@ -676,7 +816,10 @@ pub(crate) fn insert_columns(
 ) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.insert_columns(sheet, col, count)
+    model.insert_columns(sheet, col, count)?;
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Delete `count` cols starting at `col`, shifting subsequent cols left.
@@ -689,7 +832,10 @@ pub(crate) fn delete_columns(
 ) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.delete_columns(sheet, col, count)
+    model.delete_columns(sheet, col, count)?;
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Set the displayed width of a column. `px` is the display pixel value

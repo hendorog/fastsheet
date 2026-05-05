@@ -16,6 +16,7 @@
 //!   https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xls/
 //! * OpenOffice.org's Excel File Format documentation (BIFF5/8).
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -29,6 +30,7 @@ const R_EOF: u16 = 0x000A;
 const R_BOUNDSHEET8: u16 = 0x0085;
 const R_DIMENSIONS: u16 = 0x0200;
 const R_WINDOW2: u16 = 0x023E;
+const R_PANE: u16 = 0x0041;
 const R_CONTINUE: u16 = 0x003C;
 const R_CODEPAGE: u16 = 0x0042;
 const R_DSF: u16 = 0x0161;
@@ -180,7 +182,6 @@ pub(crate) trait BiffBody {
     fn put_u8(&mut self, v: u8);
     fn put_u16(&mut self, v: u16);
     fn put_u32(&mut self, v: u32);
-    fn put_i16(&mut self, v: i16);
     fn put_f64(&mut self, v: f64);
     /// XLUnicodeString-style: u16 char count + u8 flag + chars.
     /// Compressed (1 byte/char) when all codepoints fit in U+0000..=U+00FF;
@@ -195,7 +196,6 @@ impl BiffBody for Vec<u8> {
     fn put_u8(&mut self, v: u8) { self.push(v); }
     fn put_u16(&mut self, v: u16) { self.extend_from_slice(&v.to_le_bytes()); }
     fn put_u32(&mut self, v: u32) { self.extend_from_slice(&v.to_le_bytes()); }
-    fn put_i16(&mut self, v: i16) { self.extend_from_slice(&v.to_le_bytes()); }
     fn put_f64(&mut self, v: f64) { self.extend_from_slice(&v.to_le_bytes()); }
 
     fn put_xl_unicode_string(&mut self, s: &str) {
@@ -258,25 +258,84 @@ fn build_eof() -> Vec<u8> { Vec::new() }
 /// COLINFO record (0x007D) [MS-XLS] 2.4.39. Body (12 bytes):
 ///   colFirst u16, colLast u16, colWidth u16, ixfe u16, grbit u16,
 ///   reserved u16. colWidth is in 1/256ths of the default font's
-///   '0' character width.
+///   '0' character width. grbit bit 0 = hidden.
 ///
 /// IronCalc stores Col.width as PLAIN CHARACTERS (the
 /// `set_column_width` API divides its argument by COLUMN_WIDTH_FACTOR
 /// before storing — see vendor/base/src/worksheet.rs:420). Convert
 /// chars → 1/256ths by multiplying by 256.
-fn build_colinfo(col: &ironcalc::base::types::Col) -> Vec<u8> {
+fn build_colinfo_range(
+    min_col_1based: i32,
+    max_col_1based: i32,
+    width_chars: f64,
+    ixfe: u16,
+    hidden: bool,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(12);
-    let col_first = (col.min - 1).max(0) as u16;
-    let col_last = (col.max - 1).max(0) as u16;
-    let biff_units = (col.width * 256.0).round();
+    let col_first = (min_col_1based - 1).max(0) as u16;
+    let col_last = (max_col_1based - 1).max(0) as u16;
+    let biff_units = (width_chars * 256.0).round();
     let col_width = biff_units.max(0.0).min(u16::MAX as f64) as u16;
     body.put_u16(col_first);
     body.put_u16(col_last);
     body.put_u16(col_width);
-    body.put_u16(col.style.unwrap_or(15) as u16); // ixfe — fall back to default cell XF
-    body.put_u16(0); // grbit (bit 0 = hidden — not in IronCalc Col yet)
+    body.put_u16(ixfe);
+    body.put_u16(if hidden { 0x0001 } else { 0 });
     body.put_u16(0); // reserved
     body
+}
+
+/// Build the full set of COLINFO bodies for a worksheet, layering the
+/// AppState `hidden_cols` side-channel on top of `worksheet.cols`. Cols
+/// with the same (width, ixfe, hidden) coalesce into a single range
+/// entry so output mirrors what Excel itself would emit.
+///
+/// Hidden cols not covered by an explicit IronCalc Col entry get the
+/// Excel default width (8.43 chars) so unhide restores a reasonable
+/// width — IronCalc's `Col` has no hidden field, so a "user just
+/// hid this column" gesture in our UI never updates `worksheet.cols`.
+fn build_colinfo_records(
+    ws: &ironcalc::base::types::Worksheet,
+    hidden_cols: &HashSet<i32>,
+) -> Vec<Vec<u8>> {
+    const DEFAULT_HIDDEN_WIDTH_CHARS: f64 = 8.43;
+
+    let mut per_col: BTreeMap<i32, (u64, u16, bool)> = BTreeMap::new();
+    for col in &ws.cols {
+        let ixfe = col.style.unwrap_or(15) as u16;
+        // f64 isn't Eq, so quantize widths to the BIFF units we'll emit.
+        let w_units = (col.width * 256.0).round().max(0.0).min(u16::MAX as f64) as u64;
+        for i in col.min..=col.max {
+            per_col.insert(i, (w_units, ixfe, false));
+        }
+    }
+    let default_units = (DEFAULT_HIDDEN_WIDTH_CHARS * 256.0).round() as u64;
+    for &c in hidden_cols {
+        per_col
+            .entry(c)
+            .and_modify(|e| e.2 = true)
+            .or_insert((default_units, 15u16, true));
+    }
+    if per_col.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut iter = per_col.into_iter().peekable();
+    while let Some((min_col, attrs)) = iter.next() {
+        let mut max_col = min_col;
+        while let Some(&(next, next_attrs)) = iter.peek() {
+            if next != max_col + 1 || next_attrs != attrs {
+                break;
+            }
+            max_col = next;
+            iter.next();
+        }
+        let (w_units, ixfe, hidden) = attrs;
+        let width_chars = (w_units as f64) / 256.0;
+        out.push(build_colinfo_range(min_col, max_col, width_chars, ixfe, hidden));
+    }
+    out
 }
 
 /// ROW record (0x0208) [MS-XLS] 2.4.220. Body (16 bytes):
@@ -315,20 +374,50 @@ fn build_dimensions(rw_mic: u32, rw_mac: u32, col_mic: u16, col_mac: u16) -> Vec
     body
 }
 
-/// WINDOW2 — [MS-XLS] 2.4.358. Minimal selection-state record so the
-/// substream is well-formed.
-fn build_window2_default() -> Vec<u8> {
+/// WINDOW2 — [MS-XLS] 2.4.358. Selection-state record. When the
+/// worksheet has frozen panes, set fFrozen (bit 3, 0x0008) and
+/// fFrozenNoSplit (bit 8, 0x0100) — Excel pairs the two; without
+/// fFrozenNoSplit the sheet renders as a draggable split instead of
+/// frozen titles even with PANE present.
+fn build_window2(frozen_rows: i32, frozen_columns: i32) -> Vec<u8> {
     let mut body = Vec::with_capacity(18);
-    // grbit: fDspFmla=0, fDspGrid=1, fDspRwCol=1, fFrozen=0, fDspZeros=1,
-    //        fDefaultHdr=1, fRightToLeft=0, fDspGuts=1, fFrozenNoSplit=0,
-    //        fSelected=1, fPaged=1
-    body.put_u16(0x06B6);
+    // Base: fDspGrid=1, fDspRwCol=1, fDspZeros=1, fDefaultHdr=1,
+    //       fDspGuts=1, fSelected=1, fPaged=1.
+    let mut grbit: u16 = 0x06B6;
+    if frozen_rows > 0 || frozen_columns > 0 {
+        grbit |= 0x0008; // fFrozen
+        grbit |= 0x0100; // fFrozenNoSplit
+    }
+    body.put_u16(grbit);
     body.put_u16(0); // top row
     body.put_u16(0); // left col
     body.put_u32(0x00000040); // icvHdr (default)
     body.put_u16(0); // pagebreak preview zoom
     body.put_u16(0); // normal view zoom
     body.put_u32(0); // reserved
+    body
+}
+
+/// PANE — [MS-XLS] 2.4.213. Emitted only when the worksheet has frozen
+/// panes (i.e. WINDOW2's fFrozen is set). For frozen panes:
+///   x       = number of columns in the left (frozen) pane
+///   y       = number of rows in the top (frozen) pane
+///   rwTop   = top visible row in the bottom pane (= y when frozen)
+///   colLeft = left visible col in the right pane (= x when frozen)
+///   pnnAct  = active pane (0 = lower-right, 2 = lower-left). When
+///             only rows are frozen, no vertical split exists so the
+///             data area is the lower-left pane (pnnAct=2). Otherwise
+///             the data area is the lower-right (pnnAct=0).
+fn build_pane(frozen_rows: i32, frozen_columns: i32) -> Vec<u8> {
+    let cols = frozen_columns.max(0).min(u16::MAX as i32) as u16;
+    let rows = frozen_rows.max(0).min(u16::MAX as i32) as u16;
+    let pnn_act: u8 = if cols == 0 { 2 } else { 0 };
+    let mut body = Vec::with_capacity(9);
+    body.put_u16(cols);  // x
+    body.put_u16(rows);  // y
+    body.put_u16(rows);  // rwTop
+    body.put_u16(cols);  // colLeft
+    body.put_u8(pnn_act);
     body
 }
 
@@ -2527,7 +2616,7 @@ fn emit_sheet_cells(
 // ---------------------------------------------------------------------------
 
 pub fn save_xls<P: AsRef<Path>>(model: &ironcalc::base::Model, path: P) -> Result<(), String> {
-    save_xls_with_preserved(model, path, None)
+    save_xls_with_preserved(model, path, None, None)
 }
 
 /// Save with optional VBA / macro storage preservation. When
@@ -2537,13 +2626,34 @@ pub fn save_xls<P: AsRef<Path>>(model: &ironcalc::base::Model, path: P) -> Resul
 /// pivots, drawings, conditional formatting, OLE links) is still
 /// dropped — those would need full BIFF-stream offset preservation
 /// (see pending #1).
+///
+/// `hidden_cols`: per-sheet (0-based sheet index → set of 1-based col
+/// indices) hidden-column map. IronCalc's `Col` struct carries no
+/// hidden field, so the caller threads this through from the AppState
+/// side-channel populated on load.
 pub fn save_xls_with_preserved<P: AsRef<Path>>(
     model: &ironcalc::base::Model,
     path: P,
     preserved: Option<&crate::xls_preserve::PreservedXlsData>,
+    hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
 ) -> Result<(), String> {
-    let bytes = build_workbook_stream(model);
-    write_compound_file(path.as_ref(), &bytes, preserved)
+    let bytes = build_xls_bytes(model, hidden_cols);
+    write_xls_bytes_with_preserved(path, &bytes, preserved)
+}
+
+pub fn build_xls_bytes(
+    model: &ironcalc::base::Model,
+    hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
+) -> Vec<u8> {
+    build_workbook_stream(model, hidden_cols)
+}
+
+pub fn write_xls_bytes_with_preserved<P: AsRef<Path>>(
+    path: P,
+    workbook_bytes: &[u8],
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
+) -> Result<(), String> {
+    write_compound_file(path.as_ref(), workbook_bytes, preserved)
 }
 
 /// Build the full workbook-stream byte sequence: globals (header
@@ -2551,7 +2661,10 @@ pub fn save_xls_with_preserved<P: AsRef<Path>>(
 /// substream per worksheet. Cell records are not yet emitted — phase
 /// 3 walks `model.workbook.worksheets[i].sheet_data` and writes
 /// BLANK / NUMBER / LABELSST / FORMULA records.
-fn build_workbook_stream(model: &ironcalc::base::Model) -> Vec<u8> {
+fn build_workbook_stream(
+    model: &ironcalc::base::Model,
+    hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
+) -> Vec<u8> {
     let mut w = BiffWriter::new();
     let sheet_names: Vec<&str> = model
         .workbook
@@ -2742,10 +2855,15 @@ fn build_workbook_stream(model: &ironcalc::base::Model) -> Vec<u8> {
         w.write_record(R_DEFAULTROWHEIGHT, &build_defaultrowheight());
         w.write_record(R_WSBOOL, &build_wsbool());
 
-        // COLINFO records — one per IronCalc Col entry. BIFF8
-        // ordering puts COLINFO between WSBOOL and DIMENSIONS.
-        for col in &ws.cols {
-            w.write_record(R_COLINFO, &build_colinfo(col));
+        // COLINFO records — derived from IronCalc Col entries layered
+        // with the AppState hidden_cols side-channel. BIFF8 ordering
+        // puts COLINFO between WSBOOL and DIMENSIONS.
+        let empty_hidden = HashSet::new();
+        let sheet_hidden = hidden_cols
+            .and_then(|m| m.get(&(i as u32)))
+            .unwrap_or(&empty_hidden);
+        for body in build_colinfo_records(ws, sheet_hidden) {
+            w.write_record(R_COLINFO, &body);
         }
 
         // DIMENSIONS — 0-based inclusive→exclusive: rwMic / rwMac /
@@ -2770,7 +2888,10 @@ fn build_workbook_stream(model: &ironcalc::base::Model) -> Vec<u8> {
         }
 
         emit_sheet_cells(&mut w, ws, i as u32, &sst_table, &sst_idx, parsed, &xti, &defined_names, &extern_names, &style_tables);
-        w.write_record(R_WINDOW2, &build_window2_default());
+        w.write_record(R_WINDOW2, &build_window2(ws.frozen_rows, ws.frozen_columns));
+        if ws.frozen_rows > 0 || ws.frozen_columns > 0 {
+            w.write_record(R_PANE, &build_pane(ws.frozen_rows, ws.frozen_columns));
+        }
         w.write_record(R_EOF, &build_eof());
     }
 
@@ -2793,9 +2914,18 @@ fn write_compound_file(
     workbook_bytes: &[u8],
     preserved: Option<&crate::xls_preserve::PreservedXlsData>,
 ) -> Result<(), String> {
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|e| format!("xls remove existing: {e}"))?;
-    }
+    // Atomic save: build the CFB at a sibling temp path so a mid-write
+    // failure (disk full, IO error) leaves the existing file intact.
+    crate::atomic::write(path, |tmp| build_cfb_at(tmp, workbook_bytes, preserved))
+}
+
+/// Synthesize the CFB-wrapped workbook stream at `path`. Caller is
+/// responsible for atomic placement; this just writes the file.
+fn build_cfb_at(
+    path: &Path,
+    workbook_bytes: &[u8],
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
+) -> Result<(), String> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2856,7 +2986,7 @@ mod tests {
         for n in names.iter().skip(1) {
             let _ = model.add_sheet(n);
         }
-        build_workbook_stream(&model)
+        build_workbook_stream(&model, None)
     }
 
     #[test]
@@ -2998,7 +3128,7 @@ mod tests {
         // Force evaluation so the formula gets a cached numeric value.
         model.evaluate();
 
-        let bytes = build_workbook_stream(&model);
+        let bytes = build_workbook_stream(&model, None);
         let recs = read_records(&bytes);
         let types: Vec<u16> = recs.iter().map(|(t, _)| *t).collect();
 
@@ -3018,7 +3148,7 @@ mod tests {
         // colMic=1, colMac=7 (1-based last col).
         model.set_user_input(0, 3, 2, "1".to_string()).unwrap();
         model.set_user_input(0, 5, 7, "1".to_string()).unwrap();
-        let bytes = build_workbook_stream(&model);
+        let bytes = build_workbook_stream(&model, None);
 
         // Walk to the DIMENSIONS record in the sheet substream.
         let mut pos = 0usize;
@@ -3078,7 +3208,7 @@ mod tests {
         model.set_user_input(0, 1, 1, "foo".to_string()).unwrap();
         model.set_user_input(0, 2, 1, "foo".to_string()).unwrap();
         model.set_user_input(0, 3, 1, "bar".to_string()).unwrap();
-        let bytes = build_workbook_stream(&model);
+        let bytes = build_workbook_stream(&model, None);
 
         // Find the SST record and read cstTotal / cstUnique.
         let mut pos = 0usize;
@@ -3380,6 +3510,227 @@ mod tests {
         body.put_xl_unicode_string("Σ"); // U+03A3
         // u16 cch=1 + u8 flag=1 + u16 char
         assert_eq!(body, vec![1, 0, 1, 0xA3, 0x03]);
+    }
+
+    /// Walk the workbook stream and return every record body whose
+    /// type matches `rec_type`. Used by the frozen-pane / hidden-col
+    /// tests below to assert on emitted bytes.
+    fn collect_bodies(bytes: &[u8], rec_type: u16) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 4 <= bytes.len() {
+            let rt = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
+            let rl = u16::from_le_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+            if rt == rec_type {
+                out.push(&bytes[pos + 4..pos + 4 + rl]);
+            }
+            pos += 4 + rl;
+        }
+        out
+    }
+
+    #[test]
+    fn window2_default_has_no_frozen_bit() {
+        let body = build_window2(0, 0);
+        let grbit = u16::from_le_bytes([body[0], body[1]]);
+        assert_eq!(grbit & 0x0008, 0, "fFrozen must be clear when no panes");
+        assert_eq!(grbit & 0x0100, 0, "fFrozenNoSplit must be clear when no panes");
+    }
+
+    #[test]
+    fn window2_sets_frozen_bits_when_rows_frozen() {
+        let body = build_window2(2, 0);
+        let grbit = u16::from_le_bytes([body[0], body[1]]);
+        assert_ne!(grbit & 0x0008, 0, "fFrozen must be set");
+        assert_ne!(grbit & 0x0100, 0, "fFrozenNoSplit must be set");
+    }
+
+    #[test]
+    fn pane_encodes_frozen_split_position() {
+        let body = build_pane(3, 5);
+        let x = u16::from_le_bytes([body[0], body[1]]);
+        let y = u16::from_le_bytes([body[2], body[3]]);
+        let rw_top = u16::from_le_bytes([body[4], body[5]]);
+        let col_left = u16::from_le_bytes([body[6], body[7]]);
+        let pnn_act = body[8];
+        assert_eq!(x, 5, "x = frozen_columns");
+        assert_eq!(y, 3, "y = frozen_rows");
+        assert_eq!(rw_top, 3);
+        assert_eq!(col_left, 5);
+        // Both panes frozen: data area is lower-right, pnnAct=0.
+        assert_eq!(pnn_act, 0);
+    }
+
+    #[test]
+    fn pane_active_pane_is_lower_left_when_only_rows_frozen() {
+        let body = build_pane(1, 0);
+        let pnn_act = body[8];
+        assert_eq!(pnn_act, 2, "rows-only frozen → lower-left active");
+    }
+
+    #[test]
+    fn frozen_pane_round_trip_emits_window2_and_pane_in_correct_order() {
+        let mut model = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        model.workbook.worksheets[0].frozen_rows = 1;
+        model.workbook.worksheets[0].frozen_columns = 2;
+        let bytes = build_workbook_stream(&model, None);
+
+        // Locate WINDOW2 + PANE positions (sheet substream only — find
+        // them after the globals EOF).
+        let mut pos = 0usize;
+        let mut globals_eof_passed = false;
+        let mut window2_pos = None;
+        let mut pane_pos = None;
+        while pos + 4 <= bytes.len() {
+            let rt = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
+            let rl = u16::from_le_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+            if rt == R_EOF && !globals_eof_passed {
+                globals_eof_passed = true;
+            } else if globals_eof_passed && rt == R_WINDOW2 && window2_pos.is_none() {
+                window2_pos = Some(pos);
+            } else if globals_eof_passed && rt == R_PANE && pane_pos.is_none() {
+                pane_pos = Some(pos);
+            }
+            pos += 4 + rl;
+        }
+        let window2_pos = window2_pos.expect("WINDOW2 missing in sheet substream");
+        let pane_pos = pane_pos.expect("PANE missing — should be emitted when frozen");
+        assert!(pane_pos > window2_pos, "PANE must follow WINDOW2");
+
+        // WINDOW2 grbit must have fFrozen set; PANE x/y must match the model.
+        let w2_body = &bytes[window2_pos + 4..window2_pos + 4 + 18];
+        let grbit = u16::from_le_bytes([w2_body[0], w2_body[1]]);
+        assert_ne!(grbit & 0x0008, 0);
+        let pane_body = &bytes[pane_pos + 4..pane_pos + 4 + 9];
+        let x = u16::from_le_bytes([pane_body[0], pane_body[1]]);
+        let y = u16::from_le_bytes([pane_body[2], pane_body[3]]);
+        assert_eq!(x, 2, "x = frozen_columns");
+        assert_eq!(y, 1, "y = frozen_rows");
+    }
+
+    #[test]
+    fn frozen_pane_omitted_when_no_freeze() {
+        let model = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        let bytes = build_workbook_stream(&model, None);
+        let panes = collect_bodies(&bytes, R_PANE);
+        assert!(panes.is_empty(), "PANE must not be emitted without frozen panes");
+    }
+
+    #[test]
+    fn colinfo_hidden_bit_set_for_hidden_col() {
+        let mut model = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        // Explicit Col entry covering col 5 with custom width — without
+        // hidden_cols the COLINFO grbit must be 0; with col 5 in
+        // hidden_cols, the same range must come back with grbit bit 0.
+        let _ = model.set_column_width(0, 5, 12.0 * 12.0); // 12 chars after factor
+        let mut hidden = HashMap::new();
+        let mut set = HashSet::new();
+        set.insert(5);
+        hidden.insert(0u32, set);
+        let bytes = build_workbook_stream(&model, Some(&hidden));
+        let bodies = collect_bodies(&bytes, R_COLINFO);
+        let mut found_hidden = false;
+        for body in bodies {
+            let col_first = u16::from_le_bytes([body[0], body[1]]);
+            let col_last = u16::from_le_bytes([body[2], body[3]]);
+            let grbit = u16::from_le_bytes([body[8], body[9]]);
+            if col_first <= 4 && col_last >= 4 && (grbit & 0x0001) != 0 {
+                found_hidden = true;
+            }
+        }
+        assert!(found_hidden, "COLINFO covering col 5 must have hidden bit set");
+    }
+
+    #[test]
+    fn colinfo_emits_for_hidden_col_with_no_explicit_width() {
+        let model = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        let mut hidden = HashMap::new();
+        let mut set = HashSet::new();
+        set.insert(3);
+        hidden.insert(0u32, set);
+        let bytes = build_workbook_stream(&model, Some(&hidden));
+        let bodies = collect_bodies(&bytes, R_COLINFO);
+        // At least one COLINFO with the hidden bit covering col 3.
+        let mut covered = false;
+        for body in bodies {
+            let col_first = u16::from_le_bytes([body[0], body[1]]);
+            let col_last = u16::from_le_bytes([body[2], body[3]]);
+            let grbit = u16::from_le_bytes([body[8], body[9]]);
+            if col_first <= 2 && col_last >= 2 && (grbit & 0x0001) != 0 {
+                covered = true;
+            }
+        }
+        assert!(covered, "COLINFO must be emitted for hidden cols not in worksheet.cols");
+    }
+
+    #[test]
+    fn colinfo_coalesces_consecutive_hidden_cols_with_same_attrs() {
+        let model = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        let mut hidden = HashMap::new();
+        let mut set = HashSet::new();
+        set.insert(2);
+        set.insert(3);
+        set.insert(4);
+        hidden.insert(0u32, set);
+        let bytes = build_workbook_stream(&model, Some(&hidden));
+        let bodies = collect_bodies(&bytes, R_COLINFO);
+        let mut single_range = None;
+        for body in bodies {
+            let col_first = u16::from_le_bytes([body[0], body[1]]);
+            let col_last = u16::from_le_bytes([body[2], body[3]]);
+            let grbit = u16::from_le_bytes([body[8], body[9]]);
+            if (grbit & 0x0001) != 0 {
+                single_range = Some((col_first, col_last));
+            }
+        }
+        let (first, last) = single_range.expect("expected one hidden range");
+        assert_eq!(first, 1, "0-based first col");
+        assert_eq!(last, 3, "0-based last col");
+    }
+
+    #[test]
+    fn colinfo_splits_when_hidden_breaks_existing_range() {
+        let mut model = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        // Set width on cols 1..=5 so they form a single Col entry,
+        // then hide just col 3 — the writer must split into three
+        // COLINFO records: (1..=2, visible), (3, hidden), (4..=5, visible).
+        for col in 1..=5 {
+            let _ = model.set_column_width(0, col, 10.0 * 12.0);
+        }
+        let mut hidden = HashMap::new();
+        let mut set = HashSet::new();
+        set.insert(3);
+        hidden.insert(0u32, set);
+        let bytes = build_workbook_stream(&model, Some(&hidden));
+        let bodies = collect_bodies(&bytes, R_COLINFO);
+        let ranges: Vec<(u16, u16, u16)> = bodies
+            .iter()
+            .map(|b| {
+                let f = u16::from_le_bytes([b[0], b[1]]);
+                let l = u16::from_le_bytes([b[2], b[3]]);
+                let g = u16::from_le_bytes([b[8], b[9]]);
+                (f, l, g)
+            })
+            .collect();
+        // Expect the col-3 range to come out as a single-col hidden
+        // record, with sibling visible ranges on either side.
+        let hidden_range = ranges.iter().find(|(_, _, g)| g & 0x0001 != 0);
+        let (f, l, _) = hidden_range.expect("missing hidden split").clone();
+        assert_eq!(f, 2, "hidden col split first (0-based)");
+        assert_eq!(l, 2, "hidden col split last (0-based)");
+        // At least one visible range covering the cols around it.
+        assert!(
+            ranges
+                .iter()
+                .any(|(f, l, g)| g & 0x0001 == 0 && *f <= 1 && *l >= 1),
+            "expected visible range covering cols 1..=2"
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|(f, l, g)| g & 0x0001 == 0 && *f <= 3 && *l >= 3),
+            "expected visible range covering cols 4..=5"
+        );
     }
 
     #[test]

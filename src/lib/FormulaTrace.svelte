@@ -258,6 +258,13 @@
           role="button"
           tabindex="-1"
           onclick={() => { highlight = i; jumpRow(row); }}
+          onkeydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              highlight = i;
+              jumpRow(row);
+            }
+          }}
           onmouseenter={() => { highlight = i; }}
         >
           <span class="indent" style={`width: ${row.depth * 14}px;`}></span>
@@ -266,6 +273,13 @@
               role="button"
               tabindex="-1"
               onclick={(e) => { e.stopPropagation(); toggle(row); }}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  toggle(row);
+                }
+              }}
             >{collapsed.has(row.key) ? "▶" : "▼"}</span>
           {:else}
             <span class="caret-spacer"></span>

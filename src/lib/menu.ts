@@ -33,6 +33,10 @@ export type MenuCallbacks = {
   searchRange: () => void | Promise<void>;
   // Range/Label — text alignment.
   alignRange: (h: "left" | "center" | "right" | "general") => void | Promise<void>;
+  // Range/Attribute — bold / italic / underline / strike / reset.
+  // Mirrors Lotus 1-2-3 Wysiwyg's `:Format` menu and the Excel Ctrl-key
+  // shortcuts (B / I / U / 5).
+  attrRange: (kind: "bold" | "italic" | "underline" | "strike" | "reset") => void | Promise<void>;
   // Range/Format/Color — fill / text color (prompted hex).
   setFillColor: () => void | Promise<void>;
   setTextColor: () => void | Promise<void>;
@@ -65,6 +69,14 @@ export type MenuCallbacks = {
   // /File/Compare — workbook comparison.
   compareOpen: () => void | Promise<void>;
   compareExit: () => void | Promise<void>;
+  // /Worksheet/Global/Recalculation — automatic vs manual recalc.
+  // Lotus 1-2-3 path: /W G R. Manual disables the auto-evaluate that
+  // runs after every set_cell — useful for very large workbooks.
+  setRecalcMode: (mode: "automatic" | "manual") => void | Promise<void>;
+  /// Trigger a full workbook recalc. Bound to F9 globally too; the
+  /// menu version exists so /W G R doesn't lock the user out of an
+  /// immediate recalc when manual mode is active.
+  recalcNow: () => void | Promise<void>;
 };
 
 export type FormatKind =
@@ -73,6 +85,7 @@ export type FormatKind =
   | "currency"  // 0..15 decimals, prompted
   | "percent"   // 0..15 decimals, prompted
   | "comma"     // 0..15 decimals, prompted (thousands sep)
+  | "scientific" // 0..15 decimals, prompted
   | "date"
   | "time";
 
@@ -91,7 +104,21 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
       description:
         "Global settings, columns, rows, titles, windows, page, status",
       children: [
-        { letter: "G", label: "Global", description: "Worksheet global settings", action: stb("Worksheet/Global") },
+        {
+          letter: "G", label: "Global",
+          description: "Worksheet global settings",
+          children: [
+            {
+              letter: "R", label: "Recalculation",
+              description: "Automatic / Manual recalc; trigger an immediate recalc",
+              children: [
+                { letter: "A", label: "Automatic", description: "Recalc after every cell edit (default — matches Excel)", action: () => cb.setRecalcMode("automatic") },
+                { letter: "M", label: "Manual", description: "Recalc only on F9 — useful for very large workbooks", action: () => cb.setRecalcMode("manual") },
+                { letter: "N", label: "Now", description: "Recalc the entire workbook now (F9)", action: cb.recalcNow },
+              ],
+            },
+          ],
+        },
         {
           letter: "I", label: "Insert", description: "Insert columns or rows",
           children: [
@@ -169,6 +196,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
             { letter: "C", label: "Currency", description: "Currency with $ prefix and N decimals", action: () => cb.formatRange("currency") },
             { letter: ",", label: ",", description: "Comma (thousands separator) with N decimals", action: () => cb.formatRange("comma") },
             { letter: "P", label: "Percent", description: "Percent with N decimals", action: () => cb.formatRange("percent") },
+            { letter: "S", label: "Sci", description: "Scientific notation with N decimals", action: () => cb.formatRange("scientific") },
             { letter: "D", label: "Date", description: "yyyy-mm-dd", action: () => cb.formatRange("date") },
             { letter: "T", label: "Time", description: "h:mm:ss", action: () => cb.formatRange("time") },
             { letter: "G", label: "General", description: "Reset to General format", action: () => cb.formatRange("general") },
@@ -197,6 +225,17 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
             { letter: "C", label: "Center", description: "Center", action: () => cb.alignRange("center") },
             { letter: "R", label: "Right", description: "Align right", action: () => cb.alignRange("right") },
             { letter: "G", label: "General", description: "Reset to general (numbers right, text left)", action: () => cb.alignRange("general") },
+          ],
+        },
+        {
+          letter: "A", label: "Attribute",
+          description: "Bold / italic / underline / strike for the selected range",
+          children: [
+            { letter: "B", label: "Bold", description: "Toggle bold (Ctrl+B)", action: () => cb.attrRange("bold") },
+            { letter: "I", label: "Italic", description: "Toggle italic (Ctrl+I)", action: () => cb.attrRange("italic") },
+            { letter: "U", label: "Underline", description: "Toggle underline (Ctrl+U)", action: () => cb.attrRange("underline") },
+            { letter: "S", label: "Strike", description: "Toggle strike-through (Ctrl+5)", action: () => cb.attrRange("strike") },
+            { letter: "R", label: "Reset", description: "Clear bold / italic / underline / strike / text colour", action: () => cb.attrRange("reset") },
           ],
         },
         { letter: "E", label: "Erase", description: "Erase the contents of the current cell", action: cb.eraseCurrentCell },

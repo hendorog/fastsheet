@@ -40,7 +40,7 @@ use ironcalc::base::Model;
 use crate::util::col_letter_i;
 use crate::xlsx_load::strip_trailing_anchor;
 use crate::xls_biff::{
-    decode_array_formula as fastsheet_lib_decode_array, decode_full_formula,
+    decode_array_formula as fastsheet_lib_decode_array,
     scan_xls_shape,
 };
 use crate::xls_preserve::{extract as extract_preserved, PreservedXlsData};
@@ -634,7 +634,6 @@ pub fn load_xls(
         let effective_fill = ResolvedFill {
             fill_pattern: xf.fill_pattern,
             fill_fg: xf.fill_fg,
-            fill_bg: xf.fill_bg,
         };
         let effective_border = ResolvedBorder {
             border_left: xf.border_left,
@@ -878,7 +877,7 @@ fn resolve_xf_font(
 }
 
 #[derive(Default, Clone, Copy)]
-struct ResolvedFill { fill_pattern: u16, fill_fg: u16, fill_bg: u16 }
+struct ResolvedFill { fill_pattern: u16, fill_fg: u16 }
 
 // Retained for reference — strict fAtr*-based inheritance of fill/
 // border/alignment matched Excel's documented spec but dropped
@@ -900,7 +899,6 @@ fn resolve_xf_fill(
             return ResolvedFill {
                 fill_pattern: xf.fill_pattern,
                 fill_fg: xf.fill_fg,
-                fill_bg: xf.fill_bg,
             };
         }
         if xf.ixf_parent == cur { break; }
@@ -910,7 +908,6 @@ fn resolve_xf_fill(
         .map(|xf| ResolvedFill {
             fill_pattern: xf.fill_pattern,
             fill_fg: xf.fill_fg,
-            fill_bg: xf.fill_bg,
         })
         .unwrap_or_default()
 }

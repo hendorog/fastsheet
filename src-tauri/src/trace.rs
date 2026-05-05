@@ -336,21 +336,49 @@ fn build_dep_node(
                 Some(idx) => format!(" (sheet-local: {})", sheet_name_of(model, *idx)),
                 None => String::new(),
             };
-            // The defined-name formula is something like
-            // "Discount!$B$24:$W$35". Show it as the note. We don't
-            // recurse into named-range cell contents — too much volume
-            // for the popup; the user can drill in via the Goto / Names
-            // menu options instead.
+            // Resolve the name's target. A defined name's formula is
+            // typically a sheet-qualified A1 ref or range like
+            // "Discount!$B$24:$W$35" or "Sheet1!$A$1". Parse it so the
+            // value column shows the actual cell value (single-cell
+            // names) or a range summary (multi-cell names) instead of
+            // the address text. Falls back to the address when the
+            // formula isn't a simple A1 ref (e.g. dynamic OFFSET names).
+            let target = parse_name_target(model, formula);
+            let (value, mut note_extra, sheet, row, col, is_error) = match target {
+                Some((sheet_idx, r1, c1, r2, c2)) if r1 == r2 && c1 == c2 => {
+                    let v = model
+                        .get_formatted_cell_value(sheet_idx, r1, c1)
+                        .unwrap_or_default();
+                    let err = is_error_value(&v);
+                    (v, Some(formula.clone()), Some(sheet_idx), Some(r1), Some(c1), err)
+                }
+                Some((sheet_idx, r1, c1, r2, c2)) => {
+                    let preview = range_preview(model, sheet_idx, r1, c1, r2, c2);
+                    let extra = match preview.preview {
+                        Some(p) => format!("{} — {}", formula, p),
+                        None => formula.clone(),
+                    };
+                    (preview.summary, Some(extra), None, None, None, false)
+                }
+                None => (formula.clone(), None, None, None, None, false),
+            };
+            // Compose the note: defined-name label + scope, then the
+            // target address (or preview) on a follow-up line.
+            let mut note = format!("defined name{scope_label}");
+            if let Some(extra) = note_extra.take() {
+                note.push_str(" → ");
+                note.push_str(&extra);
+            }
             TraceNode {
                 address: name.clone(),
                 kind: "name",
-                sheet: None,
-                row: None,
-                col: None,
+                sheet,
+                row,
+                col,
                 formula: None,
-                value: formula.clone(),
-                note: Some(format!("defined name{scope_label}")),
-                is_error: false,
+                value,
+                note: Some(note),
+                is_error,
                 cycle: false,
                 truncated: false,
                 compare_value: None,
@@ -359,6 +387,36 @@ fn build_dep_node(
             }
         }
     }
+}
+
+/// Parse a defined-name's formula text into a (sheet_idx, r1, c1, r2,
+/// c2) range, 1-based. Handles single-cell ("Sheet1!$A$1"), range
+/// ("Sheet1!$A$1:$B$5"), and quoted-sheet ("'My Sheet'!$A$1") forms.
+/// Returns None for anything more complex (dynamic OFFSET formulas,
+/// multi-area unions, cross-sheet ranges, etc.) — caller falls back to
+/// showing the formula text.
+fn parse_name_target(model: &Model, formula: &str) -> Option<(u32, i32, i32, i32, i32)> {
+    let s = formula.trim_start_matches('=').trim();
+    let (sheet_name, rest) = if let Some(rest) = s.strip_prefix('\'') {
+        let (name, after) = rest.split_once("'!")?;
+        (name.to_string(), after)
+    } else {
+        let (name, after) = s.split_once('!')?;
+        (name.to_string(), after)
+    };
+    let sheet_idx = model
+        .workbook
+        .worksheets
+        .iter()
+        .position(|w| w.name == sheet_name)
+        .map(|i| i as u32)?;
+    let (start, end) = match rest.split_once(':') {
+        Some((a, b)) => (a, b),
+        None => (rest, rest),
+    };
+    let (r1, c1) = parse_a1(start)?;
+    let (r2, c2) = parse_a1(end)?;
+    Some((sheet_idx, r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)))
 }
 
 struct RangePreview {
@@ -438,40 +496,14 @@ pub fn list_named_ranges(model: &Model) -> Vec<NamedRangeInfo> {
     out
 }
 
-/// Parse the leading sheet-qualified A1 ref out of a defined-name
-/// formula string so the Goto can jump there. Handles:
-///   "Discount!$B$24:$W$35" → ("Discount", 24, 2)
-///   "Discount!B24"          → ("Discount", 24, 2)
-///   "'Sheet 1'!$A$1"        → ("Sheet 1", 1, 1)
-/// Returns (None, None, None) when the formula isn't a simple
+/// Top-left of the parsed range — used by the Names list's Goto
+/// action. Returns (None, None, None) when the formula isn't a simple
 /// sheet-qualified A1 ref.
 fn parse_jump_target(model: &Model, formula: &str) -> (Option<u32>, Option<i32>, Option<i32>) {
-    let s = formula.trim_start_matches('=').trim();
-    // Sheet name: either bare-quoted or unquoted up to the first '!'.
-    let (sheet_name, rest) = if let Some(rest) = s.strip_prefix('\'') {
-        match rest.split_once("'!") {
-            Some((name, after)) => (name.to_string(), after),
-            None => return (None, None, None),
-        }
-    } else {
-        match s.split_once('!') {
-            Some((name, after)) => (name.to_string(), after),
-            None => return (None, None, None),
-        }
-    };
-    // Strip range tail if any: "$B$24:$W$35" → use just the start cell.
-    let cell = rest.split(':').next().unwrap_or(rest);
-    let (row, col) = match parse_a1(cell) {
-        Some(rc) => rc,
-        None => return (None, None, None),
-    };
-    let sheet_idx = model
-        .workbook
-        .worksheets
-        .iter()
-        .position(|w| w.name == sheet_name)
-        .map(|i| i as u32);
-    (sheet_idx, Some(row), Some(col))
+    match parse_name_target(model, formula) {
+        Some((sheet_idx, r1, c1, _, _)) => (Some(sheet_idx), Some(r1), Some(c1)),
+        None => (None, None, None),
+    }
 }
 
 /// Parse an A1-style cell address (with optional `$` absolute markers)

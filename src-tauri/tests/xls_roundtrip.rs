@@ -248,6 +248,114 @@ fn rt_column_widths_and_row_heights() {
     assert_eq!(h1 as i64, (25.0_f64 * 2.0).round() as i64, "row 1 height");
 }
 
+#[test]
+fn rt_frozen_panes_rows_only() {
+    let mut m = Model::new_empty("rt", "en", "UTC", "en").unwrap();
+    m.set_user_input(0, 1, 1, "header".into()).unwrap();
+    m.set_user_input(0, 2, 1, "data".into()).unwrap();
+    m.workbook.worksheets[0].frozen_rows = 1;
+    m.workbook.worksheets[0].frozen_columns = 0;
+    m.evaluate();
+
+    let out = std::env::temp_dir().join("fastsheet_rt_frozen_rows.xls");
+    fastsheet_lib::save_xls(&m, &out).expect("save");
+    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    std::fs::remove_file(&out).ok();
+    assert_eq!(reloaded.workbook.worksheets[0].frozen_rows, 1);
+    assert_eq!(reloaded.workbook.worksheets[0].frozen_columns, 0);
+}
+
+#[test]
+fn rt_frozen_panes_cols_only() {
+    let mut m = Model::new_empty("rt", "en", "UTC", "en").unwrap();
+    m.set_user_input(0, 1, 1, "key".into()).unwrap();
+    m.set_user_input(0, 1, 2, "value".into()).unwrap();
+    m.workbook.worksheets[0].frozen_rows = 0;
+    m.workbook.worksheets[0].frozen_columns = 1;
+    m.evaluate();
+
+    let out = std::env::temp_dir().join("fastsheet_rt_frozen_cols.xls");
+    fastsheet_lib::save_xls(&m, &out).expect("save");
+    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    std::fs::remove_file(&out).ok();
+    assert_eq!(reloaded.workbook.worksheets[0].frozen_rows, 0);
+    assert_eq!(reloaded.workbook.worksheets[0].frozen_columns, 1);
+}
+
+#[test]
+fn rt_frozen_panes_both_axes() {
+    let mut m = Model::new_empty("rt", "en", "UTC", "en").unwrap();
+    m.set_user_input(0, 1, 1, "x".into()).unwrap();
+    m.workbook.worksheets[0].frozen_rows = 3;
+    m.workbook.worksheets[0].frozen_columns = 2;
+    m.evaluate();
+
+    let out = std::env::temp_dir().join("fastsheet_rt_frozen_both.xls");
+    fastsheet_lib::save_xls(&m, &out).expect("save");
+    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    std::fs::remove_file(&out).ok();
+    assert_eq!(reloaded.workbook.worksheets[0].frozen_rows, 3);
+    assert_eq!(reloaded.workbook.worksheets[0].frozen_columns, 2);
+}
+
+#[test]
+fn rt_no_frozen_panes_stays_unfrozen() {
+    let mut m = Model::new_empty("rt", "en", "UTC", "en").unwrap();
+    m.set_user_input(0, 1, 1, "x".into()).unwrap();
+    m.evaluate();
+
+    let out = std::env::temp_dir().join("fastsheet_rt_unfrozen.xls");
+    fastsheet_lib::save_xls(&m, &out).expect("save");
+    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    std::fs::remove_file(&out).ok();
+    assert_eq!(reloaded.workbook.worksheets[0].frozen_rows, 0);
+    assert_eq!(reloaded.workbook.worksheets[0].frozen_columns, 0);
+}
+
+#[test]
+fn rt_hidden_cols_survive_save() {
+    use std::collections::{HashMap, HashSet};
+    let mut m = Model::new_empty("rt", "en", "UTC", "en").unwrap();
+    m.set_user_input(0, 1, 1, "a".into()).unwrap();
+    m.set_user_input(0, 1, 2, "b".into()).unwrap();
+    m.set_user_input(0, 1, 3, "c".into()).unwrap();
+    m.set_user_input(0, 1, 4, "d".into()).unwrap();
+    // Width on col 3 so it's covered by an explicit IronCalc Col entry;
+    // hidden status is a side-channel.
+    m.set_column_width(0, 3, 15.0 * 12.0).unwrap();
+    m.evaluate();
+
+    let mut hidden: HashMap<u32, HashSet<i32>> = HashMap::new();
+    let mut s = HashSet::new();
+    s.insert(2); // hidden col covered ONLY by hidden_cols
+    s.insert(3); // hidden col that also has a custom width
+    hidden.insert(0, s);
+
+    let out = std::env::temp_dir().join("fastsheet_rt_hidden_cols.xls");
+    fastsheet_lib::save_xls_with_preserved(&m, &out, None, Some(&hidden)).expect("save");
+    let (_reloaded, hc_after, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    std::fs::remove_file(&out).ok();
+    let cols = hc_after.get(&0).cloned().unwrap_or_default();
+    assert!(cols.contains(&2), "col 2 should be hidden after round-trip");
+    assert!(cols.contains(&3), "col 3 should be hidden after round-trip");
+    assert!(!cols.contains(&1), "col 1 must not be hidden");
+    assert!(!cols.contains(&4), "col 4 must not be hidden");
+}
+
+#[test]
+fn rt_hidden_cols_default_state_has_none() {
+    let mut m = Model::new_empty("rt", "en", "UTC", "en").unwrap();
+    m.set_user_input(0, 1, 1, "x".into()).unwrap();
+    m.evaluate();
+
+    let out = std::env::temp_dir().join("fastsheet_rt_no_hidden.xls");
+    fastsheet_lib::save_xls(&m, &out).expect("save");
+    let (_, hc_after, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    std::fs::remove_file(&out).ok();
+    let cols = hc_after.get(&0).cloned().unwrap_or_default();
+    assert!(cols.is_empty(), "no hidden cols expected, got {:?}", cols);
+}
+
 // ---------------------------------------------------------------------------
 // 2. Real-file round-trips — only run when the fixture is present.
 //    This is the closest thing to a CI-friendly version of the user's

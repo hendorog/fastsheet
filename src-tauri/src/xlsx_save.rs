@@ -295,9 +295,9 @@ pub(crate) fn save_preserving(
     use zip::{ZipArchive, ZipWriter};
 
     if dirty.is_empty() && layouts.is_empty() {
-        let _ = std::fs::remove_file(target_path);
-        std::fs::write(target_path, &loaded.bytes).map_err(|e| e.to_string())?;
-        return Ok(());
+        return crate::atomic::write(std::path::Path::new(target_path), |tmp| {
+            std::fs::write(tmp, &loaded.bytes).map_err(|e| e.to_string())
+        });
     }
 
     let mut by_sheet: HashMap<u32, HashMap<(i32, i32), String>> = HashMap::new();
@@ -347,9 +347,9 @@ pub(crate) fn save_preserving(
         zout.finish().map_err(|e| e.to_string())?;
     }
     let new_bytes = buf.into_inner();
-    let _ = std::fs::remove_file(target_path);
-    std::fs::write(target_path, &new_bytes).map_err(|e| e.to_string())?;
-    Ok(())
+    crate::atomic::write(std::path::Path::new(target_path), |tmp| {
+        std::fs::write(tmp, &new_bytes).map_err(|e| e.to_string())
+    })
 }
 
 /// Rewrite the `<cols>` block to reflect IronCalc's worksheet.cols (widths

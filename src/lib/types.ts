@@ -83,6 +83,14 @@ export type SaveResult = {
   path: string;
   mode: "preserved" | "ironcalc" | "xls";
   cells_patched: number;
+  /// Set when the save would have lost features that existed in the
+  /// file being overwritten. Names the .bak (or .bak.N) copy the
+  /// backend made before the save.
+  backup_path?: string;
+  /// True when the .xls writer round-tripped VBA / macro storages
+  /// from the source. Lets the UI swap "macros not preserved" for
+  /// "macros preserved" on the post-save status line.
+  vba_preserved?: boolean;
 };
 
 export type BackupResult = { save: SaveResult; backup_path: string };
