@@ -1827,39 +1827,6 @@ fn quoted_sheet(name: &str) -> String {
     }
 }
 
-enum RefStepResult {
-    Ref3d(String, usize),
-    Advance(usize),
-    Stop,
-}
-
-fn extract_3d_or_advance(rgce: &[u8], pos: usize) -> RefStepResult {
-    if pos >= rgce.len() { return RefStepResult::Stop; }
-    let ptg = rgce[pos];
-    let i = pos + 1;
-    let advance: usize = match ptg {
-        0x3A | 0x5A | 0x7A => {
-            if i + 6 > rgce.len() { return RefStepResult::Stop; }
-            let rwu = u16::from_le_bytes([rgce[i + 2], rgce[i + 3]]);
-            let colu = u16::from_le_bytes([rgce[i + 4], rgce[i + 5]]);
-            return RefStepResult::Ref3d(format_ref(rwu, colu), 1 + 6);
-        }
-        0x3B | 0x5B | 0x7B => {
-            if i + 10 > rgce.len() { return RefStepResult::Stop; }
-            let rw1 = u16::from_le_bytes([rgce[i + 2], rgce[i + 3]]);
-            let rw2 = u16::from_le_bytes([rgce[i + 4], rgce[i + 5]]);
-            let col1 = u16::from_le_bytes([rgce[i + 6], rgce[i + 7]]);
-            let col2 = u16::from_le_bytes([rgce[i + 8], rgce[i + 9]]);
-            let s = format!("{}:{}", format_ref(rw1, col1), format_ref(rw2, col2));
-            return RefStepResult::Ref3d(s, 1 + 10);
-        }
-        // Non-ref ptgs — skip by known sizes.
-        _ => 1 + ptg_payload_size(ptg, rgce, i),
-    };
-    if pos + advance > rgce.len() { return RefStepResult::Stop; }
-    RefStepResult::Advance(advance)
-}
-
 fn ptg_payload_size(ptg: u8, rgce: &[u8], i: usize) -> usize {
     match ptg {
         0x03..=0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x16 => 0,
@@ -1906,95 +1873,6 @@ fn ptg_payload_size(ptg: u8, rgce: &[u8], i: usize) -> usize {
     }
 }
 
-/// Legacy wrapper: returns only 3D refs (preserves the
-/// defined-name scanner's call site). For cell formulas we now use
-/// `extract_refs` which captures 2D + 3D in one pass.
-pub fn extract_3d_refs(rgce: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < rgce.len() {
-        let ptg = rgce[i];
-        i += 1;
-        let advance: usize = match ptg {
-            // Binary ops + unary + parens + missing arg — 0 bytes.
-            0x03..=0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x16 => 0,
-            // Fixed-size ptgs.
-            0x01 | 0x02 => 4,
-            0x1C | 0x1D => 1,
-            0x1E => 2,
-            0x1F => 8,
-            0x17 => {
-                // PtgStr: cch(1), grbit(1), rgch(cch * {1 or 2})
-                let Some(&cch) = rgce.get(i) else { break };
-                let Some(&grbit) = rgce.get(i + 1) else { break };
-                let high = (grbit & 0x01) != 0;
-                2 + cch as usize * if high { 2 } else { 1 }
-            }
-            0x18 => {
-                // PtgExtend — rarely used; conservative 5 bytes (subtype + 4).
-                5
-            }
-            0x19 => {
-                // PtgAttr: subtype(1) + variable body.
-                let Some(&sub) = rgce.get(i) else { break };
-                match sub {
-                    0x01 | 0x02 | 0x08 | 0x20 | 0x21 | 0x10 | 0x40 | 0x41 => 3,
-                    0x04 => {
-                        // PtgAttrChoose: n(2) + 2*(n+1) + 1 subtype byte
-                        let Some(lo) = rgce.get(i + 1) else { break };
-                        let Some(hi) = rgce.get(i + 2) else { break };
-                        let n = u16::from_le_bytes([*lo, *hi]) as usize;
-                        3 + 2 * (n + 1)
-                    }
-                    _ => break,
-                }
-            }
-            // Constants and value-class variants. (0x21/0x41/0x61 =
-            // PtgFunc 2 bytes; 0x22/0x42/0x62 = PtgFuncVar 3 bytes.)
-            0x21 | 0x41 | 0x61 => 2,
-            0x22 | 0x42 | 0x62 => 3,
-            0x20 | 0x40 | 0x60 => 7, // PtgArray — data tail ignored here
-            0x23 | 0x43 | 0x63 => 4, // PtgName
-            0x24 | 0x44 | 0x64 => 4, // PtgRef (2D, calamine decodes correctly)
-            0x25 | 0x45 | 0x65 => 8, // PtgArea (2D)
-            0x26 | 0x46 | 0x66 => 6, // PtgMemArea — tail at end of formula, ignored
-            0x27 | 0x47 | 0x67 => 6,
-            0x28 | 0x48 | 0x68 => 6,
-            0x29 | 0x49 | 0x69 => 2,
-            0x2A | 0x4A | 0x6A => 4,
-            0x2B | 0x4B | 0x6B => 8,
-            0x2C | 0x4C | 0x6C => 4, // PtgRefN
-            0x2D | 0x4D | 0x6D => 8, // PtgAreaN
-            0x39 | 0x59 | 0x79 => 6, // PtgNameX
-            // THE PTGS THIS WHOLE FUNCTION EXISTS FOR.
-            0x3A | 0x5A | 0x7A => {
-                // PtgRef3d: ixti(2), rw(2), col(2)
-                if i + 6 > rgce.len() { break; }
-                let rwu = u16::from_le_bytes([rgce[i + 2], rgce[i + 3]]);
-                let colu = u16::from_le_bytes([rgce[i + 4], rgce[i + 5]]);
-                out.push(format_ref(rwu, colu));
-                6
-            }
-            0x3B | 0x5B | 0x7B => {
-                // PtgArea3d: ixti(2), rwFirst(2), rwLast(2), colFirst(2), colLast(2)
-                if i + 10 > rgce.len() { break; }
-                let rw1 = u16::from_le_bytes([rgce[i + 2], rgce[i + 3]]);
-                let rw2 = u16::from_le_bytes([rgce[i + 4], rgce[i + 5]]);
-                let col1 = u16::from_le_bytes([rgce[i + 6], rgce[i + 7]]);
-                let col2 = u16::from_le_bytes([rgce[i + 8], rgce[i + 9]]);
-                out.push(format!("{}:{}", format_ref(rw1, col1), format_ref(rw2, col2)));
-                10
-            }
-            0x3C | 0x5C | 0x7C => 6,  // PtgRefErr3d — calamine renders `#REF!`
-            0x3D | 0x5D | 0x7D => 10, // PtgAreaErr3d
-            // Anything else we don't know — bail rather than mis-align.
-            _ => break,
-        };
-        if i + advance > rgce.len() { break; }
-        i += advance;
-    }
-    out
-}
 
 /// Format a PtgRef-style (rw, col) pair into an A1 reference portion
 /// (without the sheet prefix). Handles the fRwRel (bit 15 of col) and
@@ -2088,20 +1966,6 @@ pub fn scan_comparison_ops(rgce: &[u8]) -> Vec<&'static str> {
         i += advance;
     }
     out
-}
-
-/// Sign-extend a 14-bit value to i32. Used for PtgRefN/PtgAreaN
-/// column offsets which store `col` in the low 14 bits as two's-
-/// complement signed. A literal zero-extension gives huge positive
-/// values for negative offsets like -4 (0x3FFC) that look like valid
-/// columns out at column XFC, which then produces #REF! references
-/// in decoded formulas.
-fn sign_extend_14(v: u32) -> i32 {
-    if v & 0x2000 != 0 {
-        (v as i32) - 0x4000
-    } else {
-        v as i32
-    }
 }
 
 fn col_index_to_letter(mut col: u32) -> String {

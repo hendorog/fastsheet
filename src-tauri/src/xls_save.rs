@@ -593,12 +593,6 @@ struct StyleTables {
     /// default palette at specific slots. Slots not in this list
     /// keep their default colors. Empty ⇒ no PALETTE record needed.
     palette: Vec<(u16, [u8; 3])>,
-    /// Maps IronCalc num_fmt_id → BIFF ifmt. Built using
-    /// `build_fmt_id_map` because IronCalc's num_fmt_id range
-    /// (46+) overlaps with BIFF8's built-in range (45..49 hold time
-    /// formats); custom IronCalc formats need to be relocated to
-    /// BIFF's custom range (164+) to avoid colliding with built-ins.
-    fmt_id_map: std::collections::HashMap<i32, u16>,
 }
 
 /// Map a model font's array index to its BIFF8 file font index, applying
@@ -855,14 +849,13 @@ fn build_xf_record(
     body.put_u8(align_byte);
     body.put_u8(0); // rotation
     body.put_u8(0); // indent / shrink / merge / reading order
-    // For style XFs, declare that we own the listed attributes (set
-    // bits). For cell XFs, leave bits clear — let the parent style
-    // contribute. Real-world behaviour: if a cell XF wants to override
-    // the parent's font, it sets atr_fnt; we set ALL attribute bits
-    // for cell XFs that have explicit non-default content so the cell's
-    // chosen font / format / etc. takes precedence.
-    let used_flags: u8 = if is_style { 0xFC } else { 0xFC };
-    body.put_u8(used_flags);
+    // fAtr* used-attribute bits: 0xFC sets all six (number format,
+    // font, alignment, border, fill, protection). Both style XFs and
+    // cell XFs declare ownership across the board so the cell's
+    // explicit values win over the parent style. Empirically this is
+    // what real-world XLS templates do, and the round-trip tests fail
+    // if we leave the bits clear for cell XFs.
+    body.put_u8(0xFC);
     // Border styles: nibble per side.
     let border_styles_u16 = (border_left as u16 & 0x0F)
         | ((border_right as u16 & 0x0F) << 4)
@@ -1047,7 +1040,6 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
         default_cell_xf_idx,
         cell_xf_index,
         palette: palette.custom,
-        fmt_id_map,
     }
 }
 
@@ -1075,14 +1067,12 @@ fn build_style_builtin(ixf: u16, builtin_id: u8, level: u8) -> Vec<u8> {
     body
 }
 
-/// FORMAT record — custom number-format string at index >=164.
-/// [MS-XLS] 2.4.126.
-fn build_format(ifmt: u16, format_string: &str) -> Vec<u8> {
-    let mut body = Vec::with_capacity(2 + format_string.len() + 4);
-    body.put_u16(ifmt);
-    body.put_xl_unicode_string(format_string);
-    body
-}
+// FORMAT records ([MS-XLS] 2.4.126) are emitted inline inside
+// `build_style_tables` next to where the BIFF ifmt is allocated for
+// each custom IronCalc num_fmt — see the loop near `formats.push(...)`.
+// Putting the body assembly there keeps allocation and emission in
+// the same place; an extracted helper would have been a third
+// indirection nobody else calls.
 
 // ---------------------------------------------------------------------------
 // SST (Shared String Table). [MS-XLS] 2.4.265.
@@ -1682,22 +1672,6 @@ fn build_lbl_record(entry: &DefinedNameEntry) -> Vec<u8> {
 /// fail-closed rather than try to half-encode, because a malformed
 /// rgce rendered through a BIFF reader produces nonsense formulas
 /// (the parser walks ptgs by fixed sizes and mis-aligns on garbage).
-fn encode_formula_rgce(
-    node: &ironcalc::base::expressions::parser::Node,
-    sheet_idx: u32,
-    anchor: CellAnchor,
-    xti: &XtiTable,
-) -> Option<Vec<u8>> {
-    encode_formula_rgce_with_names(
-        node,
-        sheet_idx,
-        anchor,
-        xti,
-        &DefinedNameTable::default(),
-        &ExternNameTable::default(),
-    )
-}
-
 fn encode_formula_rgce_with_names(
     node: &ironcalc::base::expressions::parser::Node,
     sheet_idx: u32,

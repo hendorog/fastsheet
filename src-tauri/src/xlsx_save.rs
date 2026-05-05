@@ -497,7 +497,7 @@ fn render_row_open_tag(r: &Row, self_closing: bool) -> String {
         s.push_str(r#" hidden="1""#);
     }
     if r.custom_format {
-        s.push_str(r#" s="{}" customFormat="1""#);
+        s.push_str(&format!(r#" s="{}" customFormat="1""#, r.s));
     }
     s.push_str(if self_closing { "/>" } else { ">" });
     s

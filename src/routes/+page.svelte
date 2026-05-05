@@ -1393,15 +1393,26 @@
   }
 
   async function applyEdits(sheet: number, ops: { row: number; col: number; value: string }[]) {
+    let failed = 0;
+    let lastErr: unknown = null;
     for (const op of ops) {
       try {
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.value });
-      } catch {}
+      } catch (e) {
+        failed++;
+        lastErr = e;
+      }
     }
     if (ops.length > 0) {
       const r1 = Math.min(...ops.map((o) => o.row));
       const r2 = Math.max(...ops.map((o) => o.row));
       await refreshRows(r1, r2);
+    }
+    if (failed > 0) {
+      // Surface the failure so undo/redo doesn't silently lie. Most
+      // common cause: a formula now references a deleted defined name
+      // / sheet, or the cell is in a sheet that no longer exists.
+      statusMsg = `Edit failed for ${failed}/${ops.length} cell${ops.length === 1 ? "" : "s"}: ${lastErr}`;
     }
   }
 

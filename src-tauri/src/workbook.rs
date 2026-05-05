@@ -424,12 +424,16 @@ pub(crate) fn compare_value_at(
     col: i32,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let compare_guard = state.compare.lock().unwrap();
-    let Some(session) = compare_guard.as_ref() else {
-        return Ok(None);
-    };
+    // Canonical AppState lock order is model → compare (also used by
+    // cells::trace_formula). Acquiring in opposite directions across
+    // commands risks a deadlock if any command path ever runs
+    // concurrently with another that hits the same two locks.
     let model_guard = state.model.lock().unwrap();
     let Some(left) = model_guard.as_ref() else {
+        return Ok(None);
+    };
+    let compare_guard = state.compare.lock().unwrap();
+    let Some(session) = compare_guard.as_ref() else {
         return Ok(None);
     };
     Ok(session.right_value_at(left, sheet, row, col))
