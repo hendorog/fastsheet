@@ -3334,6 +3334,17 @@
     window.addEventListener("keydown", onKey);
     window.addEventListener("contextmenu", blockContextMenu);
     invoke("profile_mark", { label: "onMount" }).catch(() => {});
+    // Seed a blank workbook on launch. Without this, the grid renders
+    // a "ghost" blank — looks like an empty spreadsheet but `workbook`
+    // is null on the frontend and no Model exists on the backend, so
+    // save fails and the selection overlay misaligns (colWidths /
+    // rowHeights are empty maps; the overlay's cumulative-offset math
+    // reads zeros). Auto-creating an untitled workbook makes the
+    // launch state immediately usable: type, save (-> Save As), open,
+    // anything works.
+    newWorkbook().catch((e) =>
+      console.warn("initial newWorkbook failed:", e),
+    );
     // After first paint — the moment the user can actually see and
     // interact with the grid. This is the metric they care about.
     tick().then(() => {
