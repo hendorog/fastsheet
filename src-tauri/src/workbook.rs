@@ -206,6 +206,7 @@ pub(crate) fn save_workbook(
         drop(model_guard);
         state.dirty.lock().unwrap().clear();
         state.style_dirty.lock().unwrap().clear();
+        let _ = record_open_internal(&state, &path);
         return Ok(SaveResult {
             path,
             mode: "xls",
@@ -253,6 +254,7 @@ pub(crate) fn save_workbook(
                     sheet_paths,
                 });
             }
+            let _ = record_open_internal(&state, &path);
             return Ok(SaveResult {
                 path,
                 mode: "preserved",
@@ -270,6 +272,7 @@ pub(crate) fn save_workbook(
     drop(model_guard);
     state.dirty.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
+    let _ = record_open_internal(&state, &path);
     Ok(SaveResult {
         path,
         mode: "ironcalc",
