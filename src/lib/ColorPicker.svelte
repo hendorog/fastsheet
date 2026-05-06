@@ -274,16 +274,27 @@
       );
       if (idx >= 0) highlight = idx;
     }
-    // Initial focus + grid measurement after first paint — onMount
-    // can't be async and still return a cleanup, so we tick out via
-    // a microtask instead.
+    // Track the live column count via ResizeObserver on the grid
+    // itself. `auto-fill` reflows on every dialog width change (the
+    // .card uses min(640px, 92vw), so window resizing rewrites the
+    // track count mid-frame). Without this, ArrowDown still uses the
+    // initial column count after a resize and lands a few cells off
+    // — looks like diagonal movement instead of straight down.
     tick().then(() => {
       inputEl?.focus();
       recomputeColumns();
+      if (gridEl && typeof ResizeObserver !== "undefined") {
+        gridObserver = new ResizeObserver(() => recomputeColumns());
+        gridObserver.observe(gridEl);
+      }
     });
-    window.addEventListener("resize", recomputeColumns);
-    return () => window.removeEventListener("resize", recomputeColumns);
+    return () => {
+      gridObserver?.disconnect();
+      gridObserver = null;
+    };
   });
+
+  let gridObserver: ResizeObserver | null = null;
 
   // ---------------------------------------------------------------------
   // Commit / cancel
