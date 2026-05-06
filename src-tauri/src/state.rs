@@ -4,6 +4,33 @@ use std::sync::Mutex;
 use ironcalc::base::Model;
 use rusqlite::Connection;
 
+#[derive(Clone, Debug)]
+pub(crate) struct ProtectedRange {
+    pub(crate) r1: u32,
+    pub(crate) c1: u32,
+    pub(crate) r2: u32,
+    pub(crate) c2: u32,
+}
+
+impl ProtectedRange {
+    pub(crate) fn normalized(r1: u32, c1: u32, r2: u32, c2: u32) -> Self {
+        Self {
+            r1: r1.min(r2),
+            c1: c1.min(c2),
+            r2: r1.max(r2),
+            c2: c1.max(c2),
+        }
+    }
+
+    pub(crate) fn contains(&self, row: u32, col: u32) -> bool {
+        self.r1 <= row && row <= self.r2 && self.c1 <= col && col <= self.c2
+    }
+
+    pub(crate) fn overlaps(&self, other: &ProtectedRange) -> bool {
+        self.r1 <= other.r2 && other.r1 <= self.r2 && self.c1 <= other.c2 && other.c1 <= self.c2
+    }
+}
+
 /// Snapshot of the source .xlsx kept in memory so we can patch it in-place
 /// on save and preserve features IronCalc doesn't understand
 /// (charts/pivots/drawings/comments/conditional formatting).
@@ -76,6 +103,10 @@ pub(crate) struct AppState {
     /// (the new workbook becomes the new "left" — a stale comparison
     /// against a different file would just confuse the user).
     pub(crate) compare: Mutex<Option<crate::compare::CompareSession>>,
+    /// Session-scoped protected ranges. This mirrors the Lotus-facing
+    /// command behavior for edit prevention; persistence in workbook
+    /// protection records is a separate save/load concern.
+    pub(crate) protected_ranges: Mutex<HashMap<u32, Vec<ProtectedRange>>>,
     /// File path passed on the command line (e.g. when Windows
     /// Explorer launches fastsheet via "Open with"). Captured once
     /// in `run()` from `std::env::args` and consumed by the frontend
@@ -98,6 +129,7 @@ impl AppState {
             auto_recalc: Mutex::new(true),
             xls_preserved: Mutex::new(None),
             compare: Mutex::new(None),
+            protected_ranges: Mutex::new(HashMap::new()),
             startup_path: Mutex::new(None),
         }
     }

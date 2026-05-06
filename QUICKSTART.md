@@ -167,10 +167,14 @@ Ctrl+1    Format Cells dialog — number, font, border, fill, alignment,
 /R G      Unmerge — unmerge any merged cells overlapping the selection
 /R S      Search — find and (optionally) replace within the sheet
 /R J      Justify text in the selected range
-/R P      Protect a range              ⚠ not yet
-/R U      Unprotect a range            ⚠ not yet
+/R P      Protect a range for this session
+/R U      Unprotect overlapping protected ranges
 /R I      Restrict input               ⚠ not yet
 ```
+
+Protected ranges block normal cell edits until the workbook is closed
+or a new workbook is opened. Persisting protection into saved workbook
+metadata is not implemented yet.
 
 ### `/C` Copy and `/M` Move
 

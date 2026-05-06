@@ -859,6 +859,46 @@
     });
   }
 
+  async function protectSelectedRange() {
+    if (!workbook) {
+      statusMsg = "No workbook open";
+      focusGrid();
+      return;
+    }
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    try {
+      await invoke<number>("protect_range", { sheet: activeSheet, r1, c1, r2, c2 });
+      statusMsg = `Protected ${addr(r1, c1)}:${addr(r2, c2)} for this session`;
+    } catch (e) {
+      statusMsg = `Protect failed: ${e}`;
+    }
+    focusGrid();
+  }
+
+  async function unprotectSelectedRange() {
+    if (!workbook) {
+      statusMsg = "No workbook open";
+      focusGrid();
+      return;
+    }
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    try {
+      const removed = await invoke<number>("unprotect_range", { sheet: activeSheet, r1, c1, r2, c2 });
+      statusMsg = removed === 0
+        ? `No protected ranges overlap ${addr(r1, c1)}:${addr(r2, c2)}`
+        : `Unprotected ${removed} range${removed === 1 ? "" : "s"} overlapping ${addr(r1, c1)}:${addr(r2, c2)}`;
+    } catch (e) {
+      statusMsg = `Unprotect failed: ${e}`;
+    }
+    focusGrid();
+  }
+
   function combineWorkbookPrompt() {
     if (!workbook) {
       statusMsg = "No workbook to combine into";
@@ -3826,6 +3866,8 @@
     nameCreate,
     nameDelete,
     nameList,
+    protectRange: protectSelectedRange,
+    unprotectRange: unprotectSelectedRange,
     setBorder,
     sheetNew: addSheet,
     sheetDelete: () => deleteSheetConfirm(activeSheet),

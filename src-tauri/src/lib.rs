@@ -102,6 +102,8 @@ pub fn run() {
             workbook::workbook_info,
             cells::get_cells,
             cells::set_cell,
+            cells::protect_range,
+            cells::unprotect_range,
             cells::get_layout,
             cells::get_sheet_dim,
             cells::get_used_range,

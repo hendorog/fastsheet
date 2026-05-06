@@ -5,11 +5,21 @@ use tauri::State;
 
 use std::collections::HashMap;
 
-use crate::state::AppState;
+use crate::state::{AppState, ProtectedRange};
 use crate::util::col_letter;
 
 const LAST_ROW: i32 = 1_048_576;
 const LAST_COLUMN: i32 = 16_384;
+
+fn cell_is_protected(state: &AppState, sheet: u32, row: u32, col: u32) -> bool {
+    state
+        .protected_ranges
+        .lock()
+        .unwrap()
+        .get(&sheet)
+        .map(|ranges| ranges.iter().any(|range| range.contains(row, col)))
+        .unwrap_or(false)
+}
 
 /// Flat snapshot of a cell's visual style — only what the frontend renders.
 /// `None`-style cells use the workbook default (no inline CSS needed).
@@ -307,6 +317,9 @@ pub(crate) fn set_cell(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    if cell_is_protected(&state, sheet, row, col) {
+        return Err(format!("cell {}{} is protected", col_letter(col), row));
+    }
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
     let previous = model
@@ -346,6 +359,41 @@ pub(crate) fn set_cell(
     Ok(model
         .get_formatted_cell_value(sheet, row as i32, col as i32)
         .unwrap_or_default())
+}
+
+#[tauri::command]
+pub(crate) fn protect_range(
+    sheet: u32,
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+    state: State<'_, AppState>,
+) -> usize {
+    let range = ProtectedRange::normalized(r1, c1, r2, c2);
+    let mut protected = state.protected_ranges.lock().unwrap();
+    let ranges = protected.entry(sheet).or_default();
+    ranges.push(range);
+    ranges.len()
+}
+
+#[tauri::command]
+pub(crate) fn unprotect_range(
+    sheet: u32,
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+    state: State<'_, AppState>,
+) -> usize {
+    let target = ProtectedRange::normalized(r1, c1, r2, c2);
+    let mut protected = state.protected_ranges.lock().unwrap();
+    let Some(ranges) = protected.get_mut(&sheet) else {
+        return 0;
+    };
+    let before = ranges.len();
+    ranges.retain(|range| !range.overlaps(&target));
+    before - ranges.len()
 }
 
 /// Get / set auto-recalc state. The frontend uses these for the
