@@ -84,9 +84,30 @@
   let autoRecalc = $state(true);
   let statusMsg = $state("Ready. Press / for menu.");
   let currentPath = $state("");
+  let workbookDirty = $state(false);
+  let bypassCloseConfirm = false;
 
   function noteRecalcPending(count: number) {
     if (!autoRecalc && count > 0) pendingRecalcEdits += count;
+  }
+
+  function markWorkbookDirty() {
+    workbookDirty = true;
+  }
+
+  async function refreshWorkbookDirty() {
+    try {
+      workbookDirty = await invoke<boolean>("workbook_has_unsaved_changes");
+    } catch {
+      // Keep the local state; dirty display is advisory, not worth
+      // interrupting the editing flow if the query fails.
+    }
+  }
+
+  async function confirmDiscardUnsaved(action: string): Promise<boolean> {
+    await refreshWorkbookDirty();
+    if (!workbookDirty) return true;
+    return window.confirm(`Discard unsaved changes and ${action}?`);
   }
 
   // /-menu state
@@ -598,6 +619,7 @@
   }
 
   async function newWorkbook() {
+    if (workbook && !(await confirmDiscardUnsaved("start a new workbook"))) return;
     workbook = await invoke<WorkbookInfo>("new_workbook");
     activeSheet = 0;
     selRow = 1;
@@ -609,6 +631,7 @@
     historyIdx = 0;
     sheetCursors = new Map();
     pendingRecalcEdits = 0;
+    workbookDirty = false;
     await resizeViewportToSheet();
     await refreshViewport({ clear: true });
     await refreshNameCache();
@@ -619,6 +642,10 @@
     const p = path.trim();
     if (!p) {
       statusMsg = "Enter a path then press Enter";
+      return;
+    }
+    if (workbook && !(await confirmDiscardUnsaved(`open ${p}`))) {
+      focusGrid();
       return;
     }
     try {
@@ -633,6 +660,7 @@
       historyIdx = 0;
       sheetCursors = new Map();
       pendingRecalcEdits = 0;
+      workbookDirty = false;
       await resizeViewportToSheet();
       await refreshViewport({ clear: true });
       await refreshNameCache();
@@ -672,6 +700,7 @@
     try {
       const r = await invoke<SaveResult>("save_workbook", { path });
       currentPath = path;
+      workbookDirty = false;
       statusMsg = describeSave(r);
     } catch (e) {
       statusMsg = `Save failed: ${e}`;
@@ -715,6 +744,7 @@
     try {
       const r = await invoke<BackupResult>("backup_and_save", { path });
       currentPath = path;
+      workbookDirty = false;
       statusMsg = `${describeSave(r.save)} · backup: ${r.backup_path}`;
     } catch (e) {
       statusMsg = `Backup failed: ${e}`;
@@ -778,6 +808,7 @@
       for (const op of edits) {
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
       }
+      if (edits.length > 0) markWorkbookDirty();
       await refreshRows(r1, r2);
       noteRecalcPending(edits.length);
       const span =
@@ -790,10 +821,13 @@
   }
 
   async function quitApp() {
+    if (!(await confirmDiscardUnsaved("quit"))) return;
     try {
       const w = await import("@tauri-apps/api/window");
+      bypassCloseConfirm = true;
       await w.getCurrentWindow().close();
     } catch (e) {
+      bypassCloseConfirm = false;
       statusMsg = `Quit failed: ${e}`;
     }
   }
@@ -807,6 +841,7 @@
     const c = selCol;
     try {
       await invoke<string>("set_cell", { sheet, row: r, col: c, value: next });
+      if (prev !== next) markWorkbookDirty();
       await refreshRows(r, r);
       noteRecalcPending(1);
       if (prev !== next) {
@@ -1465,6 +1500,7 @@
       }
     }
     if (ops.length > 0) {
+      markWorkbookDirty();
       const r1 = Math.min(...ops.map((o) => o.row));
       const r2 = Math.max(...ops.map((o) => o.row));
       await refreshRows(r1, r2);
@@ -1486,6 +1522,7 @@
         indices,
       });
       await refreshRows(edit.r1, edit.r2);
+      markWorkbookDirty();
     } catch (e) {
       statusMsg = `Style restore failed: ${e}`;
     }
@@ -1565,6 +1602,7 @@
           await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
         } catch {}
       }
+      if (edits.length > 0) markWorkbookDirty();
       await refreshRows(r1, r2);
       noteRecalcPending(edits.length);
       const span =
@@ -1611,6 +1649,7 @@
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
       } catch {}
     }
+    if (edits.length > 0) markWorkbookDirty();
     if (edits.length > 0) {
       const editR1 = Math.min(...edits.map((e) => e.row));
       const editR2 = Math.max(...edits.map((e) => e.row));
@@ -1639,6 +1678,7 @@
   async function addSheet() {
     try {
       const [name, idx] = await invoke<[string, number]>("add_sheet");
+      markWorkbookDirty();
       await refreshWorkbookInfo();
       await switchSheet(idx);
       statusMsg = `Added sheet "${name}"`;
@@ -1657,6 +1697,7 @@
       }
       try {
         await invoke("rename_sheet", { sheet, newName: name });
+        markWorkbookDirty();
         await refreshWorkbookInfo();
         statusMsg = `Renamed "${current}" → "${name}"`;
       } catch (e) {
@@ -1681,6 +1722,7 @@
         action: async () => {
           try {
             await invoke("delete_sheet", { sheet });
+            markWorkbookDirty();
             await refreshWorkbookInfo();
             // Sheet indices above the deleted one shift down by 1, so
             // the cursor map keyed by index is now misaligned. Cheapest
@@ -1921,6 +1963,7 @@
   async function hideCurrentColumn() {
     try {
       await invoke("set_column_hidden", { sheet: activeSheet, col: selCol, hidden: true });
+      markWorkbookDirty();
       await refreshViewport();
       statusMsg = `Hid column ${addr(1, selCol).replace("1", "")}`;
     } catch (e) {
@@ -1931,6 +1974,7 @@
   async function hideCurrentRow() {
     try {
       await invoke("set_row_hidden", { sheet: activeSheet, row: selRow, hidden: true });
+      markWorkbookDirty();
       await refreshViewport();
       statusMsg = `Hid row ${selRow}`;
     } catch (e) {
@@ -1941,6 +1985,7 @@
   async function showAllColumns() {
     try {
       const n = await invoke<number>("show_all_cols", { sheet: activeSheet });
+      if (n > 0) markWorkbookDirty();
       await refreshViewport();
       statusMsg = n > 0 ? `Displayed ${n} hidden column${n === 1 ? "" : "s"}` : "No hidden columns";
     } catch (e) {
@@ -1951,6 +1996,7 @@
   async function showAllRows() {
     try {
       const n = await invoke<number>("show_all_rows", { sheet: activeSheet });
+      if (n > 0) markWorkbookDirty();
       await refreshViewport();
       statusMsg = n > 0 ? `Displayed ${n} hidden row${n === 1 ? "" : "s"}` : "No hidden rows";
     } catch (e) {
@@ -2044,6 +2090,7 @@
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
       } catch {}
     }
+    if (edits.length > 0) markWorkbookDirty();
     await refreshViewport();
     noteRecalcPending(edits.length);
     if (edits.length > 0) {
@@ -2100,6 +2147,7 @@
         r1, c1, r2, c2,
         format,
       });
+      if (n > 0) markWorkbookDirty();
       await refreshRows(r1, r2);
       const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
       statusMsg = `Formatted ${span} (${n} cell${n === 1 ? "" : "s"}) as ${format}`;
@@ -2154,6 +2202,7 @@
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
       } catch {}
     }
+    if (edits.length > 0) markWorkbookDirty();
     await refreshRows(dest.r1, dest.r2);
     noteRecalcPending(edits.length);
     pushHistory({
@@ -2174,6 +2223,7 @@
       if (!t) { focusGrid(); return; }
       try {
         await invoke("define_name", { name: t, sheet: activeSheet, r1, c1, r2, c2 });
+        markWorkbookDirty();
         statusMsg = `Named "${t}" → ${addr(r1, c1)}:${addr(r2, c2)}`;
         await refreshNameCache();
       } catch (e) {
@@ -2189,6 +2239,7 @@
       if (!t) { focusGrid(); return; }
       try {
         await invoke("delete_name", { name: t });
+        markWorkbookDirty();
         statusMsg = `Deleted name "${t}"`;
         await refreshNameCache();
       } catch (e) {
@@ -2295,6 +2346,7 @@
             await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
           } catch {}
         }
+        if (edits.length > 0) markWorkbookDirty();
         await refreshViewport();
         noteRecalcPending(edits.length);
         pushHistory({
@@ -2345,6 +2397,7 @@
             await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
           } catch {}
         }
+        if (edits.length > 0) markWorkbookDirty();
         await refreshViewport();
         noteRecalcPending(edits.length);
         const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
@@ -2426,6 +2479,7 @@
             await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
           } catch {}
         }
+        if (edits.length > 0) markWorkbookDirty();
         await refreshViewport();
         noteRecalcPending(edits.length);
         const span = `${addr(r1, c1)}:${addr(r2, c2)}`;
@@ -2459,6 +2513,7 @@
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
       } catch {}
     }
+    if (edits.length > 0) markWorkbookDirty();
     await refreshRows(r1, r2);
     noteRecalcPending(edits.length);
     const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
@@ -2517,6 +2572,7 @@
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
       } catch {}
     }
+    if (edits.length > 0) markWorkbookDirty();
     // Transpose can write outside the original rectangle when newH > h
     // or newW > w, so refresh the union of the source and target boxes.
     await refreshRows(r1, Math.max(r2, r1 + newH - 1));
@@ -2610,6 +2666,7 @@
         await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
       } catch {}
     }
+    if (edits.length > 0) markWorkbookDirty();
     // Both source and destination row ranges may have changed (move
     // clears source, both touch dest). Span the union.
     await refreshRows(
@@ -2667,6 +2724,7 @@
       // Only push undo if any cell's style index actually changed.
       const changed = result.prev_indices.some((p, i) => p !== result.next_indices[i]);
       if (changed) {
+        markWorkbookDirty();
         pushHistory({
           kind: "style",
           description: `${label} ${span}`,
@@ -2803,6 +2861,7 @@
     const count = r2 - r1 + 1;
     try {
       await invoke("insert_rows", { sheet: activeSheet, row: r1, count });
+      markWorkbookDirty();
       await refreshViewport();
       statusMsg = `Inserted ${count} row${count === 1 ? "" : "s"} at ${r1}`;
     } catch (e) {
@@ -2816,6 +2875,7 @@
     const count = r2 - r1 + 1;
     try {
       await invoke("delete_rows", { sheet: activeSheet, row: r1, count });
+      markWorkbookDirty();
       await refreshViewport();
       statusMsg = `Deleted ${count} row${count === 1 ? "" : "s"} from ${r1}`;
     } catch (e) {
@@ -2829,6 +2889,7 @@
     const count = c2 - c1 + 1;
     try {
       await invoke("insert_columns", { sheet: activeSheet, col: c1, count });
+      markWorkbookDirty();
       await refreshViewport();
       statusMsg = `Inserted ${count} column${count === 1 ? "" : "s"} at ${addr(1, c1).replace("1", "")}`;
     } catch (e) {
@@ -2842,11 +2903,48 @@
     const count = c2 - c1 + 1;
     try {
       await invoke("delete_columns", { sheet: activeSheet, col: c1, count });
+      markWorkbookDirty();
       await refreshViewport();
       statusMsg = `Deleted ${count} column${count === 1 ? "" : "s"} from ${addr(1, c1).replace("1", "")}`;
     } catch (e) {
       statusMsg = `Delete failed: ${e}`;
     }
+  }
+
+  async function shiftCellsAtSel(
+    command: "insert_cells_shift_right" | "insert_cells_shift_down" | "delete_cells_shift_left" | "delete_cells_shift_up",
+    label: string,
+  ) {
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    try {
+      await invoke(command, { sheet: activeSheet, r1, c1, r2, c2 });
+      markWorkbookDirty();
+      await resizeViewportToSheet();
+      await refreshViewport();
+      const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
+      statusMsg = `${label} ${span}`;
+    } catch (e) {
+      statusMsg = `${label} failed: ${e}`;
+    }
+  }
+
+  function insertCellsRightAtSel() {
+    shiftCellsAtSel("insert_cells_shift_right", "Inserted cells right at");
+  }
+
+  function insertCellsDownAtSel() {
+    shiftCellsAtSel("insert_cells_shift_down", "Inserted cells down at");
+  }
+
+  function deleteCellsLeftAtSel() {
+    shiftCellsAtSel("delete_cells_shift_left", "Deleted cells left at");
+  }
+
+  function deleteCellsUpAtSel() {
+    shiftCellsAtSel("delete_cells_shift_up", "Deleted cells up at");
   }
 
   async function setTitles(kind: "both" | "horizontal" | "vertical" | "clear") {
@@ -2856,6 +2954,7 @@
     if (kind === "both" || kind === "vertical") cols = selCol - 1;
     try {
       await invoke("set_frozen_panes", { sheet: activeSheet, rows, cols });
+      markWorkbookDirty();
       await refreshViewport();
       statusMsg =
         kind === "clear"
@@ -3050,6 +3149,7 @@
       return;
     }
     await refreshViewport();
+    if (count > 0) markWorkbookDirty();
     const label = axis === "row" ? "row" : "column";
     const span = lo === hi ? `${lo}` : `${lo}–${hi}`;
     statusMsg = size === "auto"
@@ -3077,6 +3177,10 @@
     deleteRows: deleteRowsAtSel,
     insertColumns: insertColumnsAtSel,
     deleteColumns: deleteColumnsAtSel,
+    insertCellsRight: insertCellsRightAtSel,
+    insertCellsDown: insertCellsDownAtSel,
+    deleteCellsLeft: deleteCellsLeftAtSel,
+    deleteCellsUp: deleteCellsUpAtSel,
     formatRange,
     searchRange: openFindReplace,
     alignRange,
@@ -3518,6 +3622,19 @@
   onMount(() => {
     window.addEventListener("keydown", onKey);
     window.addEventListener("contextmenu", blockContextMenu);
+    let unlistenClose: (() => void) | null = null;
+    import("@tauri-apps/api/window")
+      .then(async (w) => {
+        unlistenClose = await w.getCurrentWindow().onCloseRequested(async (event) => {
+          if (bypassCloseConfirm) return;
+          event.preventDefault();
+          if (await confirmDiscardUnsaved("quit")) {
+            bypassCloseConfirm = true;
+            await w.getCurrentWindow().close();
+          }
+        });
+      })
+      .catch(() => {});
     invoke("profile_mark", { label: "onMount" }).catch(() => {});
     // Sync the recalc mode from the backend default (true). Held in
     // a separate state so we don't have to round-trip on every status
@@ -3558,6 +3675,7 @@
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("contextmenu", blockContextMenu);
+      if (unlistenClose) unlistenClose();
     };
   });
 
@@ -3568,7 +3686,7 @@
     const sep = currentPath.includes("\\") ? "\\" : "/";
     const idx = currentPath.lastIndexOf(sep);
     const base = currentPath ? currentPath.slice(idx + 1) : "untitled";
-    const dirty = pendingRecalcEdits > 0 ? "● " : "";
+    const dirty = workbookDirty ? "● " : "";
     if (typeof document !== "undefined") {
       document.title = `${dirty}${base} — fastsheet`;
     }
@@ -3713,6 +3831,7 @@
         focusGrid();
       }}
       onApplied={async () => {
+        markWorkbookDirty();
         await refreshRows(formatModalCell.r1, formatModalCell.r2);
       }}
       onStatus={(m) => (statusMsg = m)}
@@ -3801,6 +3920,7 @@
     onResizeRow={async (r, px) => {
       try {
         await invoke("set_row_height", { sheet: activeSheet, row: r, px });
+        markWorkbookDirty();
         await refreshViewport();
       } catch (e) {
         statusMsg = `Resize row failed: ${e}`;
@@ -3811,6 +3931,7 @@
     onResizeCol={async (c, px) => {
       try {
         await invoke("set_column_width", { sheet: activeSheet, col: c, px });
+        markWorkbookDirty();
         await refreshViewport();
       } catch (e) {
         statusMsg = `Resize col failed: ${e}`;
@@ -3853,8 +3974,12 @@
       <hr />
       <button type="button" onclick={() => { closeContextMenu(); insertRowsAtSel(); }}>Insert row above</button>
       <button type="button" onclick={() => { closeContextMenu(); insertColumnsAtSel(); }}>Insert column left</button>
+      <button type="button" onclick={() => { closeContextMenu(); insertCellsRightAtSel(); }}>Insert cells right</button>
+      <button type="button" onclick={() => { closeContextMenu(); insertCellsDownAtSel(); }}>Insert cells down</button>
       <button type="button" onclick={() => { closeContextMenu(); deleteRowsAtSel(); }}>Delete row</button>
       <button type="button" onclick={() => { closeContextMenu(); deleteColumnsAtSel(); }}>Delete column</button>
+      <button type="button" onclick={() => { closeContextMenu(); deleteCellsLeftAtSel(); }}>Delete cells left</button>
+      <button type="button" onclick={() => { closeContextMenu(); deleteCellsUpAtSel(); }}>Delete cells up</button>
       <hr />
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentRow(); }}>Hide row</button>
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentColumn(); }}>Hide column</button>
@@ -3867,8 +3992,11 @@
       {workbook?.sheet_names[activeSheet] ?? ""}!{addr(selRow, selCol)}
     </span>
     {#if currentPath}<span class="path-tag">{currentPath}</span>{/if}
+    {#if workbookDirty}
+      <span class="dirty-tag">● Unsaved changes</span>
+    {/if}
     {#if pendingRecalcEdits > 0}
-      <span class="dirty-tag"
+      <span class="calc-pending-tag"
         >● {pendingRecalcEdits} edit{pendingRecalcEdits > 1 ? "s" : ""} pending recalc (F9)</span
       >
     {/if}
@@ -4074,10 +4202,14 @@
     color: #d4691e;
     font-weight: 600;
   }
+  .calc-pending-tag {
+    color: #8a4f00;
+    font-weight: 600;
+  }
   /* Lotus-style "CALC" indicator. Shown only in manual recalc mode.
      Distinct colour from .dirty-tag so the user can tell at a glance
-     whether the workbook is stale ("● 3 edits pending") vs. just in
-     manual mode with no edits ("CALC" alone). */
+     whether the workbook has unsaved changes vs. just being in manual
+     mode with no edits ("CALC" alone). */
   .calc-tag {
     color: #fff;
     background: #b04040;

@@ -140,10 +140,10 @@ Prefer explicit data flow over hidden mutation.
 - Avoid "set state, then call another command" when a single command
   can take both inputs.
 - Name state for the exact thing it represents. In particular,
-  separate save-dirty, style-dirty, structural-dirty, and recalc-dirty
-  concepts. A generic name like `dirtyEdits` is only acceptable when
-  it really drives one behavior; if it feeds both "unsaved changes"
-  and "pending recalc" UI, split it.
+  separate unsaved-workbook, save-patcher, style-dirty,
+  structural-dirty, and recalc-dirty concepts. A generic name like
+  `dirtyEdits` is only acceptable when it really drives one behavior;
+  if it feeds both "unsaved changes" and "pending recalc" UI, split it.
 
 ## Project-Specific Rules
 
@@ -198,6 +198,8 @@ Different "dirty" states mean different things:
   serializer save because styles.xml is not patched safely.
 - `structural_dirty`: row/column/sheet changes that make coordinate-
   based xlsx patching unsafe.
+- `workbook_dirty`: user-visible unsaved changes. This drives
+  title/status markers and discard prompts, not save strategy.
 - recalc-pending frontend state: user-visible stale formula values in
   manual recalculation mode only. Automatic recalculation should not
   increment this counter.

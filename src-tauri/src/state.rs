@@ -47,6 +47,12 @@ pub(crate) struct AppState {
     /// unsupported features but keeps cell coordinates correct). Cleared
     /// on save, new_workbook, and successful open.
     pub(crate) structural_dirty: Mutex<bool>,
+    /// True when the open workbook has user-visible changes that have
+    /// not been saved. This is deliberately separate from `dirty`,
+    /// `style_dirty`, `structural_dirty`, and manual recalc-pending UI:
+    /// those drive save strategy or stale formula display, while this
+    /// drives data-loss prompts and the title/status dirty marker.
+    pub(crate) workbook_dirty: Mutex<bool>,
     /// Recalculation mode (Lotus 1-2-3 `/W G R` setting). When `true`,
     /// every successful `set_cell` triggers `model.evaluate()` so
     /// formula cells transition out of the un-evaluated `CellFormula`
@@ -88,6 +94,7 @@ impl AppState {
             hidden_cols: Mutex::new(HashMap::new()),
             style_dirty: Mutex::new(HashSet::new()),
             structural_dirty: Mutex::new(false),
+            workbook_dirty: Mutex::new(false),
             auto_recalc: Mutex::new(true),
             xls_preserved: Mutex::new(None),
             compare: Mutex::new(None),

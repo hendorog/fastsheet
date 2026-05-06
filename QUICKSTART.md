@@ -29,7 +29,8 @@ yet. Either:
 - **`F5`** with a path — same as `/F R` but skips straight to typing.
 
 When a file is open the title bar shows the filename. A `●` prefix
-means there are unsaved cell edits (recalc + save to clear).
+means the workbook has unsaved changes. In manual recalculation mode,
+the status bar separately shows how many edits are waiting for F9.
 
 ## The cursor and selection
 
@@ -101,8 +102,12 @@ will do.
 ```
 /W I C    Insert columns at cursor (selection width = count)
 /W I R    Insert rows at cursor (selection height = count)
+/W I I    Insert cells, shift selected rows right
+/W I D    Insert cells, shift selected columns down
 /W D C    Delete columns
 /W D R    Delete rows
+/W D L    Delete cells, shift selected rows left
+/W D U    Delete cells, shift selected columns up
 /W C S    Column Set-Width — pick cols, type width in px or "auto"
 /W C A    Column Auto-fit
 /W C H    Hide current column
@@ -119,7 +124,8 @@ will do.
 /W S N    Sheet New — append a new sheet
 /W S D    Sheet Delete — remove current sheet (with confirm)
 /W S R    Sheet Rename — rename current sheet
-/W G      Global settings           ⚠ not yet
+/W G R    Global Recalculation — Automatic / Manual / Now
+/W G      Other global settings     ⚠ not yet
 /W W      Window split / unsplit    ⚠ not yet
 /W P      Page break settings       ⚠ not yet
 ```
@@ -283,6 +289,9 @@ Type to filter across the listing, recent files, and recent dirs.
 As soon as you cross into a different directory, both recent lists
 collapse and only the current directory's entries show.
 
+If the current workbook has unsaved changes, fastsheet asks before
+opening another file, starting a new workbook, or quitting.
+
 ### Save
 
 `/F S` behaviour depends on the workbook's history:
@@ -297,7 +306,7 @@ collapse and only the current directory's entries show.
     those features are preserved. For .xls with macros, the
     VBA storage subtree is preserved.
   - **Save As** — pick a different path via the navigator.
-  - **Backup** — rename the existing file to `.bak`, then save.
+  - **Backup** — copy the existing file to `.bak` / `.bak.N`, then save.
   - **Cancel** — do nothing.
 - **Existing path that no longer exists on disk** → straight save (no
   picker — nothing to overwrite).
@@ -436,14 +445,14 @@ items, but several are stubs that print "Not yet implemented" to the
 status bar when you select them:
 
 ```
-/W G       Worksheet/Global settings
+/W G       Worksheet/Global settings other than Recalculation
 /W W       Worksheet/Window (split / unsplit panes)
 /W P       Worksheet/Page (print breaks)
 /R J       Range/Justify
 /R P       Range/Protect
 /R U       Range/Unprotect
 /R I       Range/Input restriction
-/F C       File/Combine
+/F J       File/Combine
 /F X       File/Xtract (extract)
 /F E       File/Erase from disk
 /F L       File/List

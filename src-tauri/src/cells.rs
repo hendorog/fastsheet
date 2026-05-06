@@ -1,9 +1,15 @@
 use ironcalc::base::types::{Alignment, BorderItem, BorderStyle, HorizontalAlignment};
+use ironcalc::base::types::Cell;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use std::collections::HashMap;
+
 use crate::state::AppState;
 use crate::util::col_letter;
+
+const LAST_ROW: i32 = 1_048_576;
+const LAST_COLUMN: i32 = 16_384;
 
 /// Flat snapshot of a cell's visual style — only what the frontend renders.
 /// `None`-style cells use the workbook default (no inline CSS needed).
@@ -303,6 +309,10 @@ pub(crate) fn set_cell(
 ) -> Result<String, String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
+    let previous = model
+        .get_localized_cell_content(sheet, row as i32, col as i32)
+        .unwrap_or_default();
+    let changed = previous != value;
     if value.is_empty() {
         model
             .cell_clear_contents(sheet, row as i32, col as i32)
@@ -330,6 +340,9 @@ pub(crate) fn set_cell(
         .lock()
         .unwrap()
         .insert((sheet, row as i32, col as i32), value);
+    if changed {
+        *state.workbook_dirty.lock().unwrap() = true;
+    }
     Ok(model
         .get_formatted_cell_value(sheet, row as i32, col as i32)
         .unwrap_or_default())
@@ -436,14 +449,20 @@ pub(crate) fn define_name(
         col_letter(c2 as u32),
         r2
     );
-    model.new_defined_name(&name, None, &formula)
+    model.new_defined_name(&name, None, &formula)?;
+    drop(guard);
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 #[tauri::command]
 pub(crate) fn delete_name(name: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.delete_defined_name(&name, None)
+    model.delete_defined_name(&name, None)?;
+    drop(guard);
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 #[tauri::command]
@@ -626,6 +645,7 @@ pub(crate) fn set_range_style(
     }
     drop(guard);
     state.style_dirty.lock().unwrap().insert(sheet);
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(StyleEditResult { count: n, prev_indices, next_indices })
 }
 
@@ -654,6 +674,7 @@ pub(crate) fn apply_style_indices(
     }
     drop(guard);
     state.style_dirty.lock().unwrap().insert(sheet);
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -684,6 +705,7 @@ pub(crate) fn set_range_number_format(
     }
     drop(guard);
     state.style_dirty.lock().unwrap().insert(sheet);
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(n)
 }
 
@@ -823,6 +845,7 @@ pub(crate) fn insert_rows(
     model.insert_rows(sheet, row, count)?;
     drop(guard);
     *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -839,6 +862,7 @@ pub(crate) fn delete_rows(
     model.delete_rows(sheet, row, count)?;
     drop(guard);
     *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -855,6 +879,7 @@ pub(crate) fn insert_columns(
     model.insert_columns(sheet, col, count)?;
     drop(guard);
     *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -871,6 +896,217 @@ pub(crate) fn delete_columns(
     model.delete_columns(sheet, col, count)?;
     drop(guard);
     *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
+}
+
+fn worksheet_used_bounds(model: &ironcalc::base::Model<'_>, sheet: u32) -> Result<(i32, i32), String> {
+    let ws = model.workbook.worksheet(sheet)?;
+    let dim = ws.dimension();
+    Ok((dim.max_row.max(1), dim.max_column.max(1)))
+}
+
+fn empty_like(cell: Option<&Cell>) -> Cell {
+    Cell::EmptyCell {
+        s: cell.map(|c| c.get_style()).unwrap_or(0),
+    }
+}
+
+fn set_raw_cell(
+    ws: &mut ironcalc::base::types::Worksheet,
+    row: i32,
+    col: i32,
+    cell: Cell,
+) -> Result<(), String> {
+    if !(1..=LAST_ROW).contains(&row) || !(1..=LAST_COLUMN).contains(&col) {
+        return Err("Incorrect row or column".to_string());
+    }
+    ws.sheet_data
+        .entry(row)
+        .or_insert_with(HashMap::new)
+        .insert(col, cell);
+    Ok(())
+}
+
+/// Insert blank cells and shift the affected row segment right.
+#[tauri::command]
+pub(crate) fn insert_cells_shift_right(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if r1 < 1 || c1 < 1 || r2 < r1 || c2 < c1 || r2 > LAST_ROW || c2 > LAST_COLUMN {
+        return Err("Invalid cell range".to_string());
+    }
+    let width = c2 - c1 + 1;
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let (_, max_col) = worksheet_used_bounds(model, sheet)?;
+    if max_col + width > LAST_COLUMN {
+        return Err("Cannot shift cells beyond the last column".to_string());
+    }
+    let ws = model.workbook.worksheet_mut(sheet)?;
+    for r in r1..=r2 {
+        for c in (c1..=max_col).rev() {
+            let moved = ws.sheet_data.get(&r).and_then(|row| row.get(&c)).cloned();
+            match moved {
+                Some(cell) => set_raw_cell(ws, r, c + width, cell)?,
+                None => {
+                    if ws.sheet_data.get(&r).and_then(|row| row.get(&(c + width))).is_some() {
+                        set_raw_cell(ws, r, c + width, Cell::default())?;
+                    }
+                }
+            }
+        }
+        for c in c1..=c2 {
+            let old = ws.sheet_data.get(&r).and_then(|row| row.get(&c));
+            set_raw_cell(ws, r, c, empty_like(old))?;
+        }
+    }
+    if *state.auto_recalc.lock().unwrap() {
+        model.evaluate();
+    }
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
+}
+
+/// Insert blank cells and shift the affected column segment down.
+#[tauri::command]
+pub(crate) fn insert_cells_shift_down(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if r1 < 1 || c1 < 1 || r2 < r1 || c2 < c1 || r2 > LAST_ROW || c2 > LAST_COLUMN {
+        return Err("Invalid cell range".to_string());
+    }
+    let height = r2 - r1 + 1;
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let (max_row, _) = worksheet_used_bounds(model, sheet)?;
+    if max_row + height > LAST_ROW {
+        return Err("Cannot shift cells beyond the last row".to_string());
+    }
+    let ws = model.workbook.worksheet_mut(sheet)?;
+    for c in c1..=c2 {
+        for r in (r1..=max_row).rev() {
+            let moved = ws.sheet_data.get(&r).and_then(|row| row.get(&c)).cloned();
+            match moved {
+                Some(cell) => set_raw_cell(ws, r + height, c, cell)?,
+                None => {
+                    if ws.sheet_data.get(&(r + height)).and_then(|row| row.get(&c)).is_some() {
+                        set_raw_cell(ws, r + height, c, Cell::default())?;
+                    }
+                }
+            }
+        }
+        for r in r1..=r2 {
+            let old = ws.sheet_data.get(&r).and_then(|row| row.get(&c));
+            set_raw_cell(ws, r, c, empty_like(old))?;
+        }
+    }
+    if *state.auto_recalc.lock().unwrap() {
+        model.evaluate();
+    }
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
+}
+
+/// Delete cells and shift the affected row segment left.
+#[tauri::command]
+pub(crate) fn delete_cells_shift_left(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if r1 < 1 || c1 < 1 || r2 < r1 || c2 < c1 || r2 > LAST_ROW || c2 > LAST_COLUMN {
+        return Err("Invalid cell range".to_string());
+    }
+    let width = c2 - c1 + 1;
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let (_, max_col) = worksheet_used_bounds(model, sheet)?;
+    let ws = model.workbook.worksheet_mut(sheet)?;
+    for r in r1..=r2 {
+        for c in c1..=max_col {
+            let src = c + width;
+            let moved = if src <= LAST_COLUMN {
+                ws.sheet_data.get(&r).and_then(|row| row.get(&src)).cloned()
+            } else {
+                None
+            };
+            match moved {
+                Some(cell) => set_raw_cell(ws, r, c, cell)?,
+                None => {
+                    let old = ws.sheet_data.get(&r).and_then(|row| row.get(&c));
+                    set_raw_cell(ws, r, c, empty_like(old))?;
+                }
+            }
+        }
+    }
+    if *state.auto_recalc.lock().unwrap() {
+        model.evaluate();
+    }
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
+}
+
+/// Delete cells and shift the affected column segment up.
+#[tauri::command]
+pub(crate) fn delete_cells_shift_up(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if r1 < 1 || c1 < 1 || r2 < r1 || c2 < c1 || r2 > LAST_ROW || c2 > LAST_COLUMN {
+        return Err("Invalid cell range".to_string());
+    }
+    let height = r2 - r1 + 1;
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let (max_row, _) = worksheet_used_bounds(model, sheet)?;
+    let ws = model.workbook.worksheet_mut(sheet)?;
+    for c in c1..=c2 {
+        for r in r1..=max_row {
+            let src = r + height;
+            let moved = if src <= LAST_ROW {
+                ws.sheet_data.get(&src).and_then(|row| row.get(&c)).cloned()
+            } else {
+                None
+            };
+            match moved {
+                Some(cell) => set_raw_cell(ws, r, c, cell)?,
+                None => {
+                    let old = ws.sheet_data.get(&r).and_then(|row| row.get(&c));
+                    set_raw_cell(ws, r, c, empty_like(old))?;
+                }
+            }
+        }
+    }
+    if *state.auto_recalc.lock().unwrap() {
+        model.evaluate();
+    }
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -887,7 +1123,10 @@ pub(crate) fn set_column_width(
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
     let internal = (px * 12.0 / 7.0).max(0.0);
-    model.set_column_width(sheet, col, internal)
+    model.set_column_width(sheet, col, internal)?;
+    drop(guard);
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Set the displayed height of a row. `px` is the display pixel value;
@@ -902,7 +1141,10 @@ pub(crate) fn set_row_height(
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
     let internal = (px * (72.0 / 96.0) * 2.0).max(0.0);
-    model.set_row_height(sheet, row, internal)
+    model.set_row_height(sheet, row, internal)?;
+    drop(guard);
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Toggle hidden state on a row. Persists into the IronCalc model only
@@ -917,7 +1159,10 @@ pub(crate) fn set_row_hidden(
 ) -> Result<(), String> {
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
-    model.set_row_hidden(sheet, row, hidden)
+    model.set_row_hidden(sheet, row, hidden)?;
+    drop(guard);
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Toggle hidden state on a column. The state is shadowed in
@@ -936,6 +1181,8 @@ pub(crate) fn set_column_hidden(
     } else {
         entry.remove(&col);
     }
+    drop(hc);
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -958,6 +1205,8 @@ pub(crate) fn set_frozen_panes(
         .ok_or("bad sheet index")?;
     ws.frozen_rows = rows.max(0);
     ws.frozen_columns = cols.max(0);
+    drop(guard);
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -979,6 +1228,10 @@ pub(crate) fn show_all_rows(sheet: u32, state: State<'_, AppState>) -> Result<us
             n += 1;
         }
     }
+    drop(guard);
+    if n > 0 {
+        *state.workbook_dirty.lock().unwrap() = true;
+    }
     Ok(n)
 }
 
@@ -990,6 +1243,10 @@ pub(crate) fn show_all_cols(sheet: u32, state: State<'_, AppState>) -> Result<us
     let n = hc.get(&sheet).map(|s| s.len()).unwrap_or(0);
     if let Some(set) = hc.get_mut(&sheet) {
         set.clear();
+    }
+    drop(hc);
+    if n > 0 {
+        *state.workbook_dirty.lock().unwrap() = true;
     }
     Ok(n)
 }

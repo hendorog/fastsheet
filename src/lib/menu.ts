@@ -26,6 +26,10 @@ export type MenuCallbacks = {
   deleteRows: () => void | Promise<void>;
   insertColumns: () => void | Promise<void>;
   deleteColumns: () => void | Promise<void>;
+  insertCellsRight: () => void | Promise<void>;
+  insertCellsDown: () => void | Promise<void>;
+  deleteCellsLeft: () => void | Promise<void>;
+  deleteCellsUp: () => void | Promise<void>;
   // Range/Format. Variants that take decimals raise the inline prompt;
   // others apply directly to the current selection.
   formatRange: (kind: FormatKind) => void | Promise<void>;
@@ -124,6 +128,8 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
           children: [
             { letter: "C", label: "Column", description: "Insert columns at the cursor (selection width = count)", action: cb.insertColumns },
             { letter: "R", label: "Row", description: "Insert rows at the cursor (selection height = count)", action: cb.insertRows },
+            { letter: "I", label: "Cells Right", description: "Insert cells and shift the selected rows right", action: cb.insertCellsRight },
+            { letter: "D", label: "Cells Down", description: "Insert cells and shift the selected columns down", action: cb.insertCellsDown },
           ],
         },
         {
@@ -131,6 +137,8 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
           children: [
             { letter: "C", label: "Column", description: "Delete the selected columns", action: cb.deleteColumns },
             { letter: "R", label: "Row", description: "Delete the selected rows", action: cb.deleteRows },
+            { letter: "L", label: "Cells Left", description: "Delete cells and shift the selected rows left", action: cb.deleteCellsLeft },
+            { letter: "U", label: "Cells Up", description: "Delete cells and shift the selected columns up", action: cb.deleteCellsUp },
           ],
         },
         {

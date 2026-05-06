@@ -168,6 +168,7 @@ pub(crate) fn open_workbook(
     state.dirty.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
     *state.structural_dirty.lock().unwrap() = false;
+    *state.workbook_dirty.lock().unwrap() = false;
     // Loading a fresh workbook invalidates any active compare —
     // diffing the new model against the previous right side would
     // confuse more than help.
@@ -202,6 +203,7 @@ pub(crate) fn new_workbook(state: State<'_, AppState>) -> Result<WorkbookInfo, S
     state.hidden_cols.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
     *state.structural_dirty.lock().unwrap() = false;
+    *state.workbook_dirty.lock().unwrap() = false;
     *state.compare.lock().unwrap() = None;
     Ok(info)
 }
@@ -212,6 +214,11 @@ pub(crate) fn save_workbook(
     state: State<'_, AppState>,
 ) -> Result<SaveResult, String> {
     save_workbook_inner(path, state, false)
+}
+
+#[tauri::command]
+pub(crate) fn workbook_has_unsaved_changes(state: State<'_, AppState>) -> bool {
+    *state.workbook_dirty.lock().unwrap()
 }
 
 fn save_workbook_inner(
@@ -261,6 +268,7 @@ fn save_workbook_inner(
         state.dirty.lock().unwrap().clear();
         state.style_dirty.lock().unwrap().clear();
         *state.structural_dirty.lock().unwrap() = false;
+        *state.workbook_dirty.lock().unwrap() = false;
         let _ = record_open_internal(&state, &path);
         return Ok(SaveResult {
             path,
@@ -311,6 +319,7 @@ fn save_workbook_inner(
             // being false, so this would already be false; clear anyway
             // to keep all save paths uniform.
             *state.structural_dirty.lock().unwrap() = false;
+            *state.workbook_dirty.lock().unwrap() = false;
             // Refresh our in-memory snapshot so subsequent saves keep
             // patching the latest version of the file.
             if let Ok(bytes) = std::fs::read(&path) {
@@ -359,6 +368,7 @@ fn save_workbook_inner(
     state.dirty.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
     *state.structural_dirty.lock().unwrap() = false;
+    *state.workbook_dirty.lock().unwrap() = false;
     let _ = record_open_internal(&state, &path);
     Ok(SaveResult {
         path,
@@ -380,6 +390,7 @@ pub(crate) fn add_sheet(state: State<'_, AppState>) -> Result<(String, u32), Str
     let (name, idx) = model.new_sheet();
     drop(guard);
     *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok((name, idx))
 }
 
@@ -391,6 +402,7 @@ pub(crate) fn add_sheet_named(name: String, state: State<'_, AppState>) -> Resul
     model.add_sheet(&name)?;
     drop(guard);
     *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -411,6 +423,7 @@ pub(crate) fn rename_sheet(
     // shared-formulas / defined-names is more work than just routing
     // through save_to_xlsx for now.
     *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
@@ -421,6 +434,7 @@ pub(crate) fn delete_sheet(sheet: u32, state: State<'_, AppState>) -> Result<(),
     model.delete_sheet(sheet)?;
     drop(guard);
     *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
     Ok(())
 }
 
