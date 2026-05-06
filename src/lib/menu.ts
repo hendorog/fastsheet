@@ -68,6 +68,11 @@ export type MenuCallbacks = {
   dataSort: () => void | Promise<void>;
   // /Data/Parse — split selected labels into adjacent columns.
   dataParse: () => void | Promise<void>;
+  dataTable: () => void | Promise<void>;
+  dataQuery: () => void | Promise<void>;
+  dataDistribution: () => void | Promise<void>;
+  dataMatrix: () => void | Promise<void>;
+  dataRegression: () => void | Promise<void>;
   // /Range/Name — define / delete / list named ranges.
   nameCreate: () => void | Promise<void>;
   nameDelete: () => void | Promise<void>;
@@ -372,12 +377,12 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
       description: "Fill, sort, query, distribute, regress or parse data",
       children: [
         { letter: "F", label: "Fill", description: "Fill the selection with an arithmetic progression", action: cb.dataFill },
-        { letter: "T", label: "Table", description: "What-if data tables", action: stb("Data/Table") },
+        { letter: "T", label: "Table", description: "Summarize the selected table", action: cb.dataTable },
         { letter: "S", label: "Sort", description: "Sort the selected rows by a column", action: cb.dataSort },
-        { letter: "Q", label: "Query", description: "Query a database range", action: stb("Data/Query") },
-        { letter: "D", label: "Distribution", description: "Frequency distribution", action: stb("Data/Distribution") },
-        { letter: "M", label: "Matrix", description: "Matrix operations", action: stb("Data/Matrix") },
-        { letter: "R", label: "Regression", description: "Linear regression", action: stb("Data/Regression") },
+        { letter: "Q", label: "Query", description: "Filter selected rows by contains text", action: cb.dataQuery },
+        { letter: "D", label: "Distribution", description: "Frequency distribution for selected numeric cells", action: cb.dataDistribution },
+        { letter: "M", label: "Matrix", description: "Transpose the selected matrix to another location", action: cb.dataMatrix },
+        { letter: "R", label: "Regression", description: "Linear regression from two selected columns", action: cb.dataRegression },
         { letter: "P", label: "Parse", description: "Parse a column of labels into cells", action: cb.dataParse },
       ],
     },

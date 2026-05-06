@@ -266,11 +266,11 @@ scope.
 /D F      Fill — fill selection with an arithmetic progression
 /D S      Sort — sort selected rows by a column
 /D P      Parse — split a selected column into adjacent cells
-/D T      Table         ⚠ not yet
-/D Q      Query         ⚠ not yet
-/D D      Distribution  ⚠ not yet
-/D M      Matrix        ⚠ not yet
-/D R      Regression    ⚠ not yet
+/D T      Table — summarize selected table columns below the selection
+/D Q      Query — filter selected rows by "contains" text
+/D D      Distribution — frequency table for selected numeric values
+/D M      Matrix — transpose selected matrix to another location
+/D R      Regression — linear regression from first two selected columns
 ```
 
 ### `/T` Trace (fastsheet-only)

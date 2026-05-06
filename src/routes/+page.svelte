@@ -3063,6 +3063,80 @@
     return out;
   }
 
+  function selectionBounds() {
+    return {
+      r1: Math.min(selRow, rangeEndRow),
+      r2: Math.max(selRow, rangeEndRow),
+      c1: Math.min(selCol, rangeEndCol),
+      c2: Math.max(selCol, rangeEndCol),
+    };
+  }
+
+  function parseNumericCell(value: string): number | null {
+    const n = Number(value.replace(/,/g, "").trim());
+    return Number.isFinite(n) && value.trim() !== "" ? n : null;
+  }
+
+  async function selectedInputMatrix(): Promise<string[][] | null> {
+    const { r1, r2, c1, c2 } = selectionBounds();
+    const result = await fetchBand(r1, r2, c1, c2);
+    if (!result) return null;
+    const source = new Map(cells);
+    for (let r = r1; r <= r2; r++) {
+      for (let c = c1; c <= c2; c++) source.delete(key(r, c));
+    }
+    for (const cell of result.list) source.set(key(cell.row, cell.col), cell);
+    const matrix: string[][] = [];
+    for (let r = r1; r <= r2; r++) {
+      const row: string[] = [];
+      for (let c = c1; c <= c2; c++) row.push(source.get(key(r, c))?.input ?? "");
+      matrix.push(row);
+    }
+    return matrix;
+  }
+
+  async function writeOutputGrid(startRow: number, startCol: number, values: string[][], description: string) {
+    const outputRows = values.length;
+    const outputCols = Math.max(1, ...values.map((row) => row.length));
+    if (outputRows === 0 || outputCols === 0) return;
+    const endRow = Math.min(ABS_MAX_ROWS, startRow + outputRows - 1);
+    const endCol = Math.min(ABS_MAX_COLS, startCol + outputCols - 1);
+    await fetchBand(startRow, endRow, startCol, endCol).then((result) => {
+      if (!result) return;
+      const newCells = new Map(cells);
+      for (let r = startRow; r <= endRow; r++) {
+        for (let c = startCol; c <= endCol; c++) newCells.delete(key(r, c));
+      }
+      for (const c of result.list) newCells.set(key(c.row, c.col), c);
+      cells = newCells;
+    });
+    const sheet = activeSheet;
+    const edits: EditOp[] = [];
+    for (let r = startRow; r <= endRow; r++) {
+      const sourceRow = values[r - startRow] ?? [];
+      for (let c = startCol; c <= endCol; c++) {
+        const next = sourceRow[c - startCol] ?? "";
+        const prev = cells.get(key(r, c))?.input ?? "";
+        if (prev !== next) edits.push({ row: r, col: c, prev, next });
+      }
+    }
+    for (const op of edits) {
+      try {
+        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+      } catch (e) {
+        statusMsg = `${description} failed: ${e}`;
+        focusGrid();
+        return;
+      }
+    }
+    if (edits.length > 0) markWorkbookDirty();
+    await refreshRows(startRow, endRow);
+    noteRecalcPending(edits.length);
+    pushHistory({ description, sheet, edits });
+    rangeEndRow = endRow;
+    rangeEndCol = endCol;
+  }
+
   /// /Data/Parse — split one selected column into adjacent cells.
   /// This covers the basic "Text to Columns" workflow without taking on
   /// fixed-width parsing or type inference.
@@ -3125,6 +3199,181 @@
       statusMsg = `Parsed ${r2 - r1 + 1} row${r1 === r2 ? "" : "s"} into ${outputCols} column${outputCols === 1 ? "" : "s"}`;
       focusGrid();
     });
+  }
+
+  async function dataTable() {
+    const { r1, r2, c1, c2 } = selectionBounds();
+    const matrix = await selectedInputMatrix();
+    if (!matrix) {
+      statusMsg = "Table summary cancelled";
+      focusGrid();
+      return;
+    }
+    if (matrix.length < 2) {
+      statusMsg = "Select a header row and at least one data row";
+      focusGrid();
+      return;
+    }
+    const out: string[][] = [["Column", "Count", "Numeric", "Sum", "Average", "Min", "Max"]];
+    for (let offset = 0; offset <= c2 - c1; offset++) {
+      const header = matrix[0][offset] || addr(1, c1 + offset).replace(/\d+$/, "");
+      const values = matrix.slice(1).map((row) => row[offset] ?? "").filter((v) => v.trim() !== "");
+      const nums = values.map(parseNumericCell).filter((n): n is number => n !== null);
+      const sum = nums.reduce((a, b) => a + b, 0);
+      out.push([
+        header,
+        String(values.length),
+        String(nums.length),
+        nums.length ? String(sum) : "",
+        nums.length ? String(sum / nums.length) : "",
+        nums.length ? String(Math.min(...nums)) : "",
+        nums.length ? String(Math.max(...nums)) : "",
+      ]);
+    }
+    const destRow = r2 + 2;
+    await writeOutputGrid(destRow, c1, out, `Table summary ${addr(r1, c1)}:${addr(r2, c2)}`);
+    statusMsg = `Table summary written at ${addr(destRow, c1)}`;
+    focusGrid();
+  }
+
+  function dataQuery() {
+    const { r1, r2, c1, c2 } = selectionBounds();
+    if (r2 <= r1) {
+      statusMsg = "Select a header row and data rows to query";
+      focusGrid();
+      return;
+    }
+    const defaultCol = addr(1, c1).replace(/\d+$/, "");
+    openMenuPrompt(`Query column (${defaultCol}-${addr(1, c2).replace(/\d+$/, "")}):`, defaultCol, (colV) => {
+      const parsed = parseA1Frontend(`${colV.trim()}1`);
+      const queryCol = parsed?.col ?? 0;
+      if (queryCol < c1 || queryCol > c2) {
+        statusMsg = `Column ${colV} not in selection`;
+        focusGrid();
+        return;
+      }
+      openMenuPrompt("Contains text:", "", async (needleV) => {
+        const needle = needleV.toLowerCase();
+        const matrix = await selectedInputMatrix();
+        if (!matrix) {
+          statusMsg = "Query cancelled";
+          focusGrid();
+          return;
+        }
+        const idx = queryCol - c1;
+        const out = [matrix[0]];
+        for (const row of matrix.slice(1)) {
+          if ((row[idx] ?? "").toLowerCase().includes(needle)) out.push(row);
+        }
+        const destRow = r2 + 2;
+        await writeOutputGrid(destRow, c1, out, `Query ${addr(r1, c1)}:${addr(r2, c2)}`);
+        statusMsg = `Query returned ${out.length - 1} row${out.length === 2 ? "" : "s"} at ${addr(destRow, c1)}`;
+        focusGrid();
+      });
+    });
+  }
+
+  async function dataDistribution() {
+    const { r2, c1 } = selectionBounds();
+    const matrix = await selectedInputMatrix();
+    if (!matrix) {
+      statusMsg = "Distribution cancelled";
+      focusGrid();
+      return;
+    }
+    const counts = new Map<number, number>();
+    for (const row of matrix) {
+      for (const value of row) {
+        const n = parseNumericCell(value);
+        if (n !== null) counts.set(n, (counts.get(n) ?? 0) + 1);
+      }
+    }
+    if (counts.size === 0) {
+      statusMsg = "No numeric values in selection";
+      focusGrid();
+      return;
+    }
+    const out = [["Value", "Frequency"], ...[...counts.entries()].sort((a, b) => a[0] - b[0]).map(([value, count]) => [String(value), String(count)])];
+    const destRow = r2 + 2;
+    await writeOutputGrid(destRow, c1, out, "Frequency distribution");
+    statusMsg = `Distribution written at ${addr(destRow, c1)}`;
+    focusGrid();
+  }
+
+  function dataMatrix() {
+    const { r2, c1 } = selectionBounds();
+    openMenuPrompt("Transpose output at:", addr(r2 + 2, c1), async (v) => {
+      const target = parseA1Frontend(v);
+      if (!target) {
+        statusMsg = `Invalid destination: ${v}`;
+        focusGrid();
+        return;
+      }
+      const matrix = await selectedInputMatrix();
+      if (!matrix) {
+        statusMsg = "Matrix operation cancelled";
+        focusGrid();
+        return;
+      }
+      const out = matrix[0].map((_, col) => matrix.map((row) => row[col] ?? ""));
+      await writeOutputGrid(target.row, target.col, out, "Matrix transpose");
+      statusMsg = `Matrix transpose written at ${addr(target.row, target.col)}`;
+      focusGrid();
+    });
+  }
+
+  async function dataRegression() {
+    const { r1, r2, c1, c2 } = selectionBounds();
+    if (c2 - c1 + 1 < 2) {
+      statusMsg = "Select at least two columns: X then Y";
+      focusGrid();
+      return;
+    }
+    const matrix = await selectedInputMatrix();
+    if (!matrix) {
+      statusMsg = "Regression cancelled";
+      focusGrid();
+      return;
+    }
+    const pairs: Array<[number, number]> = [];
+    for (const row of matrix) {
+      const x = parseNumericCell(row[0] ?? "");
+      const y = parseNumericCell(row[1] ?? "");
+      if (x !== null && y !== null) pairs.push([x, y]);
+    }
+    if (pairs.length < 2) {
+      statusMsg = "Regression needs at least two numeric X/Y pairs";
+      focusGrid();
+      return;
+    }
+    const n = pairs.length;
+    const sx = pairs.reduce((sum, [x]) => sum + x, 0);
+    const sy = pairs.reduce((sum, [, y]) => sum + y, 0);
+    const sxx = pairs.reduce((sum, [x]) => sum + x * x, 0);
+    const sxy = pairs.reduce((sum, [x, y]) => sum + x * y, 0);
+    const syy = pairs.reduce((sum, [, y]) => sum + y * y, 0);
+    const denom = n * sxx - sx * sx;
+    if (denom === 0) {
+      statusMsg = "Regression failed: X values have no variance";
+      focusGrid();
+      return;
+    }
+    const slope = (n * sxy - sx * sy) / denom;
+    const intercept = (sy - slope * sx) / n;
+    const rDenom = Math.sqrt((n * sxx - sx * sx) * (n * syy - sy * sy));
+    const r = rDenom === 0 ? 0 : (n * sxy - sx * sy) / rDenom;
+    const out = [
+      ["Regression", ""],
+      ["Count", String(n)],
+      ["Slope", String(slope)],
+      ["Intercept", String(intercept)],
+      ["R", String(r)],
+      ["R^2", String(r * r)],
+    ];
+    const destRow = r2 + 2;
+    await writeOutputGrid(destRow, c1, out, `Regression ${addr(r1, c1)}:${addr(r2, c2)}`);
+    statusMsg = `Regression stats written at ${addr(destRow, c1)}`;
+    focusGrid();
   }
 
   /// /Range/Value — replace each formula in the selection with its
@@ -3940,6 +4189,11 @@
     dataFill,
     dataSort,
     dataParse,
+    dataTable,
+    dataQuery,
+    dataDistribution,
+    dataMatrix,
+    dataRegression,
     nameCreate,
     nameDelete,
     nameList,
