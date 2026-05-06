@@ -6,8 +6,10 @@
   type Props = {
     mode: "open" | "save";
     currentPath: string;
+    startDir?: string;
     onOpenFile: (path: string) => void | Promise<void>;
     onSaveFile: (path: string) => void | Promise<void>;
+    onDirectoryChange?: (dir: string) => void;
     onClose: () => void;
     onStatus: (msg: string) => void;
   };
@@ -15,8 +17,10 @@
   let {
     mode,
     currentPath,
+    startDir = "",
     onOpenFile,
     onSaveFile,
+    onDirectoryChange,
     onClose,
     onStatus,
   }: Props = $props();
@@ -54,6 +58,7 @@
       const previous = listing?.dir ?? null;
       const result = await invoke<DirListing>("list_dir", { path, cwd });
       listing = result;
+      onDirectoryChange?.(result.dir);
       filter = "";
       selectedIdx = 0;
       // Crossing into a new directory means the user has acted on
@@ -90,7 +95,7 @@
   }
 
   onMount(async () => {
-    const preferred = startDirFromCurrentPath();
+    const preferred = startDir || startDirFromCurrentPath();
     const start = preferred ?? (await invoke<string>("start_dir"));
     await Promise.all([navTo(start, null), refreshRecents()]);
   });

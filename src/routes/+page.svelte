@@ -25,6 +25,7 @@
     WorkbookInfo,
     SaveResult,
     BackupResult,
+    DirListing,
     TraceNode,
     NamedRangeInfo,
     CompareResult,
@@ -123,6 +124,7 @@
   // file navigator state
   let navOpen = $state(false);
   let navMode = $state<"open" | "save">("open");
+  let fileDirectory = $state("");
 
   // Format Cells modal (Ctrl+1). Holds the selection rectangle and
   // active cell at the time the modal opens — applies hit the whole
@@ -787,6 +789,24 @@
   function openSaveAsNavigator() {
     navMode = "save";
     navOpen = true;
+  }
+
+  function changeDirectory() {
+    openMenuPrompt("Directory:", fileDirectory || ".", async (v) => {
+      const t = v.trim();
+      if (!t) { focusGrid(); return; }
+      try {
+        const listing = await invoke<DirListing>("list_dir", {
+          path: t,
+          cwd: fileDirectory || null,
+        });
+        fileDirectory = listing.dir;
+        statusMsg = `Directory: ${listing.dir}`;
+      } catch (e) {
+        statusMsg = `Directory failed: ${e}`;
+      }
+      focusGrid();
+    });
   }
 
   /// Lotus /F S flow. With no current path → Save As navigator.
@@ -3483,6 +3503,7 @@
     eraseCurrentCell,
     openRetrieveNavigator,
     openFileList,
+    changeDirectory,
     fileSaveFlow,
     quitApp,
     setStatus: (m) => { statusMsg = m; },
@@ -4123,6 +4144,7 @@
     <Navigator
       mode={navMode}
       {currentPath}
+      startDir={fileDirectory}
       onOpenFile={async (p) => {
         navOpen = false;
         if (navCompareTarget) {
@@ -4140,6 +4162,7 @@
         navOpen = false;
         focusGrid();
       }}
+      onDirectoryChange={(dir) => (fileDirectory = dir)}
       onStatus={(m) => (statusMsg = m)}
     />
   {/if}

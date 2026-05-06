@@ -196,7 +196,7 @@ commits, Esc cancels.
 /F X      Xtract                 ⚠ not yet
 /F E      Erase a file from disk ⚠ not yet
 /F I      Import a text file     ⚠ not yet
-/F D      Change directory       ⚠ not yet
+/F D      Change directory
 /F A      Admin                  ⚠ not yet
 ```
 
