@@ -177,6 +177,12 @@
   let mode = $state<Mode>("list");
   let filter = $state("");
   let inputEl: HTMLInputElement | null = $state(null);
+  /// Card ref. Receives keyboard focus when the user enters custom
+  /// mode — without this, the click on Custom… would leave focus on
+  /// the (now-hidden) Custom button, the browser would drop focus to
+  /// `body`, and the onkeydown handler on the overlay would never
+  /// fire because no descendant has focus.
+  let cardEl: HTMLDivElement | null = $state(null);
 
   // Custom-mode HSL values. Seeded from the highlighted swatch when
   // the user enters custom mode so editing starts at "the colour they
@@ -184,6 +190,12 @@
   let customH = $state(0);
   let customS = $state(0.5);
   let customL = $state(0.5);
+  /// Last hex the user navigated to that was a real colour (named or
+  /// recent — not Custom… / Clear). Used to seed customH/S/L when
+  /// they enter custom mode by clicking the Custom… tile, since at
+  /// that exact moment `highlight` points at the Custom… entry which
+  /// has no colour of its own.
+  let lastColorHex = $state<string>("");
 
   // Build the candidate list (recents + named, with optional filter).
   // Each entry has a stable index used by keyboard navigation. The
@@ -224,6 +236,16 @@
       highlight = Math.max(0, entries.length - 1);
     }
   });
+  // Remember the last colour-bearing entry so Custom… seeds from
+  // wherever the user was looking before they clicked into custom
+  // mode (rather than from the Custom… tile itself, which has no
+  // colour).
+  $effect(() => {
+    const e = entries[highlight];
+    if (e && (e.kind === "named" || e.kind === "recent")) {
+      lastColorHex = e.hex;
+    }
+  });
 
   // ---------------------------------------------------------------------
   // Layout — the swatch grid is a fixed-column grid. We need the
@@ -244,6 +266,7 @@
     if (initial && /^#[0-9A-Fa-f]{6}$/.test(initial)) {
       const [h, s, l] = hexToHsl(initial);
       customH = h; customS = s; customL = l;
+      lastColorHex = initial.toUpperCase();
       // Pre-select the closest matching entry so the keyboard cursor
       // lands on a familiar swatch instead of the top-left tile.
       const idx = entries.findIndex(
@@ -280,15 +303,30 @@
     if (e) commitEntry(e);
   }
   function enterCustom() {
-    // Seed HSL from whichever swatch is highlighted (or fall back to
-    // whatever onMount loaded). Lets the user pick "blue → CornflowerBlue"
-    // from the named list, hit Enter on Custom, and tweak from there.
+    // Seed HSL. Priority order:
+    //   1. The currently-highlighted entry, if it carries a colour
+    //      (e.g. user pressed Enter directly on a named swatch — but
+    //      via mouse click on Custom… the highlight is on Custom
+    //      itself, so this branch usually skips).
+    //   2. The last colour-bearing entry the user navigated to (so
+    //      "type 'blue' → arrow to CornflowerBlue → click Custom…"
+    //      seeds at CornflowerBlue, not at the default red).
+    //   3. The `initial` prop loaded onMount.
+    //   4. Default 0/0.5/0.5.
     const e = entries[highlight];
-    if (e && (e.kind === "named" || e.kind === "recent")) {
-      const [h, s, l] = hexToHsl(e.hex);
+    let seed = "";
+    if (e && (e.kind === "named" || e.kind === "recent")) seed = e.hex;
+    else if (lastColorHex) seed = lastColorHex;
+    else if (initial && /^#[0-9A-Fa-f]{6}$/.test(initial)) seed = initial;
+    if (seed) {
+      const [h, s, l] = hexToHsl(seed);
       customH = h; customS = s; customL = l;
     }
     mode = "custom";
+    // Refocus the card so onkeydown still fires — the input that had
+    // focus is hidden by the mode switch and would otherwise drop
+    // focus to body.
+    tick().then(() => cardEl?.focus());
   }
 
   // ---------------------------------------------------------------------
@@ -411,7 +449,7 @@
   tabindex="-1"
   onkeydown={onKey}
 >
-  <div class="card">
+  <div class="card" bind:this={cardEl} tabindex="-1">
     <header class="header">
       <h2>{title}</h2>
       <span class="hint">
