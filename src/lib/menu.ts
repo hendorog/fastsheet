@@ -60,6 +60,8 @@ export type MenuCallbacks = {
   dataFill: () => void | Promise<void>;
   // /Data/Sort — sort selection rows by column.
   dataSort: () => void | Promise<void>;
+  // /Data/Parse — split selected labels into adjacent columns.
+  dataParse: () => void | Promise<void>;
   // /Range/Name — define / delete / list named ranges.
   nameCreate: () => void | Promise<void>;
   nameDelete: () => void | Promise<void>;
@@ -333,7 +335,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
         { letter: "D", label: "Distribution", description: "Frequency distribution", action: stb("Data/Distribution") },
         { letter: "M", label: "Matrix", description: "Matrix operations", action: stb("Data/Matrix") },
         { letter: "R", label: "Regression", description: "Linear regression", action: stb("Data/Regression") },
-        { letter: "P", label: "Parse", description: "Parse a column of labels into cells", action: stb("Data/Parse") },
+        { letter: "P", label: "Parse", description: "Parse a column of labels into cells", action: cb.dataParse },
       ],
     },
     { letter: "S", label: "System", description: "Temporarily exit to operating system", action: stb("System") },

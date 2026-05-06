@@ -2607,6 +2607,106 @@
     });
   }
 
+  function delimiterFromPrompt(raw: string): string | null {
+    const t = raw.trim().toLowerCase();
+    if (t === "," || t === "comma" || t === "c") return ",";
+    if (t === ";" || t === "semicolon" || t === "s") return ";";
+    if (t === "\\t" || t === "tab" || t === "t") return "\t";
+    if (t === "space" || t === "sp" || t === " ") return " ";
+    return raw.length === 1 ? raw : null;
+  }
+
+  function parseDelimitedLine(text: string, delimiter: string): string[] {
+    if (delimiter === " ") {
+      return text.trim().length === 0 ? [""] : text.trim().split(/\s+/);
+    }
+    const out: string[] = [];
+    let cur = "";
+    let quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '"') {
+        if (quoted && text[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          quoted = !quoted;
+        }
+      } else if (ch === delimiter && !quoted) {
+        out.push(cur);
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    out.push(cur);
+    return out;
+  }
+
+  /// /Data/Parse — split one selected column into adjacent cells.
+  /// This covers the basic "Text to Columns" workflow without taking on
+  /// fixed-width parsing or type inference.
+  function dataParse() {
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    if (c1 !== c2) {
+      statusMsg = "Select one column to parse";
+      return;
+    }
+    openMenuPrompt("Delimiter: comma, tab, semicolon, space, or one character", "comma", async (v) => {
+      const delimiter = delimiterFromPrompt(v);
+      if (!delimiter) {
+        statusMsg = `Invalid delimiter: ${v}`;
+        focusGrid();
+        return;
+      }
+      await ensureRowsLoaded(r1, r2);
+      const rows: string[][] = [];
+      let maxParts = 1;
+      for (let r = r1; r <= r2; r++) {
+        const source = cells.get(key(r, c1))?.input ?? "";
+        const parts = parseDelimitedLine(source, delimiter);
+        rows.push(parts);
+        maxParts = Math.max(maxParts, parts.length);
+      }
+      const outputCols = Math.min(maxParts, ABS_MAX_COLS - c1 + 1);
+      await fetchBand(r1, r2, c1, c1 + outputCols - 1).then((result) => {
+        if (!result) return;
+        const newCells = new Map(cells);
+        for (let r = r1; r <= r2; r++) {
+          for (let c = c1; c < c1 + outputCols; c++) newCells.delete(key(r, c));
+        }
+        for (const c of result.list) newCells.set(key(c.row, c.col), c);
+        cells = newCells;
+      });
+      const sheet = activeSheet;
+      const edits: EditOp[] = [];
+      for (let r = r1; r <= r2; r++) {
+        const parts = rows[r - r1];
+        for (let offset = 0; offset < outputCols; offset++) {
+          const targetCol = c1 + offset;
+          const next = parts[offset] ?? "";
+          const prev = cells.get(key(r, targetCol))?.input ?? "";
+          if (prev !== next) edits.push({ row: r, col: targetCol, prev, next });
+        }
+      }
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+      if (edits.length > 0) markWorkbookDirty();
+      await refreshRows(r1, r2);
+      noteRecalcPending(edits.length);
+      const span = r1 === r2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c1)}`;
+      pushHistory({ description: `Parse ${span}`, sheet, edits });
+      statusMsg = `Parsed ${r2 - r1 + 1} row${r1 === r2 ? "" : "s"} into ${outputCols} column${outputCols === 1 ? "" : "s"}`;
+      focusGrid();
+    });
+  }
+
   /// /Range/Value — replace each formula in the selection with its
   /// evaluated value. One undo entry covers the whole range.
   async function rangeValue() {
@@ -3412,6 +3512,7 @@
     moveRange,
     dataFill,
     dataSort,
+    dataParse,
     nameCreate,
     nameDelete,
     nameList,

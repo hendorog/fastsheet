@@ -250,12 +250,12 @@ scope.
 ```
 /D F      Fill — fill selection with an arithmetic progression
 /D S      Sort — sort selected rows by a column
+/D P      Parse — split a selected column into adjacent cells
 /D T      Table         ⚠ not yet
 /D Q      Query         ⚠ not yet
 /D D      Distribution  ⚠ not yet
 /D M      Matrix        ⚠ not yet
 /D R      Regression    ⚠ not yet
-/D P      Parse         ⚠ not yet
 ```
 
 ### `/T` Trace (fastsheet-only)
