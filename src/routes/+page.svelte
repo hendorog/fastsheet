@@ -1469,9 +1469,12 @@
     prev_indices: number[];
     next_indices: number[];
   };
+  type ValueUndoEntry = { kind: "value"; description: string; sheet: number; edits: EditOp[] };
+  type StyleUndoEntry = { kind: "style"; description: string; sheet: number; edit: StyleEdit };
   type UndoEntry =
-    | { kind: "value"; description: string; sheet: number; edits: EditOp[] }
-    | { kind: "style"; description: string; sheet: number; edit: StyleEdit };
+    | ValueUndoEntry
+    | StyleUndoEntry
+    | { kind: "compound"; description: string; sheet: number; entries: (ValueUndoEntry | StyleUndoEntry)[] };
   let history = $state<UndoEntry[]>([]);
   let historyIdx = $state(0);
   type InternalClipboard = {
@@ -1537,19 +1540,34 @@
     }
   }
 
+  async function restoreUndoEntry(entry: UndoEntry | ValueUndoEntry | StyleUndoEntry, restore: "prev" | "next") {
+    if (entry.kind === "compound") {
+      const entries = restore === "prev" ? [...entry.entries].reverse() : entry.entries;
+      for (const child of entries) {
+        await restoreUndoEntry(child, restore);
+      }
+      return;
+    }
+    if (entry.kind === "value") {
+      await applyEdits(
+        entry.sheet,
+        entry.edits.map((e) => ({
+          row: e.row,
+          col: e.col,
+          value: restore === "prev" ? e.prev : e.next,
+        })),
+      );
+      noteRecalcPending(entry.edits.length);
+      return;
+    }
+    await applyStyleIndices(entry.sheet, entry.edit, restore);
+  }
+
   async function undo() {
     if (historyIdx <= 0) { statusMsg = "Nothing to undo"; return; }
     const entry = history[historyIdx - 1];
     if (entry.sheet !== activeSheet) await switchSheet(entry.sheet);
-    if (entry.kind === "value") {
-      await applyEdits(
-        entry.sheet,
-        entry.edits.map((e) => ({ row: e.row, col: e.col, value: e.prev })),
-      );
-      noteRecalcPending(entry.edits.length);
-    } else {
-      await applyStyleIndices(entry.sheet, entry.edit, "prev");
-    }
+    await restoreUndoEntry(entry, "prev");
     historyIdx -= 1;
     statusMsg = `Undid: ${entry.description}`;
   }
@@ -1558,15 +1576,7 @@
     if (historyIdx >= history.length) { statusMsg = "Nothing to redo"; return; }
     const entry = history[historyIdx];
     if (entry.sheet !== activeSheet) await switchSheet(entry.sheet);
-    if (entry.kind === "value") {
-      await applyEdits(
-        entry.sheet,
-        entry.edits.map((e) => ({ row: e.row, col: e.col, value: e.next })),
-      );
-      noteRecalcPending(entry.edits.length);
-    } else {
-      await applyStyleIndices(entry.sheet, entry.edit, "next");
-    }
+    await restoreUndoEntry(entry, "next");
     historyIdx += 1;
     statusMsg = `Redid: ${entry.description}`;
   }
@@ -2852,6 +2862,57 @@
     applyStyleOp({ kind: "clear_format" }, "Cleared formats");
   }
 
+  async function clearAll() {
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    const sheet = activeSheet;
+    const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
+    const valueEdits: EditOp[] = [];
+    for (let r = r1; r <= r2; r++) {
+      for (let c = c1; c <= c2; c++) {
+        const prev = cells.get(key(r, c))?.input ?? "";
+        if (prev !== "") valueEdits.push({ row: r, col: c, prev, next: "" });
+      }
+    }
+    try {
+      for (const op of valueEdits) {
+        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
+      }
+      const styleResult = await invoke<{ count: number; prev_indices: number[]; next_indices: number[] }>(
+        "set_range_style",
+        { sheet, r1, c1, r2, c2, op: { kind: "clear_format" } },
+      );
+      const styleChanged = styleResult.prev_indices.some((p, i) => p !== styleResult.next_indices[i]);
+      const entries: (ValueUndoEntry | StyleUndoEntry)[] = [];
+      if (valueEdits.length > 0) {
+        entries.push({ kind: "value", description: `Erase ${span}`, sheet, edits: valueEdits });
+      }
+      if (styleChanged) {
+        entries.push({
+          kind: "style",
+          description: `Clear formats ${span}`,
+          sheet,
+          edit: {
+            r1, c1, r2, c2,
+            prev_indices: styleResult.prev_indices,
+            next_indices: styleResult.next_indices,
+          },
+        });
+      }
+      await refreshRows(r1, r2);
+      noteRecalcPending(valueEdits.length);
+      if (entries.length > 0) {
+        markWorkbookDirty();
+        pushHistory({ kind: "compound", description: `Clear all ${span}`, sheet, entries });
+      }
+      statusMsg = entries.length === 0 ? `Nothing to clear in ${span}` : `Cleared all ${span}`;
+    } catch (e) {
+      statusMsg = `Clear all failed: ${e}`;
+    }
+  }
+
   /// Open the autocomplete color picker. Replaces the old hex-only
   /// prompt — the picker handles named-color autocomplete + custom
   /// HSL editing internally. `recents` are seeded from the workbook's
@@ -3314,6 +3375,7 @@
     unmergeCells: unmergeSelectedCells,
     formatRange,
     clearFormats,
+    clearAll,
     searchRange: openFindReplace,
     alignRange,
     attrRange,
@@ -4119,6 +4181,7 @@
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentColumn(); }}>Hide column</button>
       <button type="button" onclick={() => { closeContextMenu(); eraseCurrentCell(); }}>Erase</button>
       <button type="button" onclick={() => { closeContextMenu(); clearFormats(); }}>Clear formats</button>
+      <button type="button" onclick={() => { closeContextMenu(); clearAll(); }}>Clear all</button>
     </div>
   {/if}
 

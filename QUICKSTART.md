@@ -157,6 +157,7 @@ Ctrl+1    Format Cells dialog — number, font, border, fill, alignment,
           vertical alignment, and wrap text
 /R E      Erase selected cell contents (preserves formatting)
 /R C      Clear Formats — clear formatting from the selected cells
+/R D      Clear All — clear contents and formatting from the selected cells
 /R N C    Name Create — define a name for the current selection
 /R N D    Name Delete — delete a defined name
 /R N L    Name List — drop the names list into the worksheet

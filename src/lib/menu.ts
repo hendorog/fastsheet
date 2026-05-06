@@ -36,6 +36,7 @@ export type MenuCallbacks = {
   // others apply directly to the current selection.
   formatRange: (kind: FormatKind) => void | Promise<void>;
   clearFormats: () => void | Promise<void>;
+  clearAll: () => void | Promise<void>;
   // Range/Search — opens the find-then-replace inline prompt chain.
   searchRange: () => void | Promise<void>;
   // Range/Label — text alignment.
@@ -251,6 +252,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
         },
         { letter: "E", label: "Erase", description: "Erase the selected cells' contents", action: cb.eraseCurrentCell },
         { letter: "C", label: "Clear Formats", description: "Clear formatting from the selected cells", action: cb.clearFormats },
+        { letter: "D", label: "Clear All", description: "Clear contents and formatting from the selected cells", action: cb.clearAll },
         {
           letter: "N", label: "Name",
           description: "Create / delete / list named ranges",
