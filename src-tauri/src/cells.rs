@@ -1,4 +1,4 @@
-use ironcalc::base::types::{Alignment, BorderItem, BorderStyle, HorizontalAlignment};
+use ironcalc::base::types::{Alignment, BorderItem, BorderStyle, HorizontalAlignment, VerticalAlignment};
 use ironcalc::base::types::Cell;
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -504,6 +504,10 @@ pub(crate) enum StyleOp {
     AlignCenter,
     AlignRight,
     AlignGeneral,
+    AlignVerticalTop,
+    AlignVerticalMiddle,
+    AlignVerticalBottom,
+    SetWrap { enabled: bool },
     SetFillColor { color: String },
     SetTextColor { color: String },
     ClearFillColor,
@@ -589,6 +593,34 @@ pub(crate) fn set_range_style(
                 StyleOp::AlignGeneral => {
                     let mut a = s.alignment.clone().unwrap_or_default();
                     a.horizontal = HorizontalAlignment::General;
+                    if a == Alignment::default() {
+                        s.alignment = None;
+                    } else {
+                        s.alignment = Some(a);
+                    }
+                }
+                StyleOp::AlignVerticalTop => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.vertical = VerticalAlignment::Top;
+                    s.alignment = Some(a);
+                }
+                StyleOp::AlignVerticalMiddle => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.vertical = VerticalAlignment::Center;
+                    s.alignment = Some(a);
+                }
+                StyleOp::AlignVerticalBottom => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.vertical = VerticalAlignment::Bottom;
+                    if a == Alignment::default() {
+                        s.alignment = None;
+                    } else {
+                        s.alignment = Some(a);
+                    }
+                }
+                StyleOp::SetWrap { enabled } => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.wrap_text = *enabled;
                     if a == Alignment::default() {
                         s.alignment = None;
                     } else {

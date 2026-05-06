@@ -346,9 +346,28 @@
         });
         dirty = true;
       }
+      if (alignV !== initial.align_v) {
+        const map: Record<string, string> = {
+          top: "align_vertical_top",
+          middle: "align_vertical_middle",
+          bottom: "align_vertical_bottom",
+        };
+        await invoke("set_range_style", {
+          sheet, r1: rangeR1, c1: rangeC1, r2: rangeR2, c2: rangeC2,
+          op: { kind: map[alignV] },
+        });
+        dirty = true;
+      }
+      if (wrap !== initial.wrap) {
+        await invoke("set_range_style", {
+          sheet, r1: rangeR1, c1: rangeC1, r2: rangeR2, c2: rangeC2,
+          op: { kind: "set_wrap", enabled: wrap },
+        });
+        dirty = true;
+      }
 
       onStatus(dirty ? `Format applied to ${describeRange()}` : "No changes");
-      await onApplied();
+      if (dirty) await onApplied();
       onClose();
     } catch (e) {
       onStatus(`Apply failed: ${e}`);
@@ -594,12 +613,17 @@
             {/each}
           </fieldset>
           <fieldset>
-            <legend>Vertical (display only)</legend>
-            <p class="hint">Not yet writable — IronCalc preserves vertical alignment from the source file but the toolbar's vertical setter isn't wired.</p>
+            <legend>Vertical</legend>
+            {#each ["top", "middle", "bottom"] as v (v)}
+              <label class="radio">
+                <input type="radio" name="align-v" value={v} bind:group={alignV} />
+                {v.charAt(0).toUpperCase() + v.slice(1)}
+              </label>
+            {/each}
           </fieldset>
           <label class="check">
-            <input type="checkbox" bind:checked={wrap} disabled />
-            Wrap text (read-only for now)
+            <input type="checkbox" bind:checked={wrap} />
+            Wrap text
           </label>
         </div>
       {/if}
