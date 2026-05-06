@@ -386,6 +386,12 @@
           mode = "list";
           tick().then(() => inputEl?.focus());
           return;
+        case "Tab":
+          // Trap Tab inside the picker — without this it would move
+          // browser focus to the next page-focusable element, taking
+          // keyboard control away from the dialog.
+          e.preventDefault();
+          return;
       }
       return;
     }
@@ -424,6 +430,55 @@
         e.preventDefault();
         onCancel();
         return;
+      case "Tab":
+        // Shell-style completion: fill the filter with the highlighted
+        // entry's name. The default browser Tab would yank focus out
+        // of the input onto a swatch button, which feels jarring in
+        // an app whose primary Tab semantics is "advance the cell
+        // cursor". We swallow Tab entirely so focus stays on the
+        // filter, then either:
+        //   * (Tab) complete to the highlighted name, or if the
+        //     filter already equals that name, advance to the next
+        //     match by bumping the highlight forward;
+        //   * (Shift+Tab) advance the highlight backward.
+        e.preventDefault();
+        completeOrCycle(e.shiftKey ? -1 : 1);
+        return;
+    }
+  }
+
+  /// Tab completion. When the filter doesn't already match the
+  /// highlighted entry's name, this fills it in (a single keystroke
+  /// turns "blu" into "Blue"). When it does match, this cycles to
+  /// the next/previous match so successive Tabs walk through the
+  /// candidate set without ever moving focus off the input.
+  function completeOrCycle(direction: 1 | -1) {
+    const e = entries[highlight];
+    if (!e) return;
+    const name = e.kind === "named" ? e.name : e.kind === "recent" ? e.hex : null;
+    if (!name) return;
+    if (filter.trim().toLowerCase() !== name.toLowerCase()) {
+      filter = name;
+      // The $effect on `filter` resets highlight to 0, which is the
+      // entry we just completed to. Refocus the input so further
+      // typing keeps going there.
+      tick().then(() => inputEl?.focus());
+      return;
+    }
+    // Filter already matches; cycle to the neighbouring match. We
+    // walk over entries that carry a colour so Custom… / Clear
+    // don't get pulled into the cycle.
+    const n = entries.length;
+    for (let step = 1; step <= n; step++) {
+      const idx = ((highlight + direction * step) % n + n) % n;
+      const next = entries[idx];
+      if (next && (next.kind === "named" || next.kind === "recent")) {
+        highlight = idx;
+        const nextName = next.kind === "named" ? next.name : next.hex;
+        filter = nextName;
+        tick().then(() => inputEl?.focus());
+        return;
+      }
     }
   }
 
@@ -467,7 +522,7 @@
         {#if mode === "custom"}
           ↑↓ lighter/darker · ←→ saturate · [ ] hue · Enter pick · Esc back
         {:else}
-          type to filter · ←→↑↓ Enter pick · Esc cancel
+          type to filter · Tab complete · ←→↑↓ Enter pick · Esc cancel
         {/if}
       </span>
     </header>
