@@ -85,6 +85,7 @@ pub fn run() {
             workbook::open_workbook,
             workbook::new_workbook,
             workbook::save_workbook,
+            workbook::extract_cells_to_workbook,
             workbook::workbook_has_unsaved_changes,
             workbook::file_exists,
             workbook::erase_file,

@@ -765,6 +765,99 @@
     menuHighlight = 0;
   }
 
+  function normalizeXlsxPath(path: string): string {
+    if (/\.xlsx$/i.test(path)) return path;
+    if (/\.[^/\\.]+$/.test(path)) return path.replace(/\.[^/\\.]+$/, ".xlsx");
+    return `${path}.xlsx`;
+  }
+
+  function defaultExtractPath(): string {
+    if (currentPath) return `${currentPath.replace(/\.[^/\\.]+$/, "")}-extract.xlsx`;
+    if (fileDirectory) return `${fileDirectory.replace(/[\\/]$/, "")}/extract.xlsx`;
+    return "extract.xlsx";
+  }
+
+  async function writeExtractWorkbook(path: string, rows: string[][], label: string) {
+    try {
+      const r = await invoke<SaveResult>("extract_cells_to_workbook", { path, rows });
+      const backup = r.backup_path ? ` · backup: ${r.backup_path}` : "";
+      statusMsg = `Xtracted ${label} to ${r.path} · ${r.cells_patched} cell${r.cells_patched === 1 ? "" : "s"} written${backup}`;
+    } catch (e) {
+      statusMsg = `Xtract failed: ${e}`;
+    }
+    focusGrid();
+  }
+
+  async function extractRangeToPath(path: string, rows: string[][], label: string) {
+    let exists = false;
+    try {
+      exists = await invoke<boolean>("file_exists", { path });
+    } catch {
+      exists = false;
+    }
+    if (!exists) {
+      await writeExtractWorkbook(path, rows, label);
+      return;
+    }
+    dynamicTitle = `Replace ${path}`;
+    dynamicLevel = [
+      {
+        letter: "R",
+        label: "Replace",
+        description: `Overwrite existing ${path}`,
+        action: () => writeExtractWorkbook(path, rows, label),
+      },
+      {
+        letter: "C",
+        label: "Cancel",
+        description: "Don't extract",
+        action: () => {
+          statusMsg = "Xtract cancelled";
+          focusGrid();
+        },
+      },
+    ];
+    menuOpen = true;
+    menuPath = [];
+    menuHighlight = 0;
+  }
+
+  function extractRangePrompt() {
+    if (!workbook) {
+      statusMsg = "No workbook to xtract";
+      focusGrid();
+      return;
+    }
+    openMenuPrompt("Xtract to .xlsx:", defaultExtractPath(), async (v) => {
+      const rawPath = v.trim();
+      if (!rawPath) { focusGrid(); return; }
+      const r1 = Math.min(selRow, rangeEndRow);
+      const r2 = Math.max(selRow, rangeEndRow);
+      const c1 = Math.min(selCol, rangeEndCol);
+      const c2 = Math.max(selCol, rangeEndCol);
+      const result = await fetchBand(r1, r2, c1, c2);
+      if (!result) {
+        statusMsg = "Xtract cancelled";
+        focusGrid();
+        return;
+      }
+      const sourceCells = new Map(cells);
+      for (let r = r1; r <= r2; r++) {
+        for (let c = c1; c <= c2; c++) sourceCells.delete(key(r, c));
+      }
+      for (const c of result.list) sourceCells.set(key(c.row, c.col), c);
+      const rows: string[][] = [];
+      for (let r = r1; r <= r2; r++) {
+        const row: string[] = [];
+        for (let c = c1; c <= c2; c++) row.push(sourceCells.get(key(r, c))?.input ?? "");
+        rows.push(row);
+      }
+      const path = normalizeXlsxPath(rawPath);
+      const label = `${addr(r1, c1)}:${addr(r2, c2)}`;
+      await extractRangeToPath(path, rows, label);
+    });
+  }
+
   async function backupAndSave(path: string) {
     try {
       const r = await invoke<BackupResult>("backup_and_save", { path });
@@ -3626,6 +3719,7 @@
     changeDirectory,
     eraseFile: eraseFilePrompt,
     importTextFile: importTextFilePrompt,
+    extractRange: extractRangePrompt,
     fileSaveFlow,
     quitApp,
     setStatus: (m) => { statusMsg = m; },

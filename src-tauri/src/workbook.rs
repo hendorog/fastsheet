@@ -217,6 +217,42 @@ pub(crate) fn save_workbook(
 }
 
 #[tauri::command]
+pub(crate) fn extract_cells_to_workbook(
+    path: String,
+    rows: Vec<Vec<String>>,
+) -> Result<SaveResult, String> {
+    if rows.is_empty() {
+        return Err("no cells selected".into());
+    }
+    let mut model = Model::new_empty("extract", "en", "UTC", "en").map_err(|e| e)?;
+    let mut cells_written = 0usize;
+    for (row_idx, row) in rows.iter().enumerate() {
+        for (col_idx, value) in row.iter().enumerate() {
+            if value.is_empty() {
+                continue;
+            }
+            model
+                .set_user_input(0, row_idx as i32 + 1, col_idx as i32 + 1, value.clone())
+                .map_err(|e| e.to_string())?;
+            cells_written += 1;
+        }
+    }
+    model.evaluate();
+    let backup_path = crate::atomic::backup_if_exists(std::path::Path::new(&path))?
+        .map(|p| p.to_string_lossy().into_owned());
+    crate::atomic::write(std::path::Path::new(&path), |tmp| {
+        save_to_xlsx(&model, &tmp.to_string_lossy()).map_err(|e| e.to_string())
+    })?;
+    Ok(SaveResult {
+        path,
+        mode: "ironcalc",
+        cells_patched: cells_written,
+        backup_path,
+        vba_preserved: false,
+    })
+}
+
+#[tauri::command]
 pub(crate) fn workbook_has_unsaved_changes(state: State<'_, AppState>) -> bool {
     *state.workbook_dirty.lock().unwrap()
 }

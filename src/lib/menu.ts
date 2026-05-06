@@ -8,6 +8,7 @@ export type MenuCallbacks = {
   changeDirectory: () => void | Promise<void>;
   eraseFile: () => void | Promise<void>;
   importTextFile: () => void | Promise<void>;
+  extractRange: () => void | Promise<void>;
   fileSaveFlow: () => void | Promise<void>;
   quitApp: () => void | Promise<void>;
   setStatus: (msg: string) => void;
@@ -296,7 +297,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
           ],
         },
         { letter: "J", label: "Combine", description: "Combine another file into the current one", action: stb("File/Combine") },
-        { letter: "X", label: "Xtract", description: "Extract part of the worksheet to a new file", action: stb("File/Xtract") },
+        { letter: "X", label: "Xtract", description: "Extract the selected range to a new .xlsx file", action: cb.extractRange },
         { letter: "E", label: "Erase", description: "Erase a file from disk", action: cb.eraseFile },
         { letter: "L", label: "List", description: "List worksheet files in the directory", action: cb.openFileList },
         { letter: "I", label: "Import", description: "Import a text file as cells", action: cb.importTextFile },

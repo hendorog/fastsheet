@@ -193,7 +193,7 @@ commits, Esc cancels.
 /F C X    Compare exit — close the comparison and clear the dock
 /F L      List worksheet files in the directory
 /F J      Combine                ⚠ not yet
-/F X      Xtract                 ⚠ not yet
+/F X      Xtract — save the selected range to a new .xlsx file
 /F E      Erase a file from disk (with confirm)
 /F I      Import a text/CSV/TSV file into cells
 /F D      Change directory
