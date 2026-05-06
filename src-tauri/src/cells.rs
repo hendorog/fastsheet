@@ -503,6 +503,7 @@ pub(crate) enum StyleOp {
     AlignLeft,
     AlignCenter,
     AlignRight,
+    AlignJustify,
     AlignGeneral,
     AlignVerticalTop,
     AlignVerticalMiddle,
@@ -597,6 +598,11 @@ pub(crate) fn set_range_style(
                 StyleOp::AlignRight => {
                     let mut a = s.alignment.clone().unwrap_or_default();
                     a.horizontal = HorizontalAlignment::Right;
+                    s.alignment = Some(a);
+                }
+                StyleOp::AlignJustify => {
+                    let mut a = s.alignment.clone().unwrap_or_default();
+                    a.horizontal = HorizontalAlignment::Justify;
                     s.alignment = Some(a);
                 }
                 StyleOp::AlignGeneral => {

@@ -338,7 +338,7 @@
           left: "align_left",
           center: "align_center",
           right: "align_right",
-          justify: "align_left", // best-effort: justify not supported in StyleOp
+          justify: "align_justify",
         };
         await invoke("set_range_style", {
           sheet, r1: rangeR1, c1: rangeC1, r2: rangeR2, c2: rangeC2,

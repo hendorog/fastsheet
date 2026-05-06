@@ -166,7 +166,7 @@ Ctrl+1    Format Cells dialog — number, font, border, fill, alignment,
 /R M      Merge — merge the selected cells
 /R G      Unmerge — unmerge any merged cells overlapping the selection
 /R S      Search — find and (optionally) replace within the sheet
-/R J      Justify a range of labels    ⚠ not yet
+/R J      Justify text in the selected range
 /R P      Protect a range              ⚠ not yet
 /R U      Unprotect a range            ⚠ not yet
 /R I      Restrict input               ⚠ not yet

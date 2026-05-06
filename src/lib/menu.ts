@@ -41,7 +41,7 @@ export type MenuCallbacks = {
   // Range/Search — opens the find-then-replace inline prompt chain.
   searchRange: () => void | Promise<void>;
   // Range/Label — text alignment.
-  alignRange: (h: "left" | "center" | "right" | "general") => void | Promise<void>;
+  alignRange: (h: "left" | "center" | "right" | "justify" | "general") => void | Promise<void>;
   // Range/Attribute — bold / italic / underline / strike / reset.
   // Mirrors Lotus 1-2-3 Wysiwyg's `:Format` menu and the Excel Ctrl-key
   // shortcuts (B / I / U / 5).
@@ -265,7 +265,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
             { letter: "L", label: "List", description: "List all defined names in the status bar", action: cb.nameList },
           ],
         },
-        { letter: "J", label: "Justify", description: "Justify a range of labels", action: stb("Range/Justify") },
+        { letter: "J", label: "Justify", description: "Justify text across the selected range", action: () => cb.alignRange("justify") },
         { letter: "P", label: "Prot", description: "Protect a range from changes", action: stb("Range/Prot") },
         { letter: "U", label: "Unprot", description: "Unprotect a range", action: stb("Range/Unprot") },
         { letter: "I", label: "Input", description: "Restrict input to unprotected cells", action: stb("Range/Input") },

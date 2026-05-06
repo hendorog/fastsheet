@@ -2964,11 +2964,12 @@
     }
   }
 
-  function alignRange(h: "left" | "center" | "right" | "general") {
+  function alignRange(h: "left" | "center" | "right" | "justify" | "general") {
     const map = {
       left: { kind: "align_left" },
       center: { kind: "align_center" },
       right: { kind: "align_right" },
+      justify: { kind: "align_justify" },
       general: { kind: "align_general" },
     } as const;
     applyStyleOp(map[h], `Aligned ${h}`);
