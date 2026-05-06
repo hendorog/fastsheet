@@ -4,6 +4,7 @@ export type MenuCallbacks = {
   newWorkbook: () => void | Promise<void>;
   eraseCurrentCell: () => void | Promise<void>;
   openRetrieveNavigator: () => void | Promise<void>;
+  openFileList: () => void | Promise<void>;
   fileSaveFlow: () => void | Promise<void>;
   quitApp: () => void | Promise<void>;
   setStatus: (msg: string) => void;
@@ -294,7 +295,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
         { letter: "J", label: "Combine", description: "Combine another file into the current one", action: stb("File/Combine") },
         { letter: "X", label: "Xtract", description: "Extract part of the worksheet to a new file", action: stb("File/Xtract") },
         { letter: "E", label: "Erase", description: "Erase a file from disk", action: stb("File/Erase") },
-        { letter: "L", label: "List", description: "List worksheet files in the directory", action: stb("File/List") },
+        { letter: "L", label: "List", description: "List worksheet files in the directory", action: cb.openFileList },
         { letter: "I", label: "Import", description: "Import a text file as cells", action: stb("File/Import") },
         { letter: "D", label: "Directory", description: "Change the current directory", action: stb("File/Directory") },
         { letter: "A", label: "Admin", description: "File admin operations", action: stb("File/Admin") },

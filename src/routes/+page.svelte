@@ -779,6 +779,11 @@
     navOpen = true;
   }
 
+  function openFileList() {
+    openRetrieveNavigator();
+    statusMsg = "Listing worksheet files";
+  }
+
   function openSaveAsNavigator() {
     navMode = "save";
     navOpen = true;
@@ -3476,6 +3481,7 @@
     newWorkbook,
     eraseCurrentCell,
     openRetrieveNavigator,
+    openFileList,
     fileSaveFlow,
     quitApp,
     setStatus: (m) => { statusMsg = m; },

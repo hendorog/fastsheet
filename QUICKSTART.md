@@ -191,10 +191,10 @@ commits, Esc cancels.
 /F S      Save — see "Files" below for the picker dialog
 /F C O    Compare against another file — opens a docked diff list
 /F C X    Compare exit — close the comparison and clear the dock
+/F L      List worksheet files in the directory
 /F J      Combine                ⚠ not yet
 /F X      Xtract                 ⚠ not yet
 /F E      Erase a file from disk ⚠ not yet
-/F L      List files             ⚠ not yet
 /F I      Import a text file     ⚠ not yet
 /F D      Change directory       ⚠ not yet
 /F A      Admin                  ⚠ not yet
