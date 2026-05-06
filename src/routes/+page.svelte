@@ -25,6 +25,7 @@
     WorkbookInfo,
     SaveResult,
     BackupResult,
+    WorkbookRange,
     DirListing,
     TraceNode,
     NamedRangeInfo,
@@ -855,6 +856,70 @@
       const path = normalizeXlsxPath(rawPath);
       const label = `${addr(r1, c1)}:${addr(r2, c2)}`;
       await extractRangeToPath(path, rows, label);
+    });
+  }
+
+  function combineWorkbookPrompt() {
+    if (!workbook) {
+      statusMsg = "No workbook to combine into";
+      focusGrid();
+      return;
+    }
+    openMenuPrompt("Workbook to combine:", "", async (v) => {
+      const path = v.trim();
+      if (!path) { focusGrid(); return; }
+      let incoming: WorkbookRange;
+      try {
+        incoming = await invoke<WorkbookRange>("read_workbook_first_sheet", { path });
+      } catch (e) {
+        statusMsg = `Combine failed: ${e}`;
+        focusGrid();
+        return;
+      }
+      const rows = incoming.rows;
+      const outputRows = Math.min(rows.length, ABS_MAX_ROWS - selRow + 1);
+      const outputCols = Math.min(
+        rows.reduce((max, row) => Math.max(max, row.length), 1),
+        ABS_MAX_COLS - selCol + 1,
+      );
+      await fetchBand(selRow, selRow + outputRows - 1, selCol, selCol + outputCols - 1).then((result) => {
+        if (!result) return;
+        const newCells = new Map(cells);
+        for (let r = selRow; r < selRow + outputRows; r++) {
+          for (let c = selCol; c < selCol + outputCols; c++) newCells.delete(key(r, c));
+        }
+        for (const c of result.list) newCells.set(key(c.row, c.col), c);
+        cells = newCells;
+      });
+      const sheet = activeSheet;
+      const edits: EditOp[] = [];
+      for (let r = 0; r < outputRows; r++) {
+        for (let c = 0; c < outputCols; c++) {
+          const row = selRow + r;
+          const col = selCol + c;
+          const next = rows[r][c] ?? "";
+          const prev = cells.get(key(row, col))?.input ?? "";
+          if (prev !== next) edits.push({ row, col, prev, next });
+        }
+      }
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+      if (edits.length > 0) markWorkbookDirty();
+      await refreshRows(selRow, selRow + outputRows - 1);
+      noteRecalcPending(edits.length);
+      pushHistory({
+        description: `Combine ${path} at ${addr(selRow, selCol)}`,
+        sheet,
+        edits,
+      });
+      rangeEndRow = selRow + outputRows - 1;
+      rangeEndCol = selCol + outputCols - 1;
+      const clipped = outputRows < incoming.source_rows || outputCols < incoming.source_cols;
+      statusMsg = `Combined ${incoming.sheet_name}: ${outputRows} row${outputRows === 1 ? "" : "s"} x ${outputCols} col${outputCols === 1 ? "" : "s"}${clipped ? " (clipped to sheet bounds)" : ""}`;
+      focusGrid();
     });
   }
 
@@ -3720,6 +3785,7 @@
     eraseFile: eraseFilePrompt,
     importTextFile: importTextFilePrompt,
     extractRange: extractRangePrompt,
+    combineWorkbook: combineWorkbookPrompt,
     fileSaveFlow,
     quitApp,
     setStatus: (m) => { statusMsg = m; },

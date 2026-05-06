@@ -59,6 +59,43 @@ pub(crate) struct BackupResult {
     backup_path: String,
 }
 
+#[derive(Serialize)]
+pub(crate) struct WorkbookRange {
+    sheet_name: String,
+    rows: Vec<Vec<String>>,
+    source_rows: u32,
+    source_cols: u32,
+    cells_read: usize,
+}
+
+fn load_model_for_import(path: &str) -> Result<Model<'static>, String> {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return Err(format!("file does not exist: {path}"));
+    }
+    if !p.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    let is_xls = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.eq_ignore_ascii_case("xls"))
+        .unwrap_or(false);
+    let mut model = if is_xls {
+        let (m, _, _) = load_xls(path)?;
+        m
+    } else {
+        let bytes = std::fs::read(path).ok();
+        let mut m = load_xlsx_with_fallback(path)?;
+        if let Some(b) = &bytes {
+            let _ = replicate_my_array_formulas(&mut m, b);
+        }
+        m
+    };
+    model.evaluate();
+    Ok(model)
+}
+
 #[tauri::command]
 pub(crate) fn open_workbook(
     path: String,
@@ -249,6 +286,53 @@ pub(crate) fn extract_cells_to_workbook(
         cells_patched: cells_written,
         backup_path,
         vba_preserved: false,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn read_workbook_first_sheet(path: String) -> Result<WorkbookRange, String> {
+    let model = load_model_for_import(&path)?;
+    let ws = model
+        .workbook
+        .worksheets
+        .first()
+        .ok_or("workbook has no sheets")?;
+    let mut min_row = i32::MAX;
+    let mut min_col = i32::MAX;
+    let mut max_row = 0i32;
+    let mut max_col = 0i32;
+    let mut cells = Vec::new();
+    for (row, cols) in &ws.sheet_data {
+        for col in cols.keys() {
+            let input = model
+                .get_localized_cell_content(0, *row, *col)
+                .unwrap_or_default();
+            if input.is_empty() {
+                continue;
+            }
+            min_row = min_row.min(*row);
+            min_col = min_col.min(*col);
+            max_row = max_row.max(*row);
+            max_col = max_col.max(*col);
+            cells.push((*row, *col, input));
+        }
+    }
+    if cells.is_empty() {
+        return Err(format!("no populated cells in first sheet of {path}"));
+    }
+    let source_rows = (max_row - min_row + 1) as u32;
+    let source_cols = (max_col - min_col + 1) as u32;
+    let mut rows = vec![vec![String::new(); source_cols as usize]; source_rows as usize];
+    let cells_read = cells.len();
+    for (row, col, input) in cells {
+        rows[(row - min_row) as usize][(col - min_col) as usize] = input;
+    }
+    Ok(WorkbookRange {
+        sheet_name: ws.name.clone(),
+        rows,
+        source_rows,
+        source_cols,
+        cells_read,
     })
 }
 

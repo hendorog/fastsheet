@@ -93,6 +93,14 @@ export type SaveResult = {
   vba_preserved?: boolean;
 };
 
+export type WorkbookRange = {
+  sheet_name: string;
+  rows: string[][];
+  source_rows: number;
+  source_cols: number;
+  cells_read: number;
+};
+
 export type BackupResult = { save: SaveResult; backup_path: string };
 
 export type TraceNode = {
