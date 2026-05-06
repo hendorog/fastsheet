@@ -512,6 +512,7 @@ pub(crate) enum StyleOp {
     SetTextColor { color: String },
     ClearFillColor,
     ClearTextColor,
+    ClearFormat,
     /// Apply a thin black border to one or more sides of every cell. The
     /// `where` field selects which sides get the border (combinations
     /// expressed as comma-separated tokens for simplicity).
@@ -558,6 +559,14 @@ pub(crate) fn set_range_style(
     for r in r1..=r2 {
         for c in c1..=c2 {
             let prev_idx = model.get_cell_style_index(sheet, r, c)?;
+            if matches!(&op, StyleOp::ClearFormat) {
+                model.workbook.worksheet_mut(sheet)?.set_cell_style(r, c, 0)?;
+                let next_idx = model.get_cell_style_index(sheet, r, c)?;
+                prev_indices.push(prev_idx);
+                next_indices.push(next_idx);
+                n += 1;
+                continue;
+            }
             let mut s = model.get_style_for_cell(sheet, r, c)?;
             match &op {
                 StyleOp::ToggleBold => s.font.b = toggle_target.unwrap(),
@@ -643,6 +652,7 @@ pub(crate) fn set_range_style(
                 StyleOp::ClearTextColor => {
                     s.font.color = None;
                 }
+                StyleOp::ClearFormat => {}
                 StyleOp::SetBorder { sides } => {
                     let item = BorderItem {
                         style: BorderStyle::Thin,

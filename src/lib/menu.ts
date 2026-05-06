@@ -35,6 +35,7 @@ export type MenuCallbacks = {
   // Range/Format. Variants that take decimals raise the inline prompt;
   // others apply directly to the current selection.
   formatRange: (kind: FormatKind) => void | Promise<void>;
+  clearFormats: () => void | Promise<void>;
   // Range/Search — opens the find-then-replace inline prompt chain.
   searchRange: () => void | Promise<void>;
   // Range/Label — text alignment.
@@ -248,7 +249,8 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
             { letter: "R", label: "Reset", description: "Clear bold / italic / underline / strike / text colour", action: () => cb.attrRange("reset") },
           ],
         },
-        { letter: "E", label: "Erase", description: "Erase the contents of the current cell", action: cb.eraseCurrentCell },
+        { letter: "E", label: "Erase", description: "Erase the selected cells' contents", action: cb.eraseCurrentCell },
+        { letter: "C", label: "Clear Formats", description: "Clear formatting from the selected cells", action: cb.clearFormats },
         {
           letter: "N", label: "Name",
           description: "Create / delete / list named ranges",
@@ -265,7 +267,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
         { letter: "V", label: "Value", description: "Convert formulas in the selection to their literal values", action: cb.rangeValue },
         { letter: "T", label: "Trans", description: "Transpose the selection (rows ↔ cols, in place)", action: cb.rangeTrans },
         { letter: "M", label: "Merge", description: "Merge the selected cells into one display cell", action: cb.mergeCells },
-        { letter: "U", label: "Unmerge", description: "Unmerge any merged cells overlapping the selection", action: cb.unmergeCells },
+        { letter: "G", label: "Unmerge", description: "Unmerge any merged cells overlapping the selection", action: cb.unmergeCells },
         { letter: "S", label: "Search", description: "Find and (optionally) replace within the active sheet", action: cb.searchRange },
       ],
     },

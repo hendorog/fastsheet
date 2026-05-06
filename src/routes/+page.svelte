@@ -2848,6 +2848,10 @@
     applyStyleOp(op, label);
   }
 
+  function clearFormats() {
+    applyStyleOp({ kind: "clear_format" }, "Cleared formats");
+  }
+
   /// Open the autocomplete color picker. Replaces the old hex-only
   /// prompt — the picker handles named-color autocomplete + custom
   /// HSL editing internally. `recents` are seeded from the workbook's
@@ -3309,6 +3313,7 @@
     mergeCells: mergeSelectedCells,
     unmergeCells: unmergeSelectedCells,
     formatRange,
+    clearFormats,
     searchRange: openFindReplace,
     alignRange,
     attrRange,
@@ -4113,6 +4118,7 @@
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentRow(); }}>Hide row</button>
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentColumn(); }}>Hide column</button>
       <button type="button" onclick={() => { closeContextMenu(); eraseCurrentCell(); }}>Erase</button>
+      <button type="button" onclick={() => { closeContextMenu(); clearFormats(); }}>Clear formats</button>
     </div>
   {/if}
 

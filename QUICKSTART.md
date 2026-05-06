@@ -62,7 +62,7 @@ multi-cell selections, like Excel.
 - **Esc** — cancel, restore original content.
 - **F4** while editing — cycle the cell reference under the caret
   through `A1 → $A$1 → A$1 → $A1 → A1` (the standard Excel toggle).
-- **Backspace / Delete** — clear the cell's content (when not
+- **Backspace / Delete** — clear the selected cells' contents (when not
   editing).
 
 ### F2 edit highlights
@@ -155,14 +155,15 @@ will do.
 /R L G    Label General — reset (numbers right, text left)
 Ctrl+1    Format Cells dialog — number, font, border, fill, alignment,
           vertical alignment, and wrap text
-/R E      Erase current cell content (preserves formatting)
+/R E      Erase selected cell contents (preserves formatting)
+/R C      Clear Formats — clear formatting from the selected cells
 /R N C    Name Create — define a name for the current selection
 /R N D    Name Delete — delete a defined name
 /R N L    Name List — drop the names list into the worksheet
 /R V      Value — convert formulas in the selection to literal values
 /R T      Trans — transpose the selection in place
 /R M      Merge — merge the selected cells
-/R U      Unmerge — unmerge any merged cells overlapping the selection
+/R G      Unmerge — unmerge any merged cells overlapping the selection
 /R S      Search — find and (optionally) replace within the sheet
 /R J      Justify a range of labels    ⚠ not yet
 /R P      Protect a range              ⚠ not yet
@@ -409,7 +410,7 @@ EDITING
   Enter / Tab           Commit and move
   Esc                   Cancel edit
   F4                    Cycle ref absolute/relative under caret
-  Backspace / Delete    Clear cell
+  Backspace / Delete    Clear selected cells
 
 UNDO / REDO
   Ctrl+Z                Undo
