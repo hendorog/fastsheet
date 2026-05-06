@@ -195,7 +195,7 @@ commits, Esc cancels.
 /F J      Combine                ⚠ not yet
 /F X      Xtract                 ⚠ not yet
 /F E      Erase a file from disk (with confirm)
-/F I      Import a text file     ⚠ not yet
+/F I      Import a text/CSV/TSV file into cells
 /F D      Change directory
 /F A      Admin                  ⚠ not yet
 ```

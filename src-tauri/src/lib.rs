@@ -88,6 +88,7 @@ pub fn run() {
             workbook::workbook_has_unsaved_changes,
             workbook::file_exists,
             workbook::erase_file,
+            workbook::read_text_file,
             workbook::backup_and_save,
             workbook::compare_open,
             workbook::compare_close,

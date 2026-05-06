@@ -853,6 +853,82 @@
     });
   }
 
+  function detectTextDelimiter(text: string): string {
+    const sample = text.split(/\r?\n/, 10).join("\n");
+    const tabs = (sample.match(/\t/g) ?? []).length;
+    const commas = (sample.match(/,/g) ?? []).length;
+    const semis = (sample.match(/;/g) ?? []).length;
+    if (tabs >= commas && tabs >= semis && tabs > 0) return "\t";
+    if (semis > commas) return ";";
+    return ",";
+  }
+
+  function importTextFilePrompt() {
+    openMenuPrompt("Text file to import:", "", async (v) => {
+      const path = v.trim();
+      if (!path) { focusGrid(); return; }
+      let text = "";
+      try {
+        text = await invoke<string>("read_text_file", { path });
+      } catch (e) {
+        statusMsg = `Import failed: ${e}`;
+        focusGrid();
+        return;
+      }
+      const delimiter = detectTextDelimiter(text);
+      const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+      const rows = lines.map((line) => parseDelimitedLine(line, delimiter));
+      if (rows.length === 0) {
+        statusMsg = `No rows in ${path}`;
+        focusGrid();
+        return;
+      }
+      const outputRows = Math.min(rows.length, ABS_MAX_ROWS - selRow + 1);
+      const outputCols = Math.min(
+        rows.reduce((max, row) => Math.max(max, row.length), 1),
+        ABS_MAX_COLS - selCol + 1,
+      );
+      await fetchBand(selRow, selRow + outputRows - 1, selCol, selCol + outputCols - 1).then((result) => {
+        if (!result) return;
+        const newCells = new Map(cells);
+        for (let r = selRow; r < selRow + outputRows; r++) {
+          for (let c = selCol; c < selCol + outputCols; c++) newCells.delete(key(r, c));
+        }
+        for (const c of result.list) newCells.set(key(c.row, c.col), c);
+        cells = newCells;
+      });
+      const sheet = activeSheet;
+      const edits: EditOp[] = [];
+      for (let r = 0; r < outputRows; r++) {
+        for (let c = 0; c < outputCols; c++) {
+          const row = selRow + r;
+          const col = selCol + c;
+          const next = rows[r][c] ?? "";
+          const prev = cells.get(key(row, col))?.input ?? "";
+          if (prev !== next) edits.push({ row, col, prev, next });
+        }
+      }
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+      if (edits.length > 0) markWorkbookDirty();
+      await refreshRows(selRow, selRow + outputRows - 1);
+      noteRecalcPending(edits.length);
+      pushHistory({
+        description: `Import ${path} at ${addr(selRow, selCol)}`,
+        sheet,
+        edits,
+      });
+      rangeEndRow = selRow + outputRows - 1;
+      rangeEndCol = selCol + outputCols - 1;
+      statusMsg = `Imported ${outputRows} row${outputRows === 1 ? "" : "s"} x ${outputCols} col${outputCols === 1 ? "" : "s"}`;
+      focusGrid();
+    });
+  }
+
   /// Lotus /F S flow. With no current path → Save As navigator.
   /// With current path that exists → Replace/SaveAs/Backup/Cancel picker.
   /// With current path that doesn't exist → straight save (new file).
@@ -3549,6 +3625,7 @@
     openFileList,
     changeDirectory,
     eraseFile: eraseFilePrompt,
+    importTextFile: importTextFilePrompt,
     fileSaveFlow,
     quitApp,
     setStatus: (m) => { statusMsg = m; },
