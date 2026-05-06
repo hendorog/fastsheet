@@ -484,6 +484,29 @@
     }
   }
 
+  /// Column auto-fit must inspect more than the current visible row band.
+  /// Fetch the selected columns across the used row span into the same
+  /// cell cache that autoFitColumnPx scans, without changing viewport
+  /// row/column loading state.
+  async function ensureColumnsLoadedForAutoFit(c1: number, c2: number) {
+    if (!workbook || c1 > c2) return;
+    let usedRows = viewportRows;
+    try {
+      const [r] = await invoke<[number, number]>("get_used_range", { sheet: activeSheet });
+      usedRows = Math.max(1, Math.min(viewportRows, r));
+    } catch {
+      usedRows = Math.max(1, Math.min(viewportRows, bandEnd > 0 ? bandEnd : 60));
+    }
+    const result = await fetchBand(1, usedRows, c1, c2);
+    if (!result) return;
+    const newCells = new Map(cells);
+    for (let r = 1; r <= usedRows; r++) {
+      for (let c = c1; c <= c2; c++) newCells.delete(key(r, c));
+    }
+    for (const c of result.list) newCells.set(key(c.row, c.col), c);
+    cells = newCells;
+  }
+
   /// Invalidate just the rows in [r1..r2] and re-fetch them. Used by
   /// edit paths that touched a known row range — much cheaper than a
   /// full refreshViewport because we don't drop the rest of the loaded
@@ -3320,6 +3343,8 @@
     const sheet = activeSheet;
     if (axis === "row" && size === "auto") {
       await ensureRowsLoaded(lo, hi);
+    } else if (axis === "col" && size === "auto") {
+      await ensureColumnsLoadedForAutoFit(lo, hi);
     }
     let count = 0;
     try {
