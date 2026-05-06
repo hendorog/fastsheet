@@ -809,6 +809,50 @@
     });
   }
 
+  function eraseFilePrompt() {
+    openMenuPrompt("File to erase:", currentPath || "", async (v) => {
+      const path = v.trim();
+      if (!path) { focusGrid(); return; }
+      let exists = false;
+      try {
+        exists = await invoke<boolean>("file_exists", { path });
+      } catch {
+        exists = false;
+      }
+      if (!exists) {
+        statusMsg = `File not found: ${path}`;
+        focusGrid();
+        return;
+      }
+      dynamicTitle = `Erase ${path}`;
+      dynamicLevel = [
+        {
+          letter: "Y",
+          label: "Yes",
+          description: `Permanently erase ${path}`,
+          action: async () => {
+            try {
+              await invoke("erase_file", { path });
+              if (currentPath === path) currentPath = "";
+              statusMsg = `Erased ${path}`;
+            } catch (e) {
+              statusMsg = `Erase failed: ${e}`;
+            }
+          },
+        },
+        {
+          letter: "N",
+          label: "No",
+          description: "Do not erase",
+          action: () => { statusMsg = "Erase cancelled"; },
+        },
+      ];
+      menuOpen = true;
+      menuPath = [];
+      menuHighlight = 0;
+    });
+  }
+
   /// Lotus /F S flow. With no current path → Save As navigator.
   /// With current path that exists → Replace/SaveAs/Backup/Cancel picker.
   /// With current path that doesn't exist → straight save (new file).
@@ -3504,6 +3548,7 @@
     openRetrieveNavigator,
     openFileList,
     changeDirectory,
+    eraseFile: eraseFilePrompt,
     fileSaveFlow,
     quitApp,
     setStatus: (m) => { statusMsg = m; },

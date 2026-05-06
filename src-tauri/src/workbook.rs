@@ -490,6 +490,18 @@ pub(crate) fn file_exists(path: String) -> bool {
     std::path::Path::new(&path).exists()
 }
 
+#[tauri::command]
+pub(crate) fn erase_file(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("file does not exist: {path}"));
+    }
+    if !p.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    std::fs::remove_file(p).map_err(|e| e.to_string())
+}
+
 /// Load a second workbook from `path` and diff it against the active
 /// model. Returns the diff list + missing-sheet summary; the right
 /// model stays in `state.compare` for trace integration. The active
