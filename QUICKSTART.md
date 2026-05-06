@@ -175,12 +175,14 @@ Ctrl+1    Format Cells dialog — number, font, border, fill, alignment,
 /R J      Justify text in the selected range
 /R P      Protect a range for this session
 /R U      Unprotect overlapping protected ranges
-/R I      Restrict input               ⚠ not yet
+/R I S    Input Selection — allow input only in the current selection
+/R I C    Input Clear — clear input restrictions on this sheet
 ```
 
 Protected ranges block normal cell edits until the workbook is closed
 or a new workbook is opened. Persisting protection into saved workbook
 metadata is not implemented yet.
+Input restrictions are also session scoped.
 
 Page breaks are shown in the grid for the current session. Saving them
 into workbook print settings is not implemented yet.

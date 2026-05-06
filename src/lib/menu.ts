@@ -74,6 +74,7 @@ export type MenuCallbacks = {
   nameList: () => void | Promise<void>;
   protectRange: () => void | Promise<void>;
   unprotectRange: () => void | Promise<void>;
+  restrictInput: (mode: "selection" | "clear") => void | Promise<void>;
   // /Range/Format/Border — apply thin black borders to the selection.
   setBorder: (sides: "all" | "outline" | "top" | "bottom" | "left" | "right" | "none") => void | Promise<void>;
   // /Worksheet/Sheet — sheet management mirrors the tab-bar context menu.
@@ -302,7 +303,14 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
         { letter: "J", label: "Justify", description: "Justify text across the selected range", action: () => cb.alignRange("justify") },
         { letter: "P", label: "Prot", description: "Protect a range from changes", action: cb.protectRange },
         { letter: "U", label: "Unprot", description: "Unprotect a range", action: cb.unprotectRange },
-        { letter: "I", label: "Input", description: "Restrict input to unprotected cells", action: stb("Range/Input") },
+        {
+          letter: "I", label: "Input",
+          description: "Restrict input to a selected range",
+          children: [
+            { letter: "S", label: "Selection", description: "Allow input only in the current selection", action: () => cb.restrictInput("selection") },
+            { letter: "C", label: "Clear", description: "Clear input restrictions on this sheet", action: () => cb.restrictInput("clear") },
+          ],
+        },
         { letter: "V", label: "Value", description: "Convert formulas in the selection to their literal values", action: cb.rangeValue },
         { letter: "T", label: "Trans", description: "Transpose the selection (rows ↔ cols, in place)", action: cb.rangeTrans },
         { letter: "M", label: "Merge", description: "Merge the selected cells into one display cell", action: cb.mergeCells },

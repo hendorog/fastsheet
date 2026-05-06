@@ -909,6 +909,35 @@
     focusGrid();
   }
 
+  async function restrictInput(mode: "selection" | "clear") {
+    if (!workbook) {
+      statusMsg = "No workbook open";
+      focusGrid();
+      return;
+    }
+    if (mode === "clear") {
+      try {
+        const cleared = await invoke<boolean>("clear_input_restriction", { sheet: activeSheet });
+        statusMsg = cleared ? "Input restriction cleared" : "No input restriction on this sheet";
+      } catch (e) {
+        statusMsg = `Input restriction failed: ${e}`;
+      }
+      focusGrid();
+      return;
+    }
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    try {
+      await invoke("restrict_input_range", { sheet: activeSheet, r1, c1, r2, c2 });
+      statusMsg = `Input restricted to ${addr(r1, c1)}:${addr(r2, c2)} for this session`;
+    } catch (e) {
+      statusMsg = `Input restriction failed: ${e}`;
+    }
+    focusGrid();
+  }
+
   function combineWorkbookPrompt() {
     if (!workbook) {
       statusMsg = "No workbook to combine into";
@@ -3916,6 +3945,7 @@
     nameList,
     protectRange: protectSelectedRange,
     unprotectRange: unprotectSelectedRange,
+    restrictInput,
     setBorder,
     sheetNew: addSheet,
     sheetDelete: () => deleteSheetConfirm(activeSheet),

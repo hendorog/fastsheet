@@ -211,6 +211,7 @@ pub(crate) fn open_workbook(
     // confuse more than help.
     *state.compare.lock().unwrap() = None;
     state.protected_ranges.lock().unwrap().clear();
+    state.input_ranges.lock().unwrap().clear();
     let _ = record_open_internal(&state, &path);
     lap(&mut t, "state_install");
     crate::util::profile_log(&format!(
@@ -244,6 +245,7 @@ pub(crate) fn new_workbook(state: State<'_, AppState>) -> Result<WorkbookInfo, S
     *state.workbook_dirty.lock().unwrap() = false;
     *state.compare.lock().unwrap() = None;
     state.protected_ranges.lock().unwrap().clear();
+    state.input_ranges.lock().unwrap().clear();
     Ok(info)
 }
 

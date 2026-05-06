@@ -107,6 +107,9 @@ pub(crate) struct AppState {
     /// command behavior for edit prevention; persistence in workbook
     /// protection records is a separate save/load concern.
     pub(crate) protected_ranges: Mutex<HashMap<u32, Vec<ProtectedRange>>>,
+    /// Session-scoped input allow-list. When a sheet has entries here,
+    /// set_cell accepts edits only inside one of these ranges.
+    pub(crate) input_ranges: Mutex<HashMap<u32, Vec<ProtectedRange>>>,
     /// File path passed on the command line (e.g. when Windows
     /// Explorer launches fastsheet via "Open with"). Captured once
     /// in `run()` from `std::env::args` and consumed by the frontend
@@ -130,6 +133,7 @@ impl AppState {
             xls_preserved: Mutex::new(None),
             compare: Mutex::new(None),
             protected_ranges: Mutex::new(HashMap::new()),
+            input_ranges: Mutex::new(HashMap::new()),
             startup_path: Mutex::new(None),
         }
     }

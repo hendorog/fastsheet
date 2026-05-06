@@ -21,6 +21,16 @@ fn cell_is_protected(state: &AppState, sheet: u32, row: u32, col: u32) -> bool {
         .unwrap_or(false)
 }
 
+fn cell_allowed_by_input_ranges(state: &AppState, sheet: u32, row: u32, col: u32) -> bool {
+    state
+        .input_ranges
+        .lock()
+        .unwrap()
+        .get(&sheet)
+        .map(|ranges| ranges.iter().any(|range| range.contains(row, col)))
+        .unwrap_or(true)
+}
+
 /// Flat snapshot of a cell's visual style — only what the frontend renders.
 /// `None`-style cells use the workbook default (no inline CSS needed).
 #[derive(Serialize, Default)]
@@ -320,6 +330,9 @@ pub(crate) fn set_cell(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    if !cell_allowed_by_input_ranges(&state, sheet, row, col) {
+        return Err(format!("cell {}{} is outside the input range", col_letter(col), row));
+    }
     if cell_is_protected(&state, sheet, row, col) {
         return Err(format!("cell {}{} is protected", col_letter(col), row));
     }
@@ -397,6 +410,24 @@ pub(crate) fn unprotect_range(
     let before = ranges.len();
     ranges.retain(|range| !range.overlaps(&target));
     before - ranges.len()
+}
+
+#[tauri::command]
+pub(crate) fn restrict_input_range(
+    sheet: u32,
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+    state: State<'_, AppState>,
+) {
+    let range = ProtectedRange::normalized(r1, c1, r2, c2);
+    state.input_ranges.lock().unwrap().insert(sheet, vec![range]);
+}
+
+#[tauri::command]
+pub(crate) fn clear_input_restriction(sheet: u32, state: State<'_, AppState>) -> bool {
+    state.input_ranges.lock().unwrap().remove(&sheet).is_some()
 }
 
 #[tauri::command]

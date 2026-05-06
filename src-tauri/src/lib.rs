@@ -104,6 +104,8 @@ pub fn run() {
             cells::set_cell,
             cells::protect_range,
             cells::unprotect_range,
+            cells::restrict_input_range,
+            cells::clear_input_restriction,
             cells::set_show_grid_lines,
             cells::get_layout,
             cells::get_sheet_dim,
