@@ -131,7 +131,9 @@ will do.
 /W W H    Window Horizontal — split rows above
 /W W V    Window Vertical — split cols left
 /W W U    Window Unsplit — remove splits
-/W P      Page break settings       ⚠ not yet
+/W P H    Page Horizontal — session page break above cursor row
+/W P V    Page Vertical — session page break left of cursor column
+/W P C    Page Clear — clear session page breaks on this sheet
 ```
 
 ### `/R` Range
@@ -179,6 +181,9 @@ Ctrl+1    Format Cells dialog — number, font, border, fill, alignment,
 Protected ranges block normal cell edits until the workbook is closed
 or a new workbook is opened. Persisting protection into saved workbook
 metadata is not implemented yet.
+
+Page breaks are shown in the grid for the current session. Saving them
+into workbook print settings is not implemented yet.
 
 ### `/C` Copy and `/M` Move
 

@@ -62,9 +62,13 @@
   let frozenCols = $state(0);
   let showGridLines = $state(true);
   let mergedRanges = $state<string[]>([]);
+  let pageBreakRowsBySheet = $state<Record<number, number[]>>({});
+  let pageBreakColsBySheet = $state<Record<number, number[]>>({});
 
   let workbook = $state<WorkbookInfo | null>(null);
   let activeSheet = $state(0);
+  let pageBreakRows = $derived(new Set(pageBreakRowsBySheet[activeSheet] ?? []));
+  let pageBreakCols = $derived(new Set(pageBreakColsBySheet[activeSheet] ?? []));
   let cells = $state<Map<string, CellView>>(new Map());
   let colWidths = $state<Map<number, number>>(new Map());
   let rowHeights = $state<Map<number, number>>(new Map());
@@ -659,6 +663,8 @@
     historyIdx = 0;
     sheetCursors = new Map();
     pendingRecalcEdits = 0;
+    pageBreakRowsBySheet = {};
+    pageBreakColsBySheet = {};
     workbookDirty = false;
     await resizeViewportToSheet();
     await refreshViewport({ clear: true });
@@ -688,6 +694,8 @@
       historyIdx = 0;
       sheetCursors = new Map();
       pendingRecalcEdits = 0;
+      pageBreakRowsBySheet = {};
+      pageBreakColsBySheet = {};
       workbookDirty = false;
       await resizeViewportToSheet();
       await refreshViewport({ clear: true });
@@ -1294,6 +1302,32 @@
       statusMsg = show ? "Grid lines: Show" : "Grid lines: Hide";
     } catch (e) {
       statusMsg = `Grid line setting failed: ${e}`;
+    }
+    focusGrid();
+  }
+
+  function setPageBreak(axis: "horizontal" | "vertical" | "clear") {
+    if (axis === "clear") {
+      const hadRows = (pageBreakRowsBySheet[activeSheet] ?? []).length;
+      const hadCols = (pageBreakColsBySheet[activeSheet] ?? []).length;
+      pageBreakRowsBySheet = { ...pageBreakRowsBySheet, [activeSheet]: [] };
+      pageBreakColsBySheet = { ...pageBreakColsBySheet, [activeSheet]: [] };
+      statusMsg = hadRows + hadCols === 0 ? "No page breaks to clear" : "Page breaks cleared";
+      focusGrid();
+      return;
+    }
+    if (axis === "horizontal") {
+      const row = Math.max(1, selRow);
+      const rows = new Set(pageBreakRowsBySheet[activeSheet] ?? []);
+      rows.add(row);
+      pageBreakRowsBySheet = { ...pageBreakRowsBySheet, [activeSheet]: [...rows].sort((a, b) => a - b) };
+      statusMsg = `Horizontal page break above row ${row}`;
+    } else {
+      const col = Math.max(1, selCol);
+      const cols = new Set(pageBreakColsBySheet[activeSheet] ?? []);
+      cols.add(col);
+      pageBreakColsBySheet = { ...pageBreakColsBySheet, [activeSheet]: [...cols].sort((a, b) => a - b) };
+      statusMsg = `Vertical page break left of ${addr(1, col).replace(/\d+$/, "")}`;
     }
     focusGrid();
   }
@@ -3893,6 +3927,7 @@
     compareExit,
     setRecalcMode,
     setGridLines,
+    setPageBreak,
     recalcNow: recalcWorkbook,
   });
 
@@ -4594,6 +4629,8 @@
     {frozenRows}
     {frozenCols}
     {showGridLines}
+    {pageBreakRows}
+    {pageBreakCols}
     {mergedRanges}
     {ghostRange}
     highlights={[

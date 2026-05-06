@@ -92,6 +92,7 @@ export type MenuCallbacks = {
   // runs after every set_cell — useful for very large workbooks.
   setRecalcMode: (mode: "automatic" | "manual") => void | Promise<void>;
   setGridLines: (show: boolean) => void | Promise<void>;
+  setPageBreak: (axis: "horizontal" | "vertical" | "clear") => void | Promise<void>;
   /// Trigger a full workbook recalc. Bound to F9 globally too; the
   /// menu version exists so /W G R doesn't lock the user out of an
   /// immediate recalc when manual mode is active.
@@ -221,7 +222,15 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
             { letter: "R", label: "Rename", description: "Rename the current sheet", action: cb.sheetRename },
           ],
         },
-        { letter: "P", label: "Page", description: "Page break settings", action: stb("Worksheet/Page") },
+        {
+          letter: "P", label: "Page",
+          description: "Page break settings",
+          children: [
+            { letter: "H", label: "Horizontal", description: "Add a horizontal page break above the cursor row", action: () => cb.setPageBreak("horizontal") },
+            { letter: "V", label: "Vertical", description: "Add a vertical page break left of the cursor column", action: () => cb.setPageBreak("vertical") },
+            { letter: "C", label: "Clear", description: "Clear session page breaks on this sheet", action: () => cb.setPageBreak("clear") },
+          ],
+        },
       ],
     },
     {

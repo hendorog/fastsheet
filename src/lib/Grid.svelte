@@ -27,6 +27,8 @@
     /// Number of cols pinned to the left (sticky). 0 = no vertical freeze.
     frozenCols: number;
     showGridLines?: boolean;
+    pageBreakRows?: Set<number>;
+    pageBreakCols?: Set<number>;
     /// A1-style merged ranges from worksheet.merge_cells (e.g. "A1:B2").
     mergedRanges: string[];
     /// Optional "ghost" overlay rectangle — used for /Copy /Move
@@ -81,6 +83,8 @@
     frozenRows,
     frozenCols,
     showGridLines = true,
+    pageBreakRows = new Set(),
+    pageBreakCols = new Set(),
     mergedRanges,
     ghostRange,
     highlights = [],
@@ -685,6 +689,8 @@
       class:frozen-row={isFrozenRow}
       class:frozen-col={isFrozenCol}
       class:frozen-corner={isFrozenRow && isFrozenCol}
+      class:page-break-row={pageBreakRows.has(rowIdx)}
+      class:page-break-col={pageBreakCols.has(colIdx)}
       class:merged={merge != null}
       colspan={merge?.colspan ?? null}
       rowspan={merge?.rowspan ?? null}
@@ -962,6 +968,12 @@
   }
   .grid-no-lines .cell {
     border-color: transparent;
+  }
+  .cell.page-break-row {
+    border-top: 2px dashed #2563eb;
+  }
+  .cell.page-break-col {
+    border-left: 2px dashed #2563eb;
   }
   /* Spacer rows that absorb the rows skipped by row virtualisation.
      Their height keeps the table's total geometry equal to the sum of
