@@ -1474,6 +1474,15 @@
     | { kind: "style"; description: string; sheet: number; edit: StyleEdit };
   let history = $state<UndoEntry[]>([]);
   let historyIdx = $state(0);
+  type InternalClipboard = {
+    sheet: number;
+    r1: number;
+    c1: number;
+    rows: string[][];
+    displayTsv: string;
+    cut: boolean;
+  };
+  let internalClipboard: InternalClipboard | null = null;
 
   function pushHistory(entry: { description: string; sheet: number; edits: EditOp[] } | UndoEntry) {
     let normalized: UndoEntry;
@@ -1564,9 +1573,9 @@
 
   /// Copy / cut the active selection to the OS clipboard as TSV (Excel-
   /// and Google-Sheets-compatible). Cut additionally clears the cells.
-  /// Values-only — formula text is not preserved (to round-trip formulas
-  /// internally we'd need relative-ref adjustment, which IronCalc has but
-  /// we haven't wired yet).
+  /// The OS clipboard stays display-value TSV for external apps; FastSheet
+  /// also keeps an in-memory clipboard with raw inputs so internal paste
+  /// can preserve formulas and adjust relative references.
   async function copySelection(cut: boolean) {
     const r1 = Math.min(selRow, rangeEndRow);
     const r2 = Math.max(selRow, rangeEndRow);
@@ -1582,12 +1591,21 @@
       lines.push(cols.join("\t"));
     }
     const tsv = lines.join("\n");
+    const rawRows: string[][] = [];
+    for (let r = r1; r <= r2; r++) {
+      const cols: string[] = [];
+      for (let c = c1; c <= c2; c++) {
+        cols.push(cells.get(key(r, c))?.input ?? "");
+      }
+      rawRows.push(cols);
+    }
     try {
       await navigator.clipboard.writeText(tsv);
     } catch (e) {
       statusMsg = `${cut ? "Cut" : "Copy"} failed: ${e}`;
       return;
     }
+    internalClipboard = { sheet: activeSheet, r1, c1, rows: rawRows, displayTsv: tsv, cut };
     if (cut) {
       const sheet = activeSheet;
       const edits: EditOp[] = [];
@@ -1614,10 +1632,69 @@
     statusMsg = `${cut ? "Cut" : "Copied"} ${h}×${w} range to clipboard`;
   }
 
+  function colToNumberFrontend(col: string): number {
+    let n = 0;
+    for (const ch of col.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64);
+    return n;
+  }
+
+  function numberToColFrontend(n: number): string {
+    let out = "";
+    while (n > 0) {
+      const rem = (n - 1) % 26;
+      out = String.fromCharCode(65 + rem) + out;
+      n = Math.floor((n - 1) / 26);
+    }
+    return out;
+  }
+
+  function adjustFormulaRefs(input: string, rowDelta: number, colDelta: number): string {
+    if (!input.startsWith("=")) return input;
+    const token = /(^|[^A-Za-z0-9_.$])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_])/g;
+    const adjustOutsideString = (segment: string) => segment.replace(token, (_match, prefix, absCol, col, absRow, rowText) => {
+      let row = Number(rowText);
+      let colNum = colToNumberFrontend(col);
+      if (!absRow) row += rowDelta;
+      if (!absCol) colNum += colDelta;
+      if (row < 1 || row > ABS_MAX_ROWS || colNum < 1 || colNum > ABS_MAX_COLS) return `${prefix}#REF!`;
+      return `${prefix}${absCol}${numberToColFrontend(colNum)}${absRow}${row}`;
+    });
+    let out = "";
+    let segment = "";
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i];
+      if (ch !== "\"") {
+        segment += ch;
+        continue;
+      }
+      out += adjustOutsideString(segment);
+      segment = "\"";
+      i++;
+      while (i < input.length) {
+        segment += input[i];
+        if (input[i] === "\"") {
+          if (input[i + 1] === "\"") {
+            i++;
+            segment += input[i];
+            i++;
+            continue;
+          }
+          break;
+        }
+        i++;
+      }
+      out += segment;
+      segment = "";
+    }
+    return out + adjustOutsideString(segment);
+  }
+
   /// Paste TSV from the OS clipboard at the cursor. Each \t becomes a
   /// column boundary, each \n a row boundary. Values land verbatim — for
   /// formula text starting with `=` IronCalc parses it back into a
-  /// formula on set_user_input.
+  /// formula on set_user_input. When the clipboard came from FastSheet,
+  /// paste raw inputs instead of display text and adjust relative formula
+  /// references by the paste offset.
   async function pasteFromClipboard() {
     let text: string;
     try {
@@ -1630,12 +1707,19 @@
       statusMsg = "Clipboard empty";
       return;
     }
-    const rows = text.replace(/\r\n/g, "\n").split("\n");
-    while (rows.length > 0 && rows[rows.length - 1] === "") rows.pop();
+    const internal = internalClipboard && text === internalClipboard.displayTsv
+      ? internalClipboard
+      : null;
+    const rowDelta = internal && !internal.cut ? selRow - internal.r1 : 0;
+    const colDelta = internal && !internal.cut ? selCol - internal.c1 : 0;
+    const rows = internal
+      ? internal.rows.map((r) => r.map((v) => adjustFormulaRefs(v, rowDelta, colDelta)))
+      : text.replace(/\r\n/g, "\n").split("\n").map((r) => r.split("\t"));
+    while (rows.length > 0 && rows[rows.length - 1].length === 1 && rows[rows.length - 1][0] === "") rows.pop();
     const sheet = activeSheet;
     const edits: EditOp[] = [];
     for (let i = 0; i < rows.length; i++) {
-      const cols = rows[i].split("\t");
+      const cols = rows[i];
       for (let j = 0; j < cols.length; j++) {
         const r = selRow + i;
         const c = selCol + j;
@@ -1656,9 +1740,9 @@
       await refreshRows(editR1, editR2);
     }
     noteRecalcPending(edits.length);
-    const w = rows[0]?.split("\t").length ?? 0;
+    const w = rows[0]?.length ?? 0;
     pushHistory({
-      description: `Paste ${rows.length}×${w} at ${addr(selRow, selCol)}`,
+      description: internal ? `Paste internal ${rows.length}×${w} at ${addr(selRow, selCol)}` : `Paste ${rows.length}×${w} at ${addr(selRow, selCol)}`,
       sheet,
       edits,
     });

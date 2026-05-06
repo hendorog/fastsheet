@@ -415,6 +415,10 @@ CLIPBOARD
   Ctrl+C / Ctrl+X       Copy / cut selection
   Ctrl+V                Paste from clipboard
 
+  External clipboard uses display-value TSV. Pasting back inside
+  fastsheet from a fastsheet copy preserves raw formulas and adjusts
+  relative references to the new location.
+
 RECALC + SAVE
   F9                    Recalculate workbook
   Ctrl+S                /F S (save flow)
