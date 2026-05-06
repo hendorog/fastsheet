@@ -193,7 +193,16 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
             { letter: "C", label: "Clear", description: "Unfreeze all titles", action: () => cb.setTitles("clear") },
           ],
         },
-        { letter: "W", label: "Window", description: "Split or unsplit the window", action: stb("Worksheet/Window") },
+        {
+          letter: "W", label: "Window",
+          description: "Split or unsplit the window at the cursor",
+          children: [
+            { letter: "B", label: "Both", description: "Split rows above and cols left of the cursor", action: () => cb.setTitles("both") },
+            { letter: "H", label: "Horizontal", description: "Split rows above the cursor", action: () => cb.setTitles("horizontal") },
+            { letter: "V", label: "Vertical", description: "Split cols left of the cursor", action: () => cb.setTitles("vertical") },
+            { letter: "U", label: "Unsplit", description: "Remove window splits", action: () => cb.setTitles("clear") },
+          ],
+        },
         {
           letter: "S", label: "Sheet",
           description: "Add / delete / rename worksheets",

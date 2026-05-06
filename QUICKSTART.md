@@ -126,7 +126,10 @@ will do.
 /W S R    Sheet Rename — rename current sheet
 /W G R    Global Recalculation — Automatic / Manual / Now
 /W G      Other global settings     ⚠ not yet
-/W W      Window split / unsplit    ⚠ not yet
+/W W B    Window Both — split rows above + cols left of cursor
+/W W H    Window Horizontal — split rows above
+/W W V    Window Vertical — split cols left
+/W W U    Window Unsplit — remove splits
 /W P      Page break settings       ⚠ not yet
 ```
 
