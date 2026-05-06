@@ -116,6 +116,8 @@ pub fn run() {
             cells::insert_cells_shift_down,
             cells::delete_cells_shift_left,
             cells::delete_cells_shift_up,
+            cells::merge_cells,
+            cells::unmerge_cells,
             cells::set_range_number_format,
             cells::set_range_style,
             cells::apply_style_indices,

@@ -30,6 +30,8 @@ export type MenuCallbacks = {
   insertCellsDown: () => void | Promise<void>;
   deleteCellsLeft: () => void | Promise<void>;
   deleteCellsUp: () => void | Promise<void>;
+  mergeCells: () => void | Promise<void>;
+  unmergeCells: () => void | Promise<void>;
   // Range/Format. Variants that take decimals raise the inline prompt;
   // others apply directly to the current selection.
   formatRange: (kind: FormatKind) => void | Promise<void>;
@@ -262,6 +264,8 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
         { letter: "I", label: "Input", description: "Restrict input to unprotected cells", action: stb("Range/Input") },
         { letter: "V", label: "Value", description: "Convert formulas in the selection to their literal values", action: cb.rangeValue },
         { letter: "T", label: "Trans", description: "Transpose the selection (rows ↔ cols, in place)", action: cb.rangeTrans },
+        { letter: "M", label: "Merge", description: "Merge the selected cells into one display cell", action: cb.mergeCells },
+        { letter: "U", label: "Unmerge", description: "Unmerge any merged cells overlapping the selection", action: cb.unmergeCells },
         { letter: "S", label: "Search", description: "Find and (optionally) replace within the active sheet", action: cb.searchRange },
       ],
     },

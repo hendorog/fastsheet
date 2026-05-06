@@ -161,6 +161,8 @@ Ctrl+1    Format Cells dialog — number, font, border, fill, alignment,
 /R N L    Name List — drop the names list into the worksheet
 /R V      Value — convert formulas in the selection to literal values
 /R T      Trans — transpose the selection in place
+/R M      Merge — merge the selected cells
+/R U      Unmerge — unmerge any merged cells overlapping the selection
 /R S      Search — find and (optionally) replace within the sheet
 /R J      Justify a range of labels    ⚠ not yet
 /R P      Protect a range              ⚠ not yet

@@ -960,6 +960,123 @@ fn set_raw_cell(
     Ok(())
 }
 
+fn normalize_cell_range(
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+) -> Result<(i32, i32, i32, i32), String> {
+    let top = r1.min(r2);
+    let bottom = r1.max(r2);
+    let left = c1.min(c2);
+    let right = c1.max(c2);
+    if top < 1 || left < 1 || bottom > LAST_ROW || right > LAST_COLUMN {
+        return Err("Invalid cell range".to_string());
+    }
+    Ok((top, left, bottom, right))
+}
+
+fn format_cell_range(r1: i32, c1: i32, r2: i32, c2: i32) -> String {
+    let start = format!("{}{}", col_letter(c1 as u32), r1);
+    let end = format!("{}{}", col_letter(c2 as u32), r2);
+    if start == end {
+        start
+    } else {
+        format!("{start}:{end}")
+    }
+}
+
+fn parse_merge_range(range: &str) -> Option<(i32, i32, i32, i32)> {
+    let mut parts = range.split(':');
+    let first = parts.next()?.trim();
+    let second = parts.next().unwrap_or(first).trim();
+    if parts.next().is_some() {
+        return None;
+    }
+    let (r1, c1) = parse_a1_addr(first)?;
+    let (r2, c2) = parse_a1_addr(second)?;
+    normalize_cell_range(r1 as i32, c1 as i32, r2 as i32, c2 as i32).ok()
+}
+
+fn ranges_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    let (ar1, ac1, ar2, ac2) = a;
+    let (br1, bc1, br2, bc2) = b;
+    ar1 <= br2 && ar2 >= br1 && ac1 <= bc2 && ac2 >= bc1
+}
+
+/// Merge the selected rectangle. Existing overlapping merges are rejected
+/// rather than rewritten implicitly, which avoids silently destroying a
+/// separate layout decision.
+#[tauri::command]
+pub(crate) fn merge_cells(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let range = normalize_cell_range(r1, c1, r2, c2)?;
+    let (top, left, bottom, right) = range;
+    if top == bottom && left == right {
+        return Err("Select at least two cells to merge".to_string());
+    }
+    let range_label = format_cell_range(top, left, bottom, right);
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let ws = model
+        .workbook
+        .worksheets
+        .get_mut(sheet as usize)
+        .ok_or("bad sheet index")?;
+    for existing in &ws.merge_cells {
+        if let Some(existing_range) = parse_merge_range(existing) {
+            if existing_range == range {
+                return Ok(());
+            }
+            if ranges_overlap(existing_range, range) {
+                return Err(format!("Merge overlaps existing merged range {existing}"));
+            }
+        }
+    }
+    ws.merge_cells.push(range_label);
+    drop(guard);
+    *state.structural_dirty.lock().unwrap() = true;
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
+}
+
+/// Unmerge any merged ranges that overlap the selected rectangle.
+#[tauri::command]
+pub(crate) fn unmerge_cells(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let range = normalize_cell_range(r1, c1, r2, c2)?;
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let ws = model
+        .workbook
+        .worksheets
+        .get_mut(sheet as usize)
+        .ok_or("bad sheet index")?;
+    let before = ws.merge_cells.len();
+    ws.merge_cells.retain(|existing| {
+        parse_merge_range(existing).map_or(true, |r| !ranges_overlap(r, range))
+    });
+    let removed = before - ws.merge_cells.len();
+    drop(guard);
+    if removed > 0 {
+        *state.structural_dirty.lock().unwrap() = true;
+        *state.workbook_dirty.lock().unwrap() = true;
+    }
+    Ok(removed)
+}
+
 /// Insert blank cells and shift the affected row segment right.
 #[tauri::command]
 pub(crate) fn insert_cells_shift_right(

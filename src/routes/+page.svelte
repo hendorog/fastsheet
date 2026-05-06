@@ -3031,6 +3031,47 @@
     shiftCellsAtSel("delete_cells_shift_up", "Deleted cells up at");
   }
 
+  async function mergeSelectedCells() {
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
+    try {
+      await invoke("merge_cells", { sheet: activeSheet, r1, c1, r2, c2 });
+      markWorkbookDirty();
+      await refreshViewport();
+      statusMsg = `Merged ${span}`;
+    } catch (e) {
+      statusMsg = `Merge failed: ${e}`;
+    }
+  }
+
+  async function unmergeSelectedCells() {
+    const r1 = Math.min(selRow, rangeEndRow);
+    const r2 = Math.max(selRow, rangeEndRow);
+    const c1 = Math.min(selCol, rangeEndCol);
+    const c2 = Math.max(selCol, rangeEndCol);
+    try {
+      const removed = await invoke<number>("unmerge_cells", {
+        sheet: activeSheet,
+        r1,
+        c1,
+        r2,
+        c2,
+      });
+      if (removed > 0) {
+        markWorkbookDirty();
+        await refreshViewport();
+      }
+      statusMsg = removed === 0
+        ? "No merged cells in selection"
+        : `Unmerged ${removed} range${removed === 1 ? "" : "s"}`;
+    } catch (e) {
+      statusMsg = `Unmerge failed: ${e}`;
+    }
+  }
+
   async function setTitles(kind: "both" | "horizontal" | "vertical" | "clear") {
     let rows = 0;
     let cols = 0;
@@ -3265,6 +3306,8 @@
     insertCellsDown: insertCellsDownAtSel,
     deleteCellsLeft: deleteCellsLeftAtSel,
     deleteCellsUp: deleteCellsUpAtSel,
+    mergeCells: mergeSelectedCells,
+    unmergeCells: unmergeSelectedCells,
     formatRange,
     searchRange: openFindReplace,
     alignRange,
@@ -4064,6 +4107,8 @@
       <button type="button" onclick={() => { closeContextMenu(); deleteColumnsAtSel(); }}>Delete column</button>
       <button type="button" onclick={() => { closeContextMenu(); deleteCellsLeftAtSel(); }}>Delete cells left</button>
       <button type="button" onclick={() => { closeContextMenu(); deleteCellsUpAtSel(); }}>Delete cells up</button>
+      <button type="button" onclick={() => { closeContextMenu(); mergeSelectedCells(); }}>Merge cells</button>
+      <button type="button" onclick={() => { closeContextMenu(); unmergeSelectedCells(); }}>Unmerge cells</button>
       <hr />
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentRow(); }}>Hide row</button>
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentColumn(); }}>Hide column</button>
