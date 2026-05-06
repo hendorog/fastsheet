@@ -26,6 +26,7 @@
     frozenRows: number;
     /// Number of cols pinned to the left (sticky). 0 = no vertical freeze.
     frozenCols: number;
+    showGridLines?: boolean;
     /// A1-style merged ranges from worksheet.merge_cells (e.g. "A1:B2").
     mergedRanges: string[];
     /// Optional "ghost" overlay rectangle — used for /Copy /Move
@@ -79,6 +80,7 @@
     rangeEndCol = $bindable(),
     frozenRows,
     frozenCols,
+    showGridLines = true,
     mergedRanges,
     ghostRange,
     highlights = [],
@@ -742,7 +744,7 @@
   </tr>
 {/snippet}
 
-<div class="grid-wrap" tabindex="0" bind:this={gridWrapEl}>
+<div class:grid-no-lines={!showGridLines} class="grid-wrap" tabindex="0" bind:this={gridWrapEl}>
   <div
     class="grid-inner"
     style={`width:${tableWidthPx}px;`}
@@ -957,6 +959,9 @@
        relative` (`.cell-content { position: absolute; inset: 0 }`)
        and `contain: layout` (perf) both turned out to break this
        interaction silently. */
+  }
+  .grid-no-lines .cell {
+    border-color: transparent;
   }
   /* Spacer rows that absorb the rows skipped by row virtualisation.
      Their height keeps the table's total geometry equal to the sum of

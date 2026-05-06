@@ -60,6 +60,7 @@
   const VIEWPORT_GROW_COLS = 20;
   let frozenRows = $state(0);
   let frozenCols = $state(0);
+  let showGridLines = $state(true);
   let mergedRanges = $state<string[]>([]);
 
   let workbook = $state<WorkbookInfo | null>(null);
@@ -408,6 +409,7 @@
     colWidths = cw;
     frozenRows = layout.frozen_rows;
     frozenCols = layout.frozen_cols;
+    showGridLines = layout.show_grid_lines;
     mergedRanges = layout.merged_ranges;
   }
 
@@ -1282,6 +1284,18 @@
     } catch (e) {
       statusMsg = `Set recalc mode failed: ${e}`;
     }
+  }
+
+  async function setGridLines(show: boolean) {
+    try {
+      await invoke("set_show_grid_lines", { sheet: activeSheet, show });
+      showGridLines = show;
+      markWorkbookDirty();
+      statusMsg = show ? "Grid lines: Show" : "Grid lines: Hide";
+    } catch (e) {
+      statusMsg = `Grid line setting failed: ${e}`;
+    }
+    focusGrid();
   }
 
   /// /File Compare Open — pick a file via the navigator, then load+diff.
@@ -3878,6 +3892,7 @@
     compareOpen,
     compareExit,
     setRecalcMode,
+    setGridLines,
     recalcNow: recalcWorkbook,
   });
 
@@ -4578,6 +4593,7 @@
     cols={viewportCols}
     {frozenRows}
     {frozenCols}
+    {showGridLines}
     {mergedRanges}
     {ghostRange}
     highlights={[

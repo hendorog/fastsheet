@@ -91,6 +91,7 @@ export type MenuCallbacks = {
   // Lotus 1-2-3 path: /W G R. Manual disables the auto-evaluate that
   // runs after every set_cell — useful for very large workbooks.
   setRecalcMode: (mode: "automatic" | "manual") => void | Promise<void>;
+  setGridLines: (show: boolean) => void | Promise<void>;
   /// Trigger a full workbook recalc. Bound to F9 globally too; the
   /// menu version exists so /W G R doesn't lock the user out of an
   /// immediate recalc when manual mode is active.
@@ -133,6 +134,14 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
                 { letter: "A", label: "Automatic", description: "Recalc after every cell edit (default — matches Excel)", action: () => cb.setRecalcMode("automatic") },
                 { letter: "M", label: "Manual", description: "Recalc only on F9 — useful for very large workbooks", action: () => cb.setRecalcMode("manual") },
                 { letter: "N", label: "Now", description: "Recalc the entire workbook now (F9)", action: cb.recalcNow },
+              ],
+            },
+            {
+              letter: "G", label: "Grid",
+              description: "Show or hide worksheet grid lines",
+              children: [
+                { letter: "S", label: "Show", description: "Show worksheet grid lines", action: () => cb.setGridLines(true) },
+                { letter: "H", label: "Hide", description: "Hide worksheet grid lines", action: () => cb.setGridLines(false) },
               ],
             },
           ],

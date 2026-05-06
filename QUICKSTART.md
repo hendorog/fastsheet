@@ -125,7 +125,8 @@ will do.
 /W S D    Sheet Delete — remove current sheet (with confirm)
 /W S R    Sheet Rename — rename current sheet
 /W G R    Global Recalculation — Automatic / Manual / Now
-/W G      Other global settings     ⚠ not yet
+/W G G S  Global Grid Show — show worksheet grid lines
+/W G G H  Global Grid Hide — hide worksheet grid lines
 /W W B    Window Both — split rows above + cols left of cursor
 /W W H    Window Horizontal — split rows above
 /W W V    Window Vertical — split cols left

@@ -31,6 +31,7 @@ export type LayoutData = {
   frozen_rows: number;
   frozen_cols: number;
   merged_ranges: string[];
+  show_grid_lines: boolean;
 };
 
 export type WorkbookInfo = { sheet_names: string[]; active_sheet: number };

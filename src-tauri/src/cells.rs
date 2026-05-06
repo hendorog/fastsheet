@@ -171,6 +171,8 @@ pub(crate) struct LayoutData {
     /// Merged-cell ranges as A1-style strings (e.g. "A1:B2"). Frontend
     /// renders the anchor with colspan/rowspan and skips the others.
     merged_ranges: Vec<String>,
+    /// Whether worksheet grid lines should be drawn.
+    show_grid_lines: bool,
 }
 
 /// Read a rectangular block of cells [start_row..=end_row, start_col..=end_col] (1-indexed).
@@ -298,6 +300,7 @@ pub(crate) fn get_layout(
         frozen_rows: ws.frozen_rows,
         frozen_cols: ws.frozen_columns,
         merged_ranges: ws.merge_cells.clone(),
+        show_grid_lines: ws.show_grid_lines,
     };
     crate::util::profile_log(&format!(
         "[get_layout] sheet={} rows={} cols={} {:>7.1}ms",
@@ -394,6 +397,20 @@ pub(crate) fn unprotect_range(
     let before = ranges.len();
     ranges.retain(|range| !range.overlaps(&target));
     before - ranges.len()
+}
+
+#[tauri::command]
+pub(crate) fn set_show_grid_lines(
+    sheet: u32,
+    show: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    model.set_show_grid_lines(sheet, show)?;
+    drop(guard);
+    *state.workbook_dirty.lock().unwrap() = true;
+    Ok(())
 }
 
 /// Get / set auto-recalc state. The frontend uses these for the
