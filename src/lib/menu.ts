@@ -10,6 +10,8 @@ export type MenuCallbacks = {
   importTextFile: () => void | Promise<void>;
   extractRange: () => void | Promise<void>;
   combineWorkbook: () => void | Promise<void>;
+  fileAdminInfo: () => void | Promise<void>;
+  fileAdminBackup: () => void | Promise<void>;
   fileSaveFlow: () => void | Promise<void>;
   quitApp: () => void | Promise<void>;
   setStatus: (msg: string) => void;
@@ -345,7 +347,14 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
         { letter: "L", label: "List", description: "List worksheet files in the directory", action: cb.openFileList },
         { letter: "I", label: "Import", description: "Import a text file as cells", action: cb.importTextFile },
         { letter: "D", label: "Directory", description: "Change the current directory", action: cb.changeDirectory },
-        { letter: "A", label: "Admin", description: "File admin operations", action: stb("File/Admin") },
+        {
+          letter: "A", label: "Admin",
+          description: "File admin operations",
+          children: [
+            { letter: "I", label: "Info", description: "Show current workbook path, sheets and dirty state", action: cb.fileAdminInfo },
+            { letter: "B", label: "Backup", description: "Create a backup and save the current workbook", action: cb.fileAdminBackup },
+          ],
+        },
       ],
     },
     {

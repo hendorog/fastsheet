@@ -1013,6 +1013,24 @@
     }
   }
 
+  function fileAdminInfo() {
+    const path = currentPath || "(not saved)";
+    const dir = fileDirectory || "(default)";
+    const sheetCount = workbook?.sheet_names.length ?? 0;
+    statusMsg = `File: ${path} · dir: ${dir} · sheets: ${sheetCount} · ${workbookDirty ? "modified" : "clean"}`;
+    focusGrid();
+  }
+
+  async function fileAdminBackup() {
+    if (!currentPath) {
+      statusMsg = "Save the workbook before creating a backup";
+      focusGrid();
+      return;
+    }
+    await backupAndSave(currentPath);
+    focusGrid();
+  }
+
   function openRetrieveNavigator() {
     navMode = "open";
     navOpen = true;
@@ -4152,6 +4170,8 @@
     importTextFile: importTextFilePrompt,
     extractRange: extractRangePrompt,
     combineWorkbook: combineWorkbookPrompt,
+    fileAdminInfo,
+    fileAdminBackup,
     fileSaveFlow,
     quitApp,
     setStatus: (m) => { statusMsg = m; },

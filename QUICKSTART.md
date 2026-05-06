@@ -212,7 +212,8 @@ commits, Esc cancels.
 /F E      Erase a file from disk (with confirm)
 /F I      Import a text/CSV/TSV file into cells
 /F D      Change directory
-/F A      Admin                  ⚠ not yet
+/F A I    Admin Info — show current path, directory, sheets and dirty state
+/F A B    Admin Backup — create a backup and save current workbook
 ```
 
 #### Compare mode
