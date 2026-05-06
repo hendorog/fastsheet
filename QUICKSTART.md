@@ -466,33 +466,12 @@ SHEETS
 
 ## Not yet implemented
 
-The Lotus menu tree is fully populated with the original 1-2-3
-items, but several are stubs that print "Not yet implemented" to the
-status bar when you select them:
+The planned worksheet, range, file, and data menu items are implemented.
+The remaining Lotus branches below are still explicit stubs:
 
 ```
-/W G       Worksheet/Global settings other than Recalculation
-/W W       Worksheet/Window (split / unsplit panes)
-/W P       Worksheet/Page (print breaks)
-/R J       Range/Justify
-/R P       Range/Protect
-/R U       Range/Unprotect
-/R I       Range/Input restriction
-/F J       File/Combine
-/F X       File/Xtract (extract)
-/F E       File/Erase from disk
-/F L       File/List
-/F I       File/Import text
-/F D       File/Change directory
-/F A       File/Admin
 /P *       Print/* (entire branch)
 /G *       Graph/* (entire branch)
-/D T       Data/Table (what-if)
-/D Q       Data/Query
-/D D       Data/Distribution
-/D M       Data/Matrix
-/D R       Data/Regression
-/D P       Data/Parse
 /S         System (shell out)
 ```
 
