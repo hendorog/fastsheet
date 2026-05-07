@@ -981,11 +981,15 @@
           if (prev !== next) edits.push({ row, col, prev, next });
         }
       }
-      for (const op of edits) {
-        try {
-          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-        } catch {}
-      }
+      await withSuspendedRecalc(async () => {
+        await withSuspendedRecalc(async () => {
+          for (const op of edits) {
+            try {
+              await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+            } catch {}
+          }
+        });
+      });
       if (edits.length > 0) markWorkbookDirty();
       await refreshRows(selRow, selRow + outputRows - 1);
       noteRecalcPending(edits.length);
@@ -1146,11 +1150,15 @@
           if (prev !== next) edits.push({ row, col, prev, next });
         }
       }
-      for (const op of edits) {
-        try {
-          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-        } catch {}
-      }
+      await withSuspendedRecalc(async () => {
+        await withSuspendedRecalc(async () => {
+          for (const op of edits) {
+            try {
+              await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+            } catch {}
+          }
+        });
+      });
       if (edits.length > 0) markWorkbookDirty();
       await refreshRows(selRow, selRow + outputRows - 1);
       noteRecalcPending(edits.length);
@@ -1210,9 +1218,11 @@
       }
     }
     try {
-      for (const op of edits) {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
-      }
+      await withSuspendedRecalc(async () => {
+        for (const op of edits) {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
+        }
+      });
       if (edits.length > 0) markWorkbookDirty();
       await refreshRows(r1, r2);
       noteRecalcPending(edits.length);
@@ -1943,17 +1953,44 @@
     historyIdx = history.length;
   }
 
+  /// Run `fn` with auto-recalc temporarily suspended on the backend,
+  /// then restore + run a single `recalc` afterwards. Without this,
+  /// every per-cell `set_cell` triggers a full `model.evaluate()`, so
+  /// a 286-cell move on a complex workbook turns into 286 ×
+  /// multi-second recalcs (the original "5 minute move" report).
+  /// The autoRecalc check means the suspend/restore is a no-op when
+  /// the user already chose manual mode (/W G R M) — they get to
+  /// keep their batched-pending state instead of a forced recalc.
+  async function withSuspendedRecalc<T>(fn: () => Promise<T>): Promise<T> {
+    const wasAuto = autoRecalc;
+    if (wasAuto) {
+      try { await invoke("set_auto_recalc", { enabled: false }); } catch {}
+    }
+    try {
+      return await fn();
+    } finally {
+      if (wasAuto) {
+        try {
+          await invoke("set_auto_recalc", { enabled: true });
+          await invoke("recalc");
+        } catch {}
+      }
+    }
+  }
+
   async function applyEdits(sheet: number, ops: { row: number; col: number; value: string }[]) {
     let failed = 0;
     let lastErr: unknown = null;
-    for (const op of ops) {
-      try {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.value });
-      } catch (e) {
-        failed++;
-        lastErr = e;
+    await withSuspendedRecalc(async () => {
+      for (const op of ops) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.value });
+        } catch (e) {
+          failed++;
+          lastErr = e;
+        }
       }
-    }
+    });
     if (ops.length > 0) {
       markWorkbookDirty();
       const r1 = Math.min(...ops.map((o) => o.row));
@@ -2068,11 +2105,13 @@
           if (prev !== "") edits.push({ row: r, col: c, prev, next: "" });
         }
       }
-      for (const op of edits) {
-        try {
-          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
-        } catch {}
-      }
+      await withSuspendedRecalc(async () => {
+        for (const op of edits) {
+          try {
+            await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
+          } catch {}
+        }
+      });
       if (edits.length > 0) markWorkbookDirty();
       await refreshRows(r1, r2);
       noteRecalcPending(edits.length);
@@ -2181,11 +2220,13 @@
         if (prev !== next) edits.push({ row: r, col: c, prev, next });
       }
     }
-    for (const op of edits) {
-      try {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-      } catch {}
-    }
+    await withSuspendedRecalc(async () => {
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+    });
     if (edits.length > 0) markWorkbookDirty();
     if (edits.length > 0) {
       const editR1 = Math.min(...edits.map((e) => e.row));
@@ -2622,11 +2663,13 @@
       }
       if (next !== prev) edits.push({ row: m.row, col: m.col, prev, next });
     }
-    for (const op of edits) {
-      try {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-      } catch {}
-    }
+    await withSuspendedRecalc(async () => {
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+    });
     if (edits.length > 0) markWorkbookDirty();
     await refreshViewport();
     noteRecalcPending(edits.length);
@@ -2734,11 +2777,13 @@
         if (prev !== srcVal) edits.push({ row: r, col: c, prev, next: srcVal });
       }
     }
-    for (const op of edits) {
-      try {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-      } catch {}
-    }
+    await withSuspendedRecalc(async () => {
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+    });
     if (edits.length > 0) markWorkbookDirty();
     await refreshRows(dest.r1, dest.r2);
     noteRecalcPending(edits.length);
@@ -2878,11 +2923,13 @@
             if (prev !== val) edits.push({ row: r, col: c, prev, next: val });
           }
         }
-        for (const op of edits) {
-          try {
-            await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-          } catch {}
-        }
+        await withSuspendedRecalc(async () => {
+          for (const op of edits) {
+            try {
+              await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+            } catch {}
+          }
+        });
         if (edits.length > 0) markWorkbookDirty();
         await refreshViewport();
         noteRecalcPending(edits.length);
@@ -2929,11 +2976,13 @@
             i++;
           }
         }
-        for (const op of edits) {
-          try {
-            await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-          } catch {}
-        }
+        await withSuspendedRecalc(async () => {
+          for (const op of edits) {
+            try {
+              await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+            } catch {}
+          }
+        });
         if (edits.length > 0) markWorkbookDirty();
         await refreshViewport();
         noteRecalcPending(edits.length);
@@ -3011,11 +3060,13 @@
             if (prev !== next) edits.push({ row: targetR, col: targetC, prev, next });
           }
         }
-        for (const op of edits) {
-          try {
-            await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-          } catch {}
-        }
+        await withSuspendedRecalc(async () => {
+          for (const op of edits) {
+            try {
+              await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+            } catch {}
+          }
+        });
         if (edits.length > 0) markWorkbookDirty();
         await refreshViewport();
         noteRecalcPending(edits.length);
@@ -3088,30 +3139,20 @@
         if (prev !== next) edits.push({ row: r, col: c, prev, next });
       }
     }
-    // Suspend auto-recalc for the batch — see commitPendingMove for
-    // why per-cell evaluate kills performance on large writes.
-    const wasAuto = autoRecalc;
-    if (wasAuto && edits.length > 0) {
-      try { await invoke("set_auto_recalc", { enabled: false }); } catch {}
-    }
-    try {
+    let aborted = false;
+    await withSuspendedRecalc(async () => {
       for (const op of edits) {
         try {
           await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
         } catch (e) {
           statusMsg = `${description} failed: ${e}`;
           focusGrid();
+          aborted = true;
           return;
         }
       }
-    } finally {
-      if (wasAuto && edits.length > 0) {
-        try {
-          await invoke("set_auto_recalc", { enabled: true });
-          await invoke("recalc");
-        } catch {}
-      }
-    }
+    });
+    if (aborted) return;
     if (edits.length > 0) markWorkbookDirty();
     await refreshRows(startRow, endRow);
     noteRecalcPending(edits.length);
@@ -3272,11 +3313,13 @@
         if (prev !== next) edits.push({ row: r, col: c, prev, next });
       }
     }
-    for (const op of edits) {
-      try {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-      } catch {}
-    }
+    await withSuspendedRecalc(async () => {
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+    });
     if (edits.length > 0) markWorkbookDirty();
     await refreshRows(r1, r2);
     noteRecalcPending(edits.length);
@@ -3331,11 +3374,13 @@
         }
       }
     }
-    for (const op of edits) {
-      try {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-      } catch {}
-    }
+    await withSuspendedRecalc(async () => {
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+    });
     if (edits.length > 0) markWorkbookDirty();
     // Transpose can write outside the original rectangle when newH > h
     // or newW > w, so refresh the union of the source and target boxes.
@@ -3449,29 +3494,17 @@
         }
       }
     }
-    // Suspend auto-recalc for the duration of the batch — every
-    // set_cell with auto-recalc on triggers a full model.evaluate(),
-    // which on a complex workbook is multi-second per cell. A 286-cell
-    // move would otherwise take minutes. Restore + recalc once at
-    // the end so formulas catch up in a single pass.
-    const wasAuto = autoRecalc;
-    if (wasAuto && edits.length > 0) {
-      try { await invoke("set_auto_recalc", { enabled: false }); } catch {}
-    }
-    try {
-      for (const op of edits) {
-        try {
-          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-        } catch {}
-      }
-    } finally {
-      if (wasAuto && edits.length > 0) {
-        try {
-          await invoke("set_auto_recalc", { enabled: true });
-          await invoke("recalc");
-        } catch {}
-      }
-    }
+    await withSuspendedRecalc(async () => {
+      await withSuspendedRecalc(async () => {
+        await withSuspendedRecalc(async () => {
+          for (const op of edits) {
+            try {
+              await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+            } catch {}
+          }
+        });
+      });
+    });
     if (edits.length > 0) markWorkbookDirty();
     // Both source and destination row ranges may have changed (move
     // clears source, both touch dest). Span the union.
@@ -3590,9 +3623,11 @@
       }
     }
     try {
-      for (const op of valueEdits) {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
-      }
+      await withSuspendedRecalc(async () => {
+        for (const op of valueEdits) {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: "" });
+        }
+      });
       const styleResult = await invoke<{ count: number; prev_indices: number[]; next_indices: number[] }>(
         "set_range_style",
         { sheet, r1, c1, r2, c2, op: { kind: "clear_format" } },
