@@ -10,8 +10,6 @@ export type MenuCallbacks = {
   importTextFile: () => void | Promise<void>;
   extractRange: () => void | Promise<void>;
   combineWorkbook: () => void | Promise<void>;
-  fileAdminInfo: () => void | Promise<void>;
-  fileAdminBackup: () => void | Promise<void>;
   fileSaveFlow: () => void | Promise<void>;
   quitApp: () => void | Promise<void>;
   setStatus: (msg: string) => void;
@@ -38,13 +36,19 @@ export type MenuCallbacks = {
   insertCellsDown: () => void | Promise<void>;
   deleteCellsLeft: () => void | Promise<void>;
   deleteCellsUp: () => void | Promise<void>;
-  mergeCells: () => void | Promise<void>;
-  unmergeCells: () => void | Promise<void>;
   // Range/Format. Variants that take decimals raise the inline prompt;
   // others apply directly to the current selection.
   formatRange: (kind: FormatKind) => void | Promise<void>;
+  /// /R C Clear submenu actions. Contents lives on /R E Erase
+  /// (Lotus-faithful), so this submenu only carries Formats and All
+  /// — the pieces Lotus didn't have a separate command for.
   clearFormats: () => void | Promise<void>;
   clearAll: () => void | Promise<void>;
+  /// /R M Merge toggles: merges the selection if no merge overlaps,
+  /// unmerges any overlapping merges otherwise. Replaces the prior
+  /// /R M / /R G pair which forced the user to know the current
+  /// state.
+  toggleMerge: () => void | Promise<void>;
   // Range/Search — opens the find-then-replace inline prompt chain.
   searchRange: () => void | Promise<void>;
   // Range/Label — text alignment.
@@ -70,10 +74,15 @@ export type MenuCallbacks = {
   dataSort: () => void | Promise<void>;
   // /Data/Parse — split selected labels into adjacent columns.
   dataParse: () => void | Promise<void>;
-  dataTable: () => void | Promise<void>;
-  dataQuery: () => void | Promise<void>;
+  /// Range summary: count / numeric / sum / avg / min / max per column
+  /// of the selection. Renamed from "Table" because Lotus's /D T Table
+  /// was a what-if data-table feature, which this isn't.
+  dataSummary: () => void | Promise<void>;
+  /// Filter rows where a chosen column contains a substring. Renamed
+  /// from "Query" because Lotus's /D Q Query was a criteria/output-range
+  /// system, not a contains-filter.
+  dataFilter: () => void | Promise<void>;
   dataDistribution: () => void | Promise<void>;
-  dataMatrix: () => void | Promise<void>;
   dataRegression: () => void | Promise<void>;
   // /Range/Name — define / delete / list named ranges.
   nameCreate: () => void | Promise<void>;
@@ -295,9 +304,15 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
             { letter: "R", label: "Reset", description: "Clear bold / italic / underline / strike / text colour", action: () => cb.attrRange("reset") },
           ],
         },
-        { letter: "E", label: "Erase", description: "Erase the selected cells' contents", action: cb.eraseCurrentCell },
-        { letter: "C", label: "Clear Formats", description: "Clear formatting from the selected cells", action: cb.clearFormats },
-        { letter: "D", label: "Clear All", description: "Clear contents and formatting from the selected cells", action: cb.clearAll },
+        { letter: "E", label: "Erase", description: "Erase the selected cells' contents (Lotus /R E)", action: cb.eraseCurrentCell },
+        {
+          letter: "C", label: "Clear",
+          description: "Clear formatting or both contents + formatting on the selection",
+          children: [
+            { letter: "F", label: "Formats", description: "Clear formatting (font, fill, borders, number format) — leaves contents", action: cb.clearFormats },
+            { letter: "A", label: "All", description: "Clear contents AND formatting — same as Erase + Clear Formats", action: cb.clearAll },
+          ],
+        },
         {
           letter: "N", label: "Name",
           description: "Create / delete / list named ranges",
@@ -320,8 +335,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
         },
         { letter: "V", label: "Value", description: "Convert formulas in the selection to their literal values", action: cb.rangeValue },
         { letter: "T", label: "Trans", description: "Transpose the selection (rows ↔ cols, in place)", action: cb.rangeTrans },
-        { letter: "M", label: "Merge", description: "Merge the selected cells into one display cell", action: cb.mergeCells },
-        { letter: "G", label: "Unmerge", description: "Unmerge any merged cells overlapping the selection", action: cb.unmergeCells },
+        { letter: "M", label: "Merge", description: "Toggle merge: merges the selection, or unmerges if overlapping a merge", action: cb.toggleMerge },
         { letter: "S", label: "Search", description: "Find and (optionally) replace within the active sheet", action: cb.searchRange },
       ],
     },
@@ -333,28 +347,15 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
       children: [
         { letter: "R", label: "Retrieve", description: "Retrieve (open) a worksheet file from disk", action: cb.openRetrieveNavigator },
         { letter: "S", label: "Save", description: "Save the current worksheet", action: cb.fileSaveFlow },
-        {
-          letter: "C", label: "Compare",
-          description: "Compare the current workbook against another file (values + formulas)",
-          children: [
-            { letter: "O", label: "Open", description: "Pick a file to compare against — diffs get listed in the dock", action: cb.compareOpen },
-            { letter: "X", label: "Exit", description: "Close the comparison and clear the dock", action: cb.compareExit },
-          ],
-        },
-        { letter: "J", label: "Combine", description: "Combine another workbook into the current sheet", action: cb.combineWorkbook },
+        // Lotus 1-2-3 path is /F C Combine. The previous build had
+        // Compare on /F C; that's been moved to /T Compare so the
+        // canonical Lotus letter is free again.
+        { letter: "C", label: "Combine", description: "Combine another workbook into the current sheet", action: cb.combineWorkbook },
         { letter: "X", label: "Xtract", description: "Extract the selected range to a new .xlsx file", action: cb.extractRange },
         { letter: "E", label: "Erase", description: "Erase a file from disk", action: cb.eraseFile },
         { letter: "L", label: "List", description: "List worksheet files in the directory", action: cb.openFileList },
         { letter: "I", label: "Import", description: "Import a text file as cells", action: cb.importTextFile },
         { letter: "D", label: "Directory", description: "Change the current directory", action: cb.changeDirectory },
-        {
-          letter: "A", label: "Admin",
-          description: "File admin operations",
-          children: [
-            { letter: "I", label: "Info", description: "Show current workbook path, sheets and dirty state", action: cb.fileAdminInfo },
-            { letter: "B", label: "Backup", description: "Create a backup and save the current workbook", action: cb.fileAdminBackup },
-          ],
-        },
       ],
     },
     {
@@ -386,11 +387,10 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
       description: "Fill, sort, query, distribute, regress or parse data",
       children: [
         { letter: "F", label: "Fill", description: "Fill the selection with an arithmetic progression", action: cb.dataFill },
-        { letter: "T", label: "Table", description: "Summarize the selected table", action: cb.dataTable },
+        { letter: "U", label: "Summary", description: "Per-column count / sum / avg / min / max for the selected range", action: cb.dataSummary },
         { letter: "S", label: "Sort", description: "Sort the selected rows by a column", action: cb.dataSort },
-        { letter: "Q", label: "Query", description: "Filter selected rows by contains text", action: cb.dataQuery },
+        { letter: "L", label: "Filter", description: "Filter selected rows by contains-text on a chosen column", action: cb.dataFilter },
         { letter: "D", label: "Distribution", description: "Frequency distribution for selected numeric cells", action: cb.dataDistribution },
-        { letter: "M", label: "Matrix", description: "Transpose the selected matrix to another location", action: cb.dataMatrix },
         { letter: "R", label: "Regression", description: "Linear regression from two selected columns", action: cb.dataRegression },
         { letter: "P", label: "Parse", description: "Parse a column of labels into cells", action: cb.dataParse },
       ],
@@ -398,7 +398,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
     { letter: "S", label: "System", description: "Temporarily exit to operating system", action: stb("System") },
     {
       letter: "T", label: "Trace",
-      description: "Formula dependency tools — trace, jump to dependency, browse named ranges",
+      description: "Formula dependency tools, named ranges, and workbook compare",
       children: [
         {
           letter: "T", label: "Trace",
@@ -414,6 +414,14 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
           letter: "N", label: "Names",
           description: "Browse the workbook's named ranges and jump to one",
           action: cb.traceNames,
+        },
+        {
+          letter: "C", label: "Compare",
+          description: "Compare the current workbook against another file (values + formulas)",
+          children: [
+            { letter: "O", label: "Open", description: "Pick a file to compare against — diffs get listed in the dock", action: cb.compareOpen },
+            { letter: "X", label: "Exit", description: "Close the comparison and clear the dock", action: cb.compareExit },
+          ],
         },
       ],
     },

@@ -1013,24 +1013,6 @@
     }
   }
 
-  function fileAdminInfo() {
-    const path = currentPath || "(not saved)";
-    const dir = fileDirectory || "(default)";
-    const sheetCount = workbook?.sheet_names.length ?? 0;
-    statusMsg = `File: ${path} · dir: ${dir} · sheets: ${sheetCount} · ${workbookDirty ? "modified" : "clean"}`;
-    focusGrid();
-  }
-
-  async function fileAdminBackup() {
-    if (!currentPath) {
-      statusMsg = "Save the workbook before creating a backup";
-      focusGrid();
-      return;
-    }
-    await backupAndSave(currentPath);
-    focusGrid();
-  }
-
   function openRetrieveNavigator() {
     navMode = "open";
     navOpen = true;
@@ -3045,15 +3027,6 @@
     });
   }
 
-  function delimiterFromPrompt(raw: string): string | null {
-    const t = raw.trim().toLowerCase();
-    if (t === "," || t === "comma" || t === "c") return ",";
-    if (t === ";" || t === "semicolon" || t === "s") return ";";
-    if (t === "\\t" || t === "tab" || t === "t") return "\t";
-    if (t === "space" || t === "sp" || t === " ") return " ";
-    return raw.length === 1 ? raw : null;
-  }
-
   function parseDelimitedLine(text: string, delimiter: string): string[] {
     if (delimiter === " ") {
       return text.trim().length === 0 ? [""] : text.trim().split(/\s+/);
@@ -3088,29 +3061,6 @@
       c1: Math.min(selCol, rangeEndCol),
       c2: Math.max(selCol, rangeEndCol),
     };
-  }
-
-  function parseNumericCell(value: string): number | null {
-    const n = Number(value.replace(/,/g, "").trim());
-    return Number.isFinite(n) && value.trim() !== "" ? n : null;
-  }
-
-  async function selectedInputMatrix(): Promise<string[][] | null> {
-    const { r1, r2, c1, c2 } = selectionBounds();
-    const result = await fetchBand(r1, r2, c1, c2);
-    if (!result) return null;
-    const source = new Map(cells);
-    for (let r = r1; r <= r2; r++) {
-      for (let c = c1; c <= c2; c++) source.delete(key(r, c));
-    }
-    for (const cell of result.list) source.set(key(cell.row, cell.col), cell);
-    const matrix: string[][] = [];
-    for (let r = r1; r <= r2; r++) {
-      const row: string[] = [];
-      for (let c = c1; c <= c2; c++) row.push(source.get(key(r, c))?.input ?? "");
-      matrix.push(row);
-    }
-    return matrix;
   }
 
   async function writeOutputGrid(startRow: number, startCol: number, values: string[][], description: string) {
@@ -3159,238 +3109,133 @@
   /// This covers the basic "Text to Columns" workflow without taking on
   /// fixed-width parsing or type inference.
   function dataParse() {
-    const r1 = Math.min(selRow, rangeEndRow);
-    const r2 = Math.max(selRow, rangeEndRow);
-    const c1 = Math.min(selCol, rangeEndCol);
-    const c2 = Math.max(selCol, rangeEndCol);
+    const { r1, r2, c1, c2 } = selectionBounds();
     if (c1 !== c2) {
       statusMsg = "Select one column to parse";
       return;
     }
     openMenuPrompt("Delimiter: comma, tab, semicolon, space, or one character", "comma", async (v) => {
-      const delimiter = delimiterFromPrompt(v);
-      if (!delimiter) {
+      const delim = classifyDelimiter(v);
+      if (!delim) {
         statusMsg = `Invalid delimiter: ${v}`;
         focusGrid();
         return;
       }
-      await ensureRowsLoaded(r1, r2);
-      const rows: string[][] = [];
-      let maxParts = 1;
-      for (let r = r1; r <= r2; r++) {
-        const source = cells.get(key(r, c1))?.input ?? "";
-        const parts = parseDelimitedLine(source, delimiter);
-        rows.push(parts);
-        maxParts = Math.max(maxParts, parts.length);
+      try {
+        const out = await invoke<string[][]>("data_parse", {
+          sheet: activeSheet, r1, c1, r2, c2,
+          delimiter: delim,
+        });
+        // Parse writes back into the same range starting at (r1, c1).
+        // Use the existing writeOutputGrid which handles refresh +
+        // history + dirty tracking.
+        await writeOutputGrid(r1, c1, out, `Parse ${r1 === r2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c1)}`}`);
+        const span = r1 === r2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c1)}`;
+        const cols = Math.max(1, ...out.map((r) => r.length));
+        statusMsg = `Parsed ${out.length} row${out.length === 1 ? "" : "s"} of ${span} into ${cols} column${cols === 1 ? "" : "s"}`;
+      } catch (e) {
+        statusMsg = `Parse failed: ${e}`;
       }
-      const outputCols = Math.min(maxParts, ABS_MAX_COLS - c1 + 1);
-      await fetchBand(r1, r2, c1, c1 + outputCols - 1).then((result) => {
-        if (!result) return;
-        const newCells = new Map(cells);
-        for (let r = r1; r <= r2; r++) {
-          for (let c = c1; c < c1 + outputCols; c++) newCells.delete(key(r, c));
-        }
-        for (const c of result.list) newCells.set(key(c.row, c.col), c);
-        cells = newCells;
-      });
-      const sheet = activeSheet;
-      const edits: EditOp[] = [];
-      for (let r = r1; r <= r2; r++) {
-        const parts = rows[r - r1];
-        for (let offset = 0; offset < outputCols; offset++) {
-          const targetCol = c1 + offset;
-          const next = parts[offset] ?? "";
-          const prev = cells.get(key(r, targetCol))?.input ?? "";
-          if (prev !== next) edits.push({ row: r, col: targetCol, prev, next });
-        }
-      }
-      for (const op of edits) {
-        try {
-          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-        } catch {}
-      }
-      if (edits.length > 0) markWorkbookDirty();
-      await refreshRows(r1, r2);
-      noteRecalcPending(edits.length);
-      const span = r1 === r2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c1)}`;
-      pushHistory({ description: `Parse ${span}`, sheet, edits });
-      statusMsg = `Parsed ${r2 - r1 + 1} row${r1 === r2 ? "" : "s"} into ${outputCols} column${outputCols === 1 ? "" : "s"}`;
       focusGrid();
     });
   }
 
-  async function dataTable() {
+  /// Map a user-typed delimiter spec to the {kind, literal} struct
+  /// the backend expects. Single-char inputs (e.g. "|") flow through
+  /// `literal`; named inputs hit the named branches. Returns null on
+  /// invalid input.
+  function classifyDelimiter(raw: string): { kind: string; literal?: string } | null {
+    const t = raw.trim().toLowerCase();
+    if (t === "," || t === "comma" || t === "c") return { kind: "comma" };
+    if (t === ";" || t === "semicolon" || t === "s") return { kind: "semicolon" };
+    if (t === "\\t" || t === "tab" || t === "t") return { kind: "tab" };
+    if (t === "space" || t === "sp" || t === " ") return { kind: "space" };
+    if (raw.length === 1) return { kind: "char", literal: raw };
+    return null;
+  }
+
+  /// All five data ops now compute their result grid on the backend
+  /// (`data_summary` / `data_filter` / `data_distribution` /
+  /// `data_regression` / `data_parse` in `data_analysis.rs`). The
+  /// frontend just picks the destination, calls the command, and
+  /// writes the returned grid via `writeOutputGrid` so undo / dirty
+  /// tracking flow through the existing edit channel.
+  async function dataSummary() {
     const { r1, r2, c1, c2 } = selectionBounds();
-    const matrix = await selectedInputMatrix();
-    if (!matrix) {
-      statusMsg = "Table summary cancelled";
-      focusGrid();
-      return;
+    try {
+      const out = await invoke<string[][]>("data_summary", {
+        sheet: activeSheet, r1, c1, r2, c2,
+      });
+      const destRow = r2 + 2;
+      await writeOutputGrid(destRow, c1, out, `Summary ${addr(r1, c1)}:${addr(r2, c2)}`);
+      statusMsg = `Summary written at ${addr(destRow, c1)}`;
+    } catch (e) {
+      statusMsg = `Summary failed: ${e}`;
     }
-    if (matrix.length < 2) {
-      statusMsg = "Select a header row and at least one data row";
-      focusGrid();
-      return;
-    }
-    const out: string[][] = [["Column", "Count", "Numeric", "Sum", "Average", "Min", "Max"]];
-    for (let offset = 0; offset <= c2 - c1; offset++) {
-      const header = matrix[0][offset] || addr(1, c1 + offset).replace(/\d+$/, "");
-      const values = matrix.slice(1).map((row) => row[offset] ?? "").filter((v) => v.trim() !== "");
-      const nums = values.map(parseNumericCell).filter((n): n is number => n !== null);
-      const sum = nums.reduce((a, b) => a + b, 0);
-      out.push([
-        header,
-        String(values.length),
-        String(nums.length),
-        nums.length ? String(sum) : "",
-        nums.length ? String(sum / nums.length) : "",
-        nums.length ? String(Math.min(...nums)) : "",
-        nums.length ? String(Math.max(...nums)) : "",
-      ]);
-    }
-    const destRow = r2 + 2;
-    await writeOutputGrid(destRow, c1, out, `Table summary ${addr(r1, c1)}:${addr(r2, c2)}`);
-    statusMsg = `Table summary written at ${addr(destRow, c1)}`;
     focusGrid();
   }
 
-  function dataQuery() {
+  function dataFilter() {
     const { r1, r2, c1, c2 } = selectionBounds();
     if (r2 <= r1) {
-      statusMsg = "Select a header row and data rows to query";
+      statusMsg = "Select a header row and data rows to filter";
       focusGrid();
       return;
     }
     const defaultCol = addr(1, c1).replace(/\d+$/, "");
-    openMenuPrompt(`Query column (${defaultCol}-${addr(1, c2).replace(/\d+$/, "")}):`, defaultCol, (colV) => {
+    openMenuPrompt(`Filter column (${defaultCol}-${addr(1, c2).replace(/\d+$/, "")}):`, defaultCol, (colV) => {
       const parsed = parseA1Frontend(`${colV.trim()}1`);
-      const queryCol = parsed?.col ?? 0;
-      if (queryCol < c1 || queryCol > c2) {
+      const filterCol = parsed?.col ?? 0;
+      if (filterCol < c1 || filterCol > c2) {
         statusMsg = `Column ${colV} not in selection`;
         focusGrid();
         return;
       }
-      openMenuPrompt("Contains text:", "", async (needleV) => {
-        const needle = needleV.toLowerCase();
-        const matrix = await selectedInputMatrix();
-        if (!matrix) {
-          statusMsg = "Query cancelled";
-          focusGrid();
-          return;
+      openMenuPrompt("Contains text:", "", async (needle) => {
+        try {
+          const out = await invoke<string[][]>("data_filter", {
+            sheet: activeSheet, r1, c1, r2, c2,
+            filterCol,
+            needle,
+          });
+          const destRow = r2 + 2;
+          await writeOutputGrid(destRow, c1, out, `Filter ${addr(r1, c1)}:${addr(r2, c2)}`);
+          statusMsg = `Filter returned ${out.length - 1} row${out.length === 2 ? "" : "s"} at ${addr(destRow, c1)}`;
+        } catch (e) {
+          statusMsg = `Filter failed: ${e}`;
         }
-        const idx = queryCol - c1;
-        const out = [matrix[0]];
-        for (const row of matrix.slice(1)) {
-          if ((row[idx] ?? "").toLowerCase().includes(needle)) out.push(row);
-        }
-        const destRow = r2 + 2;
-        await writeOutputGrid(destRow, c1, out, `Query ${addr(r1, c1)}:${addr(r2, c2)}`);
-        statusMsg = `Query returned ${out.length - 1} row${out.length === 2 ? "" : "s"} at ${addr(destRow, c1)}`;
         focusGrid();
       });
     });
   }
 
   async function dataDistribution() {
-    const { r2, c1 } = selectionBounds();
-    const matrix = await selectedInputMatrix();
-    if (!matrix) {
-      statusMsg = "Distribution cancelled";
-      focusGrid();
-      return;
+    const { r1, r2, c1, c2 } = selectionBounds();
+    try {
+      const out = await invoke<string[][]>("data_distribution", {
+        sheet: activeSheet, r1, c1, r2, c2,
+      });
+      const destRow = r2 + 2;
+      await writeOutputGrid(destRow, c1, out, "Frequency distribution");
+      statusMsg = `Distribution written at ${addr(destRow, c1)}`;
+    } catch (e) {
+      statusMsg = `Distribution failed: ${e}`;
     }
-    const counts = new Map<number, number>();
-    for (const row of matrix) {
-      for (const value of row) {
-        const n = parseNumericCell(value);
-        if (n !== null) counts.set(n, (counts.get(n) ?? 0) + 1);
-      }
-    }
-    if (counts.size === 0) {
-      statusMsg = "No numeric values in selection";
-      focusGrid();
-      return;
-    }
-    const out = [["Value", "Frequency"], ...[...counts.entries()].sort((a, b) => a[0] - b[0]).map(([value, count]) => [String(value), String(count)])];
-    const destRow = r2 + 2;
-    await writeOutputGrid(destRow, c1, out, "Frequency distribution");
-    statusMsg = `Distribution written at ${addr(destRow, c1)}`;
     focusGrid();
-  }
-
-  function dataMatrix() {
-    const { r2, c1 } = selectionBounds();
-    openMenuPrompt("Transpose output at:", addr(r2 + 2, c1), async (v) => {
-      const target = parseA1Frontend(v);
-      if (!target) {
-        statusMsg = `Invalid destination: ${v}`;
-        focusGrid();
-        return;
-      }
-      const matrix = await selectedInputMatrix();
-      if (!matrix) {
-        statusMsg = "Matrix operation cancelled";
-        focusGrid();
-        return;
-      }
-      const out = matrix[0].map((_, col) => matrix.map((row) => row[col] ?? ""));
-      await writeOutputGrid(target.row, target.col, out, "Matrix transpose");
-      statusMsg = `Matrix transpose written at ${addr(target.row, target.col)}`;
-      focusGrid();
-    });
   }
 
   async function dataRegression() {
     const { r1, r2, c1, c2 } = selectionBounds();
-    if (c2 - c1 + 1 < 2) {
-      statusMsg = "Select at least two columns: X then Y";
-      focusGrid();
-      return;
+    try {
+      const out = await invoke<string[][]>("data_regression", {
+        sheet: activeSheet, r1, c1, r2, c2,
+      });
+      const destRow = r2 + 2;
+      await writeOutputGrid(destRow, c1, out, `Regression ${addr(r1, c1)}:${addr(r2, c2)}`);
+      statusMsg = `Regression stats written at ${addr(destRow, c1)}`;
+    } catch (e) {
+      statusMsg = `Regression failed: ${e}`;
     }
-    const matrix = await selectedInputMatrix();
-    if (!matrix) {
-      statusMsg = "Regression cancelled";
-      focusGrid();
-      return;
-    }
-    const pairs: Array<[number, number]> = [];
-    for (const row of matrix) {
-      const x = parseNumericCell(row[0] ?? "");
-      const y = parseNumericCell(row[1] ?? "");
-      if (x !== null && y !== null) pairs.push([x, y]);
-    }
-    if (pairs.length < 2) {
-      statusMsg = "Regression needs at least two numeric X/Y pairs";
-      focusGrid();
-      return;
-    }
-    const n = pairs.length;
-    const sx = pairs.reduce((sum, [x]) => sum + x, 0);
-    const sy = pairs.reduce((sum, [, y]) => sum + y, 0);
-    const sxx = pairs.reduce((sum, [x]) => sum + x * x, 0);
-    const sxy = pairs.reduce((sum, [x, y]) => sum + x * y, 0);
-    const syy = pairs.reduce((sum, [, y]) => sum + y * y, 0);
-    const denom = n * sxx - sx * sx;
-    if (denom === 0) {
-      statusMsg = "Regression failed: X values have no variance";
-      focusGrid();
-      return;
-    }
-    const slope = (n * sxy - sx * sy) / denom;
-    const intercept = (sy - slope * sx) / n;
-    const rDenom = Math.sqrt((n * sxx - sx * sx) * (n * syy - sy * sy));
-    const r = rDenom === 0 ? 0 : (n * sxy - sx * sy) / rDenom;
-    const out = [
-      ["Regression", ""],
-      ["Count", String(n)],
-      ["Slope", String(slope)],
-      ["Intercept", String(intercept)],
-      ["R", String(r)],
-      ["R^2", String(r * r)],
-    ];
-    const destRow = r2 + 2;
-    await writeOutputGrid(destRow, c1, out, `Regression ${addr(r1, c1)}:${addr(r2, c2)}`);
-    statusMsg = `Regression stats written at ${addr(destRow, c1)}`;
     focusGrid();
   }
 
@@ -3907,44 +3752,37 @@
     shiftCellsAtSel("delete_cells_shift_up", "Deleted cells up at");
   }
 
-  async function mergeSelectedCells() {
+  /// /R M Merge: single toggle. Try unmerge first — if any existing
+  /// merges overlap the selection, removing them is the obvious user
+  /// intent. Otherwise merge the selection. This avoids forcing the
+  /// user to know the current merge state before pressing the key.
+  async function toggleMergeSelectedCells() {
     const r1 = Math.min(selRow, rangeEndRow);
     const r2 = Math.max(selRow, rangeEndRow);
     const c1 = Math.min(selCol, rangeEndCol);
     const c2 = Math.max(selCol, rangeEndCol);
     const span = r1 === r2 && c1 === c2 ? addr(r1, c1) : `${addr(r1, c1)}:${addr(r2, c2)}`;
     try {
+      const removed = await invoke<number>("unmerge_cells", {
+        sheet: activeSheet, r1, c1, r2, c2,
+      });
+      if (removed > 0) {
+        markWorkbookDirty();
+        await refreshViewport();
+        statusMsg = `Unmerged ${removed} range${removed === 1 ? "" : "s"}`;
+        return;
+      }
+      // No existing merges overlapped — try to create one.
+      if (r1 === r2 && c1 === c2) {
+        statusMsg = "Select at least two cells to merge";
+        return;
+      }
       await invoke("merge_cells", { sheet: activeSheet, r1, c1, r2, c2 });
       markWorkbookDirty();
       await refreshViewport();
       statusMsg = `Merged ${span}`;
     } catch (e) {
-      statusMsg = `Merge failed: ${e}`;
-    }
-  }
-
-  async function unmergeSelectedCells() {
-    const r1 = Math.min(selRow, rangeEndRow);
-    const r2 = Math.max(selRow, rangeEndRow);
-    const c1 = Math.min(selCol, rangeEndCol);
-    const c2 = Math.max(selCol, rangeEndCol);
-    try {
-      const removed = await invoke<number>("unmerge_cells", {
-        sheet: activeSheet,
-        r1,
-        c1,
-        r2,
-        c2,
-      });
-      if (removed > 0) {
-        markWorkbookDirty();
-        await refreshViewport();
-      }
-      statusMsg = removed === 0
-        ? "No merged cells in selection"
-        : `Unmerged ${removed} range${removed === 1 ? "" : "s"}`;
-    } catch (e) {
-      statusMsg = `Unmerge failed: ${e}`;
+      statusMsg = `Merge toggle failed: ${e}`;
     }
   }
 
@@ -4170,8 +4008,6 @@
     importTextFile: importTextFilePrompt,
     extractRange: extractRangePrompt,
     combineWorkbook: combineWorkbookPrompt,
-    fileAdminInfo,
-    fileAdminBackup,
     fileSaveFlow,
     quitApp,
     setStatus: (m) => { statusMsg = m; },
@@ -4192,8 +4028,7 @@
     insertCellsDown: insertCellsDownAtSel,
     deleteCellsLeft: deleteCellsLeftAtSel,
     deleteCellsUp: deleteCellsUpAtSel,
-    mergeCells: mergeSelectedCells,
-    unmergeCells: unmergeSelectedCells,
+    toggleMerge: toggleMergeSelectedCells,
     formatRange,
     clearFormats,
     clearAll,
@@ -4209,10 +4044,9 @@
     dataFill,
     dataSort,
     dataParse,
-    dataTable,
-    dataQuery,
+    dataSummary,
+    dataFilter,
     dataDistribution,
-    dataMatrix,
     dataRegression,
     nameCreate,
     nameDelete,
@@ -5011,8 +4845,7 @@
       <button type="button" onclick={() => { closeContextMenu(); deleteColumnsAtSel(); }}>Delete column</button>
       <button type="button" onclick={() => { closeContextMenu(); deleteCellsLeftAtSel(); }}>Delete cells left</button>
       <button type="button" onclick={() => { closeContextMenu(); deleteCellsUpAtSel(); }}>Delete cells up</button>
-      <button type="button" onclick={() => { closeContextMenu(); mergeSelectedCells(); }}>Merge cells</button>
-      <button type="button" onclick={() => { closeContextMenu(); unmergeSelectedCells(); }}>Unmerge cells</button>
+      <button type="button" onclick={() => { closeContextMenu(); toggleMergeSelectedCells(); }}>Merge / unmerge cells</button>
       <hr />
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentRow(); }}>Hide row</button>
       <button type="button" onclick={() => { closeContextMenu(); hideCurrentColumn(); }}>Hide column</button>
