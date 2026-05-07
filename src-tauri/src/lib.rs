@@ -1,5 +1,6 @@
 mod atomic;
 mod cells;
+mod data_analysis;
 pub mod compare;
 mod hidden;
 mod index;
@@ -142,6 +143,11 @@ pub fn run() {
             cells::jump_edge,
             cells::trace_formula,
             cells::list_named_ranges,
+            data_analysis::data_summary,
+            data_analysis::data_filter,
+            data_analysis::data_distribution,
+            data_analysis::data_regression,
+            data_analysis::data_parse,
             navigator::start_dir,
             navigator::home_dir_path,
             navigator::list_dir,
