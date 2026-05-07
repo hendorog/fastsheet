@@ -11,7 +11,7 @@ use crate::model::Model;
 // I feel this is unimportant for now.
 
 impl<'a> Model<'a> {
-    fn shift_cell_formula(
+    pub fn shift_cell_formula(
         &mut self,
         sheet: u32,
         row: i32,
@@ -44,7 +44,7 @@ impl<'a> Model<'a> {
     /// # Arguments
     ///
     /// * `displace_data` - A reference to `DisplaceData` describing the displacement's direction and magnitude.
-    fn displace_cells(&mut self, displace_data: &DisplaceData) -> Result<(), String> {
+    pub fn displace_cells(&mut self, displace_data: &DisplaceData) -> Result<(), String> {
         let cells = self.get_all_cells();
         for cell in cells {
             self.shift_cell_formula(cell.index, cell.row, cell.column, displace_data)?;

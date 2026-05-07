@@ -1,9 +1,6 @@
 use ironcalc::base::types::{Alignment, BorderItem, BorderStyle, HorizontalAlignment, VerticalAlignment};
-use ironcalc::base::types::Cell;
 use serde::{Deserialize, Serialize};
 use tauri::State;
-
-use std::collections::HashMap;
 
 use crate::state::{AppState, ProtectedRange};
 use crate::util::col_letter;
@@ -1050,28 +1047,6 @@ fn worksheet_used_bounds(model: &ironcalc::base::Model<'_>, sheet: u32) -> Resul
     Ok((dim.max_row.max(1), dim.max_column.max(1)))
 }
 
-fn empty_like(cell: Option<&Cell>) -> Cell {
-    Cell::EmptyCell {
-        s: cell.map(|c| c.get_style()).unwrap_or(0),
-    }
-}
-
-fn set_raw_cell(
-    ws: &mut ironcalc::base::types::Worksheet,
-    row: i32,
-    col: i32,
-    cell: Cell,
-) -> Result<(), String> {
-    if !(1..=LAST_ROW).contains(&row) || !(1..=LAST_COLUMN).contains(&col) {
-        return Err("Incorrect row or column".to_string());
-    }
-    ws.sheet_data
-        .entry(row)
-        .or_insert_with(HashMap::new)
-        .insert(col, cell);
-    Ok(())
-}
-
 fn normalize_cell_range(
     r1: i32,
     c1: i32,
@@ -1189,7 +1164,48 @@ pub(crate) fn unmerge_cells(
     Ok(removed)
 }
 
+/// Move one cell's content + style from (sr, sc) to (tr, tc), going
+/// through `set_user_input` so any formula gets re-parsed at the new
+/// anchor. Without this round-trip a relative ref like `=A5+1` at B5
+/// would still mean "one column left" after moving to C5 — i.e. now
+/// pointing at B5 (empty) instead of A5. Mirrors the IronCalc-internal
+/// `move_cell` (which is private) so we don't have to widen the
+/// vendor patch beyond `displace_cells` / `shift_cell_formula`.
+fn move_cell_via_input(
+    model: &mut ironcalc::base::Model<'_>,
+    sheet: u32,
+    sr: i32,
+    sc: i32,
+    tr: i32,
+    tc: i32,
+) -> Result<(), String> {
+    // get_localized_cell_content returns "=FORMULA" for formula cells,
+    // the value text otherwise, "" for missing cells. That's exactly
+    // the input string set_user_input wants — re-parsing it at the
+    // target anchor rebases relative refs correctly.
+    let input = model.get_localized_cell_content(sheet, sr, sc)?;
+    if input.is_empty() {
+        // Source is empty. Clear the target so a previous iteration's
+        // write doesn't leak through.
+        model.cell_clear_contents(sheet, tr, tc)?;
+        return Ok(());
+    }
+    let style_idx = model.workbook.worksheet(sheet)?.get_style(sr, sc);
+    model.set_user_input(sheet, tr, tc, input)?;
+    model
+        .workbook
+        .worksheet_mut(sheet)?
+        .set_cell_style(tr, tc, style_idx)?;
+    model.cell_clear_all(sheet, sr, sc)?;
+    Ok(())
+}
+
 /// Insert blank cells and shift the affected row segment right.
+/// After moving the cells, `displace_cells` walks every formula in
+/// the workbook and rewrites refs into the shifted region — that's
+/// the bit the previous `set_raw_cell`-only implementation skipped,
+/// silently leaving downstream `=B5` formulas pointing at whatever
+/// landed at B5 instead of where B5's content actually went.
 #[tauri::command]
 pub(crate) fn insert_cells_shift_right(
     sheet: u32,
@@ -1199,6 +1215,7 @@ pub(crate) fn insert_cells_shift_right(
     c2: i32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    use ironcalc::base::expressions::parser::stringify::DisplaceData;
     if r1 < 1 || c1 < 1 || r2 < r1 || c2 < c1 || r2 > LAST_ROW || c2 > LAST_COLUMN {
         return Err("Invalid cell range".to_string());
     }
@@ -1209,23 +1226,22 @@ pub(crate) fn insert_cells_shift_right(
     if max_col + width > LAST_COLUMN {
         return Err("Cannot shift cells beyond the last column".to_string());
     }
-    let ws = model.workbook.worksheet_mut(sheet)?;
+    // Right-to-left so each move reads source data before any
+    // earlier-iteration write could overwrite it.
     for r in r1..=r2 {
         for c in (c1..=max_col).rev() {
-            let moved = ws.sheet_data.get(&r).and_then(|row| row.get(&c)).cloned();
-            match moved {
-                Some(cell) => set_raw_cell(ws, r, c + width, cell)?,
-                None => {
-                    if ws.sheet_data.get(&r).and_then(|row| row.get(&(c + width))).is_some() {
-                        set_raw_cell(ws, r, c + width, Cell::default())?;
-                    }
-                }
-            }
+            move_cell_via_input(model, sheet, r, c, r, c + width)?;
         }
-        for c in c1..=c2 {
-            let old = ws.sheet_data.get(&r).and_then(|row| row.get(&c));
-            set_raw_cell(ws, r, c, empty_like(old))?;
-        }
+    }
+    for r in r1..=r2 {
+        model
+            .displace_cells(&DisplaceData::CellHorizontal {
+                sheet,
+                row: r,
+                column: c1,
+                delta: width,
+            })
+            .map_err(|e| format!("displace cells: {e}"))?;
     }
     if *state.auto_recalc.lock().unwrap() {
         model.evaluate();
@@ -1246,6 +1262,7 @@ pub(crate) fn insert_cells_shift_down(
     c2: i32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    use ironcalc::base::expressions::parser::stringify::DisplaceData;
     if r1 < 1 || c1 < 1 || r2 < r1 || c2 < c1 || r2 > LAST_ROW || c2 > LAST_COLUMN {
         return Err("Invalid cell range".to_string());
     }
@@ -1256,23 +1273,20 @@ pub(crate) fn insert_cells_shift_down(
     if max_row + height > LAST_ROW {
         return Err("Cannot shift cells beyond the last row".to_string());
     }
-    let ws = model.workbook.worksheet_mut(sheet)?;
     for c in c1..=c2 {
         for r in (r1..=max_row).rev() {
-            let moved = ws.sheet_data.get(&r).and_then(|row| row.get(&c)).cloned();
-            match moved {
-                Some(cell) => set_raw_cell(ws, r + height, c, cell)?,
-                None => {
-                    if ws.sheet_data.get(&(r + height)).and_then(|row| row.get(&c)).is_some() {
-                        set_raw_cell(ws, r + height, c, Cell::default())?;
-                    }
-                }
-            }
+            move_cell_via_input(model, sheet, r, c, r + height, c)?;
         }
-        for r in r1..=r2 {
-            let old = ws.sheet_data.get(&r).and_then(|row| row.get(&c));
-            set_raw_cell(ws, r, c, empty_like(old))?;
-        }
+    }
+    for c in c1..=c2 {
+        model
+            .displace_cells(&DisplaceData::CellVertical {
+                sheet,
+                row: r1,
+                column: c,
+                delta: height,
+            })
+            .map_err(|e| format!("displace cells: {e}"))?;
     }
     if *state.auto_recalc.lock().unwrap() {
         model.evaluate();
@@ -1283,7 +1297,10 @@ pub(crate) fn insert_cells_shift_down(
     Ok(())
 }
 
-/// Delete cells and shift the affected row segment left.
+/// Delete cells and shift the affected row segment left. Refs that
+/// pointed at deleted cells become `#REF!`; refs past the deletion
+/// shift left by `width`. Both come from `displace_cells` with a
+/// negative delta — that's the part the prior naive impl skipped.
 #[tauri::command]
 pub(crate) fn delete_cells_shift_left(
     sheet: u32,
@@ -1293,6 +1310,7 @@ pub(crate) fn delete_cells_shift_left(
     c2: i32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    use ironcalc::base::expressions::parser::stringify::DisplaceData;
     if r1 < 1 || c1 < 1 || r2 < r1 || c2 < c1 || r2 > LAST_ROW || c2 > LAST_COLUMN {
         return Err("Invalid cell range".to_string());
     }
@@ -1300,23 +1318,29 @@ pub(crate) fn delete_cells_shift_left(
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
     let (_, max_col) = worksheet_used_bounds(model, sheet)?;
-    let ws = model.workbook.worksheet_mut(sheet)?;
+    // Clear the deleted cells first; left-to-right move from c1+width.
     for r in r1..=r2 {
+        for c in c1..=c2 {
+            model.cell_clear_all(sheet, r, c)?;
+        }
         for c in c1..=max_col {
             let src = c + width;
-            let moved = if src <= LAST_COLUMN {
-                ws.sheet_data.get(&r).and_then(|row| row.get(&src)).cloned()
+            if src > LAST_COLUMN {
+                model.cell_clear_contents(sheet, r, c)?;
             } else {
-                None
-            };
-            match moved {
-                Some(cell) => set_raw_cell(ws, r, c, cell)?,
-                None => {
-                    let old = ws.sheet_data.get(&r).and_then(|row| row.get(&c));
-                    set_raw_cell(ws, r, c, empty_like(old))?;
-                }
+                move_cell_via_input(model, sheet, r, src, r, c)?;
             }
         }
+    }
+    for r in r1..=r2 {
+        model
+            .displace_cells(&DisplaceData::CellHorizontal {
+                sheet,
+                row: r,
+                column: c1,
+                delta: -width,
+            })
+            .map_err(|e| format!("displace cells: {e}"))?;
     }
     if *state.auto_recalc.lock().unwrap() {
         model.evaluate();
@@ -1337,6 +1361,7 @@ pub(crate) fn delete_cells_shift_up(
     c2: i32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    use ironcalc::base::expressions::parser::stringify::DisplaceData;
     if r1 < 1 || c1 < 1 || r2 < r1 || c2 < c1 || r2 > LAST_ROW || c2 > LAST_COLUMN {
         return Err("Invalid cell range".to_string());
     }
@@ -1344,23 +1369,28 @@ pub(crate) fn delete_cells_shift_up(
     let mut guard = state.model.lock().unwrap();
     let model = guard.as_mut().ok_or("no workbook open")?;
     let (max_row, _) = worksheet_used_bounds(model, sheet)?;
-    let ws = model.workbook.worksheet_mut(sheet)?;
     for c in c1..=c2 {
+        for r in r1..=r2 {
+            model.cell_clear_all(sheet, r, c)?;
+        }
         for r in r1..=max_row {
             let src = r + height;
-            let moved = if src <= LAST_ROW {
-                ws.sheet_data.get(&src).and_then(|row| row.get(&c)).cloned()
+            if src > LAST_ROW {
+                model.cell_clear_contents(sheet, r, c)?;
             } else {
-                None
-            };
-            match moved {
-                Some(cell) => set_raw_cell(ws, r, c, cell)?,
-                None => {
-                    let old = ws.sheet_data.get(&r).and_then(|row| row.get(&c));
-                    set_raw_cell(ws, r, c, empty_like(old))?;
-                }
+                move_cell_via_input(model, sheet, src, c, r, c)?;
             }
         }
+    }
+    for c in c1..=c2 {
+        model
+            .displace_cells(&DisplaceData::CellVertical {
+                sheet,
+                row: r1,
+                column: c,
+                delta: -height,
+            })
+            .map_err(|e| format!("displace cells: {e}"))?;
     }
     if *state.auto_recalc.lock().unwrap() {
         model.evaluate();
