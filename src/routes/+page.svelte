@@ -3388,6 +3388,16 @@
     const sheet = activeSheet;
     const h = source.r2 - source.r1 + 1;
     const w = source.c2 - source.c1 + 1;
+    // Source rows may extend beyond the currently-loaded viewport
+    // band — without a fetch the top of a long source range comes
+    // back as empty (only the loaded rows had real `input` values
+    // in the cells Map), and the bug shows as "only the bottom rows
+    // moved". Same risk on the destination side, since we read the
+    // previous value there for the undo edit's `prev`.
+    await ensureRowsLoaded(
+      Math.min(source.r1, anchor.row),
+      Math.max(source.r2, anchor.row + h - 1),
+    );
     const edits: EditOp[] = [];
     for (let r = 0; r < h; r++) {
       for (let c = 0; c < w; c++) {

@@ -969,11 +969,21 @@
   .grid-no-lines .cell {
     border-color: transparent;
   }
+  /* Page-break markers. Using `box-shadow inset` instead of a thicker
+     border because border-collapse: collapse adds the extra pixel to
+     the row's actual height — `rowOffsets` (computed from the
+     rowHeights map alone) wouldn't see it, and the selection overlay
+     would drift down by 1px per page break in the rows above the
+     cursor. Inset shadows render purely on top of the cell paint and
+     don't affect layout. Dashed-look approximated via gradient. */
   .cell.page-break-row {
-    border-top: 2px dashed #2563eb;
+    box-shadow: inset 0 2px 0 #2563eb;
   }
   .cell.page-break-col {
-    border-left: 2px dashed #2563eb;
+    box-shadow: inset 2px 0 0 #2563eb;
+  }
+  .cell.page-break-row.page-break-col {
+    box-shadow: inset 2px 0 0 #2563eb, inset 0 2px 0 #2563eb;
   }
   /* Spacer rows that absorb the rows skipped by row virtualisation.
      Their height keeps the table's total geometry equal to the sum of
