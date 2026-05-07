@@ -1040,6 +1040,15 @@
     height: 100%;
     width: 100%;
     padding: 1px 4px;
+    /* Line-height 1 is required so the cell content fits in the
+       configured row height. Browsers default to ~1.2 for sans-serif,
+       which makes a Calibri-11 cell's natural min-height ~22px even
+       though Excel renders the same text at 20px. With 1.2 line-height
+       the row stretches past the height attribute we set on the <tr>,
+       and rowOffsets (built from the rowHeights map) drifts by ~2-3px
+       per row — accumulating into a visible cursor-vs-grid offset
+       further down the sheet. line-height: 1 collapses that gap. */
+    line-height: 1;
     white-space: nowrap;
     overflow: visible;
     /* Opaque background masks any overflow leaking in from the left

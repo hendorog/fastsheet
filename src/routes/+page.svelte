@@ -3088,13 +3088,28 @@
         if (prev !== next) edits.push({ row: r, col: c, prev, next });
       }
     }
-    for (const op of edits) {
-      try {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-      } catch (e) {
-        statusMsg = `${description} failed: ${e}`;
-        focusGrid();
-        return;
+    // Suspend auto-recalc for the batch — see commitPendingMove for
+    // why per-cell evaluate kills performance on large writes.
+    const wasAuto = autoRecalc;
+    if (wasAuto && edits.length > 0) {
+      try { await invoke("set_auto_recalc", { enabled: false }); } catch {}
+    }
+    try {
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch (e) {
+          statusMsg = `${description} failed: ${e}`;
+          focusGrid();
+          return;
+        }
+      }
+    } finally {
+      if (wasAuto && edits.length > 0) {
+        try {
+          await invoke("set_auto_recalc", { enabled: true });
+          await invoke("recalc");
+        } catch {}
       }
     }
     if (edits.length > 0) markWorkbookDirty();
@@ -3388,23 +3403,37 @@
     const sheet = activeSheet;
     const h = source.r2 - source.r1 + 1;
     const w = source.c2 - source.c1 + 1;
-    // Source rows may extend beyond the currently-loaded viewport
-    // band — without a fetch the top of a long source range comes
-    // back as empty (only the loaded rows had real `input` values
-    // in the cells Map), and the bug shows as "only the bottom rows
-    // moved". Same risk on the destination side, since we read the
-    // previous value there for the undo edit's `prev`.
-    await ensureRowsLoaded(
-      Math.min(source.r1, anchor.row),
-      Math.max(source.r2, anchor.row + h - 1),
+    // Both source and destination rectangles need to be in the cells
+    // Map before we read inputs for the edit list. ensureRowsLoaded
+    // only walks the currently-loaded column band, so wide selections
+    // (e.g. B..W when only A..E is in the viewport) silently lose
+    // every column past the band. fetchBand explicitly loads the
+    // full row × col rectangle for both source and destination.
+    statusMsg = `${kind === "move" ? "Moving" : "Copying"}…`;
+    const srcResult = await fetchBand(source.r1, source.r2, source.c1, source.c2);
+    const dstResult = await fetchBand(
+      anchor.row,
+      anchor.row + h - 1,
+      anchor.col,
+      anchor.col + w - 1,
     );
+    if (!srcResult || !dstResult) {
+      statusMsg = "Move cancelled — failed to load cells";
+      return;
+    }
+    // Index the freshly-loaded cells locally so subsequent reads see
+    // the values regardless of what's in the viewport's cells Map.
+    const srcByKey = new Map<string, string>();
+    for (const c of srcResult.list) srcByKey.set(key(c.row, c.col), c.input);
+    const dstByKey = new Map<string, string>();
+    for (const c of dstResult.list) dstByKey.set(key(c.row, c.col), c.input);
     const edits: EditOp[] = [];
     for (let r = 0; r < h; r++) {
       for (let c = 0; c < w; c++) {
-        const srcVal = cells.get(key(source.r1 + r, source.c1 + c))?.input ?? "";
+        const srcVal = srcByKey.get(key(source.r1 + r, source.c1 + c)) ?? "";
         const tgtR = anchor.row + r;
         const tgtC = anchor.col + c;
-        const prev = cells.get(key(tgtR, tgtC))?.input ?? "";
+        const prev = dstByKey.get(key(tgtR, tgtC)) ?? "";
         if (prev !== srcVal) edits.push({ row: tgtR, col: tgtC, prev, next: srcVal });
       }
     }
@@ -3415,15 +3444,33 @@
             r >= anchor.row && r < anchor.row + h &&
             c >= anchor.col && c < anchor.col + w;
           if (overlap) continue;
-          const prev = cells.get(key(r, c))?.input ?? "";
+          const prev = srcByKey.get(key(r, c)) ?? "";
           if (prev !== "") edits.push({ row: r, col: c, prev, next: "" });
         }
       }
     }
-    for (const op of edits) {
-      try {
-        await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-      } catch {}
+    // Suspend auto-recalc for the duration of the batch — every
+    // set_cell with auto-recalc on triggers a full model.evaluate(),
+    // which on a complex workbook is multi-second per cell. A 286-cell
+    // move would otherwise take minutes. Restore + recalc once at
+    // the end so formulas catch up in a single pass.
+    const wasAuto = autoRecalc;
+    if (wasAuto && edits.length > 0) {
+      try { await invoke("set_auto_recalc", { enabled: false }); } catch {}
+    }
+    try {
+      for (const op of edits) {
+        try {
+          await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
+        } catch {}
+      }
+    } finally {
+      if (wasAuto && edits.length > 0) {
+        try {
+          await invoke("set_auto_recalc", { enabled: true });
+          await invoke("recalc");
+        } catch {}
+      }
     }
     if (edits.length > 0) markWorkbookDirty();
     // Both source and destination row ranges may have changed (move
