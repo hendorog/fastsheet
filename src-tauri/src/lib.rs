@@ -19,7 +19,7 @@ mod xlsx_save;
 
 // Re-exports for the probe binary, which uses the same xlsx loader and
 // hidden-col scraper as the GUI.
-pub use hidden::extract_hidden_col_ranges;
+pub use hidden::{extract_default_row_height, extract_hidden_col_ranges};
 pub use xls_load::load_xls;
 pub use xls_save::{save_xls, save_xls_with_preserved};
 pub use xlsx_load::{load_xlsx_with_fallback, replicate_my_array_formulas};

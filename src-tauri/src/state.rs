@@ -59,6 +59,18 @@ pub(crate) struct AppState {
     /// shadow it: populated from the original xlsx's `<col hidden="1">`
     /// markers on load, mutated by set_column_hidden, queried by get_layout.
     pub(crate) hidden_cols: Mutex<HashMap<u32, HashSet<i32>>>,
+    /// Per-sheet `defaultRowHeight` from each xlsx worksheet's
+    /// `<sheetFormatPr>` element, in POINTS. Populated on load. Used
+    /// by `get_layout` to fill in the row height for any row in the
+    /// requested viewport that has NO explicit `Row` entry — IronCalc's
+    /// `Worksheet::row_height` falls back to the constant 14pt (=
+    /// 19px) for those rows regardless of the file, which under-
+    /// predicted ~1px per default row on real workbooks (e.g. a file
+    /// with `defaultRowHeight="15"` should render rows at 20px). The
+    /// frontend uses these heights to position the selection overlay,
+    /// so the under-prediction accumulates into a visible cursor-vs-
+    /// grid offset further down the sheet.
+    pub(crate) default_row_heights: Mutex<HashMap<u32, f64>>,
     /// Sheets with cell-style changes (number format, font, fill, etc.)
     /// that have NOT been persisted by the in-place save_preserving path.
     /// Non-empty → save_workbook routes to save_to_xlsx so styles flow
@@ -126,6 +138,7 @@ impl AppState {
             loaded: Mutex::new(None),
             dirty: Mutex::new(HashMap::new()),
             hidden_cols: Mutex::new(HashMap::new()),
+            default_row_heights: Mutex::new(HashMap::new()),
             style_dirty: Mutex::new(HashSet::new()),
             structural_dirty: Mutex::new(false),
             workbook_dirty: Mutex::new(false),

@@ -58,6 +58,30 @@ pub fn extract_hidden_col_ranges(zip_bytes: &[u8], sheet_path: &str) -> Vec<(i32
     out
 }
 
+/// Read the worksheet's `<sheetFormatPr defaultRowHeight="N">` from
+/// the raw xlsx XML. IronCalc's xlsx loader hardcodes 14.5pt for the
+/// default and only stores explicit `Row` entries for rows that have
+/// custom attributes — so for files specifying e.g. `defaultRowHeight="15"`
+/// every default-height row was under-predicted by ~0.67px in
+/// `get_row_height`'s 14pt fallback. The accumulated drift is what
+/// the user sees as a per-cell cursor-vs-grid offset further down
+/// the sheet. Returns `None` when the attribute is absent or
+/// unparseable; callers fall back to whatever IronCalc reports.
+pub fn extract_default_row_height(zip_bytes: &[u8], sheet_path: &str) -> Option<f64> {
+    use std::io::{Cursor, Read};
+    use zip::ZipArchive;
+    let mut zin = ZipArchive::new(Cursor::new(zip_bytes)).ok()?;
+    let mut xml = String::new();
+    zin.by_name(sheet_path)
+        .ok()?
+        .read_to_string(&mut xml)
+        .ok()?;
+    let i = xml.find("<sheetFormatPr")?;
+    let close = xml[i..].find('>')?;
+    let attrs = &xml[i..i + close];
+    parse_attr_val(attrs, "defaultRowHeight").and_then(|v| v.parse::<f64>().ok())
+}
+
 /// Diagnostic: report the sheet_path mapping and hidden-col ranges the
 /// backend has extracted. Called from the frontend status bar on demand.
 #[tauri::command]

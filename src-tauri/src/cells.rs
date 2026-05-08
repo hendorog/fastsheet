@@ -286,21 +286,28 @@ pub(crate) fn get_layout(
         };
         col_widths.push((col, w));
     }
+    // Default row height for rows that have no explicit `Row` entry.
+    // IronCalc's `get_row_height` falls back to a constant 14pt for
+    // those rows regardless of what the file specified — under-
+    // predicting ~1px per row on workbooks whose `defaultRowHeight`
+    // is 15 (the modern Excel default). Read the file's value (in
+    // points) and convert to IronCalc's internal `pt × 2` form.
+    let default_rh_guard = state.default_row_heights.lock().unwrap();
+    let file_default_internal: Option<f64> = default_rh_guard
+        .get(&sheet)
+        .map(|pt| pt * 2.0);
     let mut row_heights = Vec::new();
     for row in start_row..=end_row {
-        let hidden = ws
-            .rows
-            .iter()
-            .find(|r| r.r == row as i32)
-            .map(|r| r.hidden)
-            .unwrap_or(false);
-        let h = if hidden {
-            0.0
-        } else {
-            model.get_row_height(sheet, row as i32).unwrap_or(0.0)
+        let row_entry = ws.rows.iter().find(|r| r.r == row as i32);
+        let h = match row_entry {
+            Some(r) if r.hidden => 0.0,
+            Some(r) => r.height * 2.0, // ROW_HEIGHT_FACTOR; matches get_row_height
+            None => file_default_internal
+                .unwrap_or_else(|| model.get_row_height(sheet, row as i32).unwrap_or(0.0)),
         };
         row_heights.push((row, h));
     }
+    drop(default_rh_guard);
     let layout = LayoutData {
         col_widths,
         row_heights,

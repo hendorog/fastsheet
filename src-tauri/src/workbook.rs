@@ -5,7 +5,7 @@ use tauri::State;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::hidden::extract_hidden_col_ranges;
+use crate::hidden::{extract_default_row_height, extract_hidden_col_ranges};
 use crate::index::record_open_internal;
 use crate::state::{AppState, LoadedFile};
 use crate::xls_load::load_xls;
@@ -185,13 +185,21 @@ pub(crate) fn open_workbook(
         // Seed the in-memory hidden-column state from the original xlsx so
         // get_layout doesn't have to re-scrape the zip on every refresh,
         // and so set_column_hidden has somewhere to mutate.
+        let mut default_rh: HashMap<u32, f64> = HashMap::new();
         for (idx, sheet_path) in sheet_paths.iter().enumerate() {
             let ranges = extract_hidden_col_ranges(&bytes, sheet_path);
             let cols: HashSet<i32> = ranges.iter().flat_map(|(lo, hi)| *lo..=*hi).collect();
             if !cols.is_empty() {
                 hidden_cols_init.insert(idx as u32, cols);
             }
+            // Capture the file's per-sheet defaultRowHeight (in
+            // points). Used by get_layout to size rows that have no
+            // explicit Row entry — see state::default_row_heights.
+            if let Some(pt) = extract_default_row_height(&bytes, sheet_path) {
+                default_rh.insert(idx as u32, pt);
+            }
         }
+        *state.default_row_heights.lock().unwrap() = default_rh;
         *state.loaded.lock().unwrap() = Some(LoadedFile {
             path: path.clone(),
             bytes,
@@ -199,6 +207,7 @@ pub(crate) fn open_workbook(
         });
     } else {
         *state.loaded.lock().unwrap() = None;
+        state.default_row_heights.lock().unwrap().clear();
     }
     lap(&mut t, "snapshot+hidden");
     *state.hidden_cols.lock().unwrap() = hidden_cols_init;
@@ -240,6 +249,7 @@ pub(crate) fn new_workbook(state: State<'_, AppState>) -> Result<WorkbookInfo, S
     *state.xls_preserved.lock().unwrap() = None;
     state.dirty.lock().unwrap().clear();
     state.hidden_cols.lock().unwrap().clear();
+    state.default_row_heights.lock().unwrap().clear();
     state.style_dirty.lock().unwrap().clear();
     *state.structural_dirty.lock().unwrap() = false;
     *state.workbook_dirty.lock().unwrap() = false;
