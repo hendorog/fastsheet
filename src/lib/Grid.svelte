@@ -705,6 +705,7 @@
       class:frozen-row={isFrozenRow}
       class:frozen-col={isFrozenCol}
       class:frozen-corner={isFrozenRow && isFrozenCol}
+      class:cell-wrap={cell?.style?.wrap}
       class:page-break-row={pageBreakRows.has(rowIdx)}
       class:page-break-col={pageBreakCols.has(colIdx)}
       class:merged={merge != null}
@@ -1082,15 +1083,27 @@
     flex-direction: column;
     justify-content: flex-end;
   }
-  /* Wrap-text cells: clip wrapped lines to the configured row height
-     instead of letting the natural multi-line content grow the row.
-     Without this every wrap-true cell with text that wraps to two
-     lines makes its row twice as tall as rowOffsets predicts, and
-     the cursor / cell-edge alignment drifts for every row below it.
-     Excel auto-fits row heights to wrap content; we don't (yet), so
-     a row at default 20px shows the first line + clips the rest.
-     Top-align so the visible line is the first, not the last. */
+  /* Wrap-text cells: keep the cell's intrinsic height tied to the
+     row's configured height (style="height:N" on the <tr>) rather
+     than letting wrapped content grow it. `overflow: hidden` alone
+     isn't enough — the browser still measures the natural multi-
+     line height when computing row size. Lifting .cell-content out
+     of flow via `position: absolute` makes the cell's in-flow
+     content area effectively empty, so the row falls back to its
+     configured height and the cursor overlay (positioned from
+     rowOffsets) lines up.
+     This is the position:absolute + position:relative combination
+     that CLAUDE.md flags as "breaking spill into bg-styled
+     neighbours" — but ONLY for wrap cells. Wrap cells don't spill
+     (they wrap), so the spill rendering model isn't relevant for
+     them. Non-wrap cells keep the natural-flow `.cell-content`
+     and the spill behaviour stays intact. */
+  .cell.cell-wrap {
+    position: relative;
+  }
   .cell-content.wrap {
+    position: absolute;
+    inset: 0;
     overflow: hidden;
     justify-content: flex-start;
   }
