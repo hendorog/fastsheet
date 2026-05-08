@@ -114,11 +114,20 @@
   const ROWHDR_W = 42; // matches the colgroup row-header width
   const DEFAULT_ROW_H = 19;
   const DEFAULT_COL_W = 73;
+  /// Row heights MEASURED off the DOM after render. Wrap-text cells
+  /// auto-grow their row past the configured rowHeights value (the
+  /// browser respects `<tr style="height:N">` only as a min height
+  /// when content needs more), so rowOffsets built from rowHeights
+  /// alone would under-predict and the cursor would shrink relative
+  /// to the actual cell. Populated by the post-render $effect below;
+  /// rowOffsets prefers measured values when present.
+  let measuredRowHeights = $state<Map<number, number>>(new Map());
   let rowOffsets = $derived.by(() => {
     const out: number[] = new Array(rows + 2);
     out[1] = 0;
     for (let r = 1; r <= rows; r++) {
-      out[r + 1] = out[r] + (rowHeights.get(r) ?? DEFAULT_ROW_H);
+      const h = measuredRowHeights.get(r) ?? rowHeights.get(r) ?? DEFAULT_ROW_H;
+      out[r + 1] = out[r] + h;
     }
     return out;
   });
@@ -449,11 +458,16 @@
     const onResize = () => {
       viewportH = wrap.clientHeight;
       viewportW = wrap.clientWidth;
-      // Measure the actual column-header strip height so the selection
-      // overlay aligns with body cells. A hardcoded constant drifts by
-      // a few px depending on font rendering.
-      const thead = wrap.querySelector("thead") as HTMLElement | null;
-      if (thead) colhdrH = thead.offsetHeight;
+      // Measure the actual top of the first tbody row, NOT
+      // thead.offsetHeight. With border-collapse: collapse, the
+      // border between thead and tbody is shared and offsetHeight
+      // can land 1-2px short of the first row's actual offsetTop —
+      // visible to the user as a "cursor sits 2px above the cell"
+      // long-standing offset. tbody.offsetTop is the position the
+      // browser actually places the first row at, including any
+      // border-collapse rounding.
+      const tbody = wrap.querySelector("tbody") as HTMLElement | null;
+      if (tbody) colhdrH = tbody.offsetTop;
     };
     onResize();
     onScroll();
@@ -464,6 +478,54 @@
       wrap.removeEventListener("scroll", onScroll);
       ro.disconnect();
     };
+  });
+
+  /// After every render, walk the visible-band tbody rows and
+  /// reconcile their actual rendered heights into measuredRowHeights.
+  /// Wrap-text cells auto-grow their row past the configured height
+  /// (browsers grow rows to fit multi-line content, ignoring
+  /// `style="height:N"` as a minimum-only hint), so rowOffsets built
+  /// from rowHeights alone under-predicts in those cases. Without
+  /// this reconciliation the cursor overlay (top + height computed
+  /// from rowOffsets) shrinks relative to the actual cell, and rows
+  /// below a wrap-grown row drift.
+  ///
+  /// Only push back a measured value when it differs from the
+  /// configured rowHeights — saves churn on the (vast majority of)
+  /// rows that match exactly. Tolerance ±1 swallows browser
+  /// sub-pixel rounding.
+  $effect(() => {
+    if (!gridWrapEl) return;
+    // Re-trigger when geometry-affecting state changes.
+    rowHeights;
+    cells;
+    bandStart;
+    bandEnd;
+    requestAnimationFrame(() => {
+      const wrap = gridWrapEl;
+      if (!wrap) return;
+      const trs = wrap.querySelectorAll<HTMLTableRowElement>(
+        "tbody tr:not(.virt-spacer)",
+      );
+      let next: Map<number, number> | null = null;
+      for (const tr of trs) {
+        const dataR = tr.querySelector<HTMLElement>("[data-r]");
+        if (!dataR) continue;
+        const r = parseInt(dataR.dataset.r ?? "0", 10);
+        if (!r) continue;
+        const actual = tr.offsetHeight;
+        const configured = rowHeights.get(r) ?? DEFAULT_ROW_H;
+        if (actual <= 0) continue;
+        if (Math.abs(actual - configured) > 1) {
+          if (!next) next = new Map(measuredRowHeights);
+          if (next.get(r) !== actual) next.set(r, actual);
+        } else if (measuredRowHeights.has(r)) {
+          if (!next) next = new Map(measuredRowHeights);
+          next.delete(r);
+        }
+      }
+      if (next) measuredRowHeights = next;
+    });
   });
 
   // Visible row band — only these rows + frozen + buffer end up in the
@@ -642,17 +704,18 @@
   // independent of selRow/selCol so arrow keys don't trigger any
   // per-cell re-evaluation.
   let isMultiCell = $derived(selRow !== rangeEndRow || selCol !== rangeEndCol);
-  // Center the 2px cursor border on the cell's edge, Excel-style:
-  // 1px outside, 1px inside. With `box-sizing: border-box` the
-  // overlay's bounding box is `(left, top) → (left+width, top+height)`
-  // and the visible border sits entirely inside that box. Without the
-  // -1 / +2 offset the border draws 2px INSIDE the cell edges, which
-  // leaves a visible gap between the cell's gridline and the cursor.
+  // Selection cursor overlay. `colhdrH` is the actual offsetTop of
+  // the first tbody row (measured below) so the cursor sits flush
+  // with the cell's top edge regardless of how border-collapse
+  // resolves the thead/tbody border boundary in any given browser.
+  // `rowOffsets` cumulative sums use measured row heights when
+  // available so wrap cells (which grow the row beyond its
+  // configured height) still match the actual cell box.
   let selBox = $derived({
-    top: colhdrH + (rowOffsets[selRow] ?? 0) - 1,
-    left: (colLefts[selCol] ?? 0) - 1,
-    width: (colLefts[selCol + 1] ?? 0) - (colLefts[selCol] ?? 0) + 2,
-    height: (rowOffsets[selRow + 1] ?? 0) - (rowOffsets[selRow] ?? 0) + 2,
+    top: colhdrH + (rowOffsets[selRow] ?? 0),
+    left: colLefts[selCol] ?? 0,
+    width: (colLefts[selCol + 1] ?? 0) - (colLefts[selCol] ?? 0),
+    height: (rowOffsets[selRow + 1] ?? 0) - (rowOffsets[selRow] ?? 0),
   });
   let rangeBox = $derived({
     top: colhdrH + (rowOffsets[rangeBounds.r1] ?? 0),
@@ -705,7 +768,6 @@
       class:frozen-row={isFrozenRow}
       class:frozen-col={isFrozenCol}
       class:frozen-corner={isFrozenRow && isFrozenCol}
-      class:cell-wrap={cell?.style?.wrap}
       class:page-break-row={pageBreakRows.has(rowIdx)}
       class:page-break-col={pageBreakCols.has(colIdx)}
       class:merged={merge != null}
@@ -1083,28 +1145,13 @@
     flex-direction: column;
     justify-content: flex-end;
   }
-  /* Wrap-text cells: keep the cell's intrinsic height tied to the
-     row's configured height (style="height:N" on the <tr>) rather
-     than letting wrapped content grow it. `overflow: hidden` alone
-     isn't enough — the browser still measures the natural multi-
-     line height when computing row size. Lifting .cell-content out
-     of flow via `position: absolute` makes the cell's in-flow
-     content area effectively empty, so the row falls back to its
-     configured height and the cursor overlay (positioned from
-     rowOffsets) lines up.
-     This is the position:absolute + position:relative combination
-     that CLAUDE.md flags as "breaking spill into bg-styled
-     neighbours" — but ONLY for wrap cells. Wrap cells don't spill
-     (they wrap), so the spill rendering model isn't relevant for
-     them. Non-wrap cells keep the natural-flow `.cell-content`
-     and the spill behaviour stays intact. */
-  .cell.cell-wrap {
-    position: relative;
-  }
+  /* Wrap-text cells: render wrapped content in natural flow so the
+     row auto-fits to fit it (Excel-style row auto-grow). Top-align
+     the visible lines so reading order is natural. The actual
+     rendered row height is captured by the ResizeObserver below
+     and pushed back into rowHeights, so rowOffsets stays in sync
+     with the visible geometry and the cursor matches. */
   .cell-content.wrap {
-    position: absolute;
-    inset: 0;
-    overflow: hidden;
     justify-content: flex-start;
   }
   /* Inner positioning context for the overlay layer. The table sits
