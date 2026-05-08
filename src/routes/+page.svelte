@@ -3592,7 +3592,25 @@
     applyStyleOp(map[h], `Aligned ${h}`);
   }
 
-  function attrRange(kind: "bold" | "italic" | "underline" | "strike" | "reset") {
+  async function attrRange(kind: "bold" | "italic" | "underline" | "strike" | "wrap" | "reset") {
+    if (kind === "wrap") {
+      // SetWrap takes an explicit enabled flag, not a toggle, so flip
+      // off the active cell's current wrap state and apply the
+      // opposite to the whole selection. Mirrors how the bold/italic
+      // toggles work — the whole range converges on the new value.
+      try {
+        const info = await invoke<{ wrap: boolean }>("get_cell_format", {
+          sheet: activeSheet,
+          row: selRow,
+          col: selCol,
+        });
+        const next = !info.wrap;
+        applyStyleOp({ kind: "set_wrap", enabled: next }, next ? "Enabled wrap on" : "Disabled wrap on");
+      } catch (e) {
+        statusMsg = `Wrap toggle failed: ${e}`;
+      }
+      return;
+    }
     const map = {
       bold:      { op: { kind: "toggle_bold" },      label: "Toggled bold" },
       italic:    { op: { kind: "toggle_italic" },    label: "Toggled italic" },

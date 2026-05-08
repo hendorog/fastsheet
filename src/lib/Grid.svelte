@@ -496,11 +496,17 @@
   /// sub-pixel rounding.
   $effect(() => {
     if (!gridWrapEl) return;
-    // Re-trigger when geometry-affecting state changes.
+    // Re-trigger when geometry-affecting state changes. colWidths
+    // matters because wrap-text content reflows when its column's
+    // width changes — e.g. narrowing a wrap-text column makes the
+    // text wrap to more lines and the row grows. viewportW catches
+    // window resizes for the same reason.
     rowHeights;
     cells;
     bandStart;
     bandEnd;
+    colWidths;
+    viewportW;
     requestAnimationFrame(() => {
       const wrap = gridWrapEl;
       if (!wrap) return;
