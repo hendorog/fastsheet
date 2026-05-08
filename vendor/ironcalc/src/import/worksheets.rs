@@ -742,7 +742,19 @@ pub(super) fn load_sheet<R: Read + std::io::Seek>(
         .filter(|n| n.has_tag_name("sheetData"))
         .collect::<Vec<Node>>()[0];
 
-    let default_row_height = 14.5;
+    // Read the file's `<sheetFormatPr defaultRowHeight="N">` instead
+    // of hardcoding 14.5. This covers the case where a row HAS a
+    // <row> entry (because it carries a row-level style `s="..."` or
+    // similar) but no `ht` attribute — the loader needs to fall back
+    // to the file's default, not its own. fastsheet's
+    // AppState.default_row_heights side-channel handles the "no row
+    // entry at all" case; this handles "entry without ht".
+    let default_row_height = ws
+        .children()
+        .find(|n| n.has_tag_name("sheetFormatPr"))
+        .and_then(|n| n.attribute("defaultRowHeight"))
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(14.5);
 
     // holds a map from the formula index in Excel to the index in IronCalc
     let mut index_map = HashMap::new();
