@@ -4,7 +4,8 @@
   import {
     autoFitColumnPx,
     autoFitRowPx,
-    cellStyle,
+    cellTdStyle,
+    cellContentStyle,
     colLetter,
     key,
     parseA1,
@@ -51,8 +52,8 @@
     scrollTarget?: { row: number; col: number } | null;
     gridWrapEl?: HTMLDivElement | null;
     onDblClick: () => void;
-    onResizeRow: (row: number, px: number) => void;
-    onResizeCol: (col: number, px: number) => void;
+    onResizeRow: (row: number, px: number) => void | Promise<void>;
+    onResizeCol: (col: number, px: number) => void | Promise<void>;
     onContextMenu: (x: number, y: number, row: number, col: number) => void;
     onFill: (
       src: { r1: number; c1: number; r2: number; c2: number },
@@ -179,12 +180,21 @@
     drag = { ...drag, current: next };
   }
 
-  function onWindowMouseUp() {
+  async function onWindowMouseUp() {
     if (!drag) return;
     const final = drag;
+    // Don't clear `drag` yet — the parent's resize handler is async
+    // (it round-trips to the backend, then refreshViewport repopulates
+    // colWidths / rowHeights from the new layout). Clearing drag too
+    // early flips colWidthList back to the OLD value for the few
+    // frames between drag=null and the layout refresh, producing a
+    // visible "snap back to original then jump to new size" glitch.
+    if (final.kind === "col") {
+      await onResizeCol(final.index, final.current);
+    } else {
+      await onResizeRow(final.index, final.current);
+    }
     drag = null;
-    if (final.kind === "col") onResizeCol(final.index, final.current);
-    else onResizeRow(final.index, final.current);
   }
 
   // Auto-fit on resize-handle double-click. Measurement lives in utils
@@ -632,11 +642,17 @@
   // independent of selRow/selCol so arrow keys don't trigger any
   // per-cell re-evaluation.
   let isMultiCell = $derived(selRow !== rangeEndRow || selCol !== rangeEndCol);
+  // Center the 2px cursor border on the cell's edge, Excel-style:
+  // 1px outside, 1px inside. With `box-sizing: border-box` the
+  // overlay's bounding box is `(left, top) → (left+width, top+height)`
+  // and the visible border sits entirely inside that box. Without the
+  // -1 / +2 offset the border draws 2px INSIDE the cell edges, which
+  // leaves a visible gap between the cell's gridline and the cursor.
   let selBox = $derived({
-    top: colhdrH + (rowOffsets[selRow] ?? 0),
-    left: colLefts[selCol] ?? 0,
-    width: (colLefts[selCol + 1] ?? 0) - (colLefts[selCol] ?? 0),
-    height: (rowOffsets[selRow + 1] ?? 0) - (rowOffsets[selRow] ?? 0),
+    top: colhdrH + (rowOffsets[selRow] ?? 0) - 1,
+    left: (colLefts[selCol] ?? 0) - 1,
+    width: (colLefts[selCol + 1] ?? 0) - (colLefts[selCol] ?? 0) + 2,
+    height: (rowOffsets[selRow + 1] ?? 0) - (rowOffsets[selRow] ?? 0) + 2,
   });
   let rangeBox = $derived({
     top: colhdrH + (rowOffsets[rangeBounds.r1] ?? 0),
@@ -698,10 +714,14 @@
       data-c={colIdx}
       style={(isFrozenRow ? `top:${rowTop}px;` : "") +
         (isFrozenCol ? `left:${colLeft}px;` : "") +
-        (cell && !cell.text ? cellStyle(cell) : "")}
+        cellTdStyle(cell)}
     >
       {#if cell?.text}
-        <div class="cell-content" style={cellStyle(cell)}>
+        <div
+          class="cell-content"
+          class:wrap={cell.style?.wrap}
+          style={cellContentStyle(cell)}
+        >
           {cell.text}
         </div>
       {/if}
@@ -1061,6 +1081,18 @@
     display: flex;
     flex-direction: column;
     justify-content: flex-end;
+  }
+  /* Wrap-text cells: clip wrapped lines to the configured row height
+     instead of letting the natural multi-line content grow the row.
+     Without this every wrap-true cell with text that wraps to two
+     lines makes its row twice as tall as rowOffsets predicts, and
+     the cursor / cell-edge alignment drifts for every row below it.
+     Excel auto-fits row heights to wrap content; we don't (yet), so
+     a row at default 20px shows the first line + clips the rest.
+     Top-align so the visible line is the first, not the last. */
+  .cell-content.wrap {
+    overflow: hidden;
+    justify-content: flex-start;
   }
   /* Inner positioning context for the overlay layer. The table sits
      here too; both scroll together as the user drags grid-wrap. The

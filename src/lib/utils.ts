@@ -95,7 +95,38 @@ export function autoFitRowPx(
 /// Build the inline `style="..."` string for a cell from its CellStyleView.
 /// Numeric cells default to right-aligned and string cells to left when
 /// the style doesn't override.
-export function cellStyle(cell: CellView | undefined): string {
+///
+/// Two halves: borders + background + alignment go on the `<td>` itself
+/// so they sit on the cell's outer edge (table painting model). Font /
+/// color / text-decoration go on the inner `.cell-content` div which
+/// has padding 1px 4px — applying borders THERE would inset them by
+/// the padding offset, looking visibly wrong on real workbooks.
+export function cellTdStyle(cell: CellView | undefined): string {
+  if (!cell) return "";
+  const s = cell.style;
+  const parts: string[] = [];
+  if (s) {
+    if (s.bg) parts.push(`background:${s.bg}`);
+    if (s.align_h) parts.push(`text-align:${s.align_h}`);
+    if (s.align_v) parts.push(`vertical-align:${s.align_v}`);
+    if (s.border_top) parts.push("border-top:1px solid #000");
+    if (s.border_bottom) parts.push("border-bottom:1px solid #000");
+    if (s.border_left) parts.push("border-left:1px solid #000");
+    if (s.border_right) parts.push("border-right:1px solid #000");
+  }
+  // Default alignment (left for text, right for numbers) belongs on
+  // the <td> too — text-align inherits into .cell-content.
+  if (!s?.align_h && cell) {
+    const text = cell.text;
+    if (text !== "") {
+      const n = Number(text.replace(/,/g, "").trim());
+      if (Number.isFinite(n)) parts.push("text-align:right");
+    }
+  }
+  return parts.join(";");
+}
+
+export function cellContentStyle(cell: CellView | undefined): string {
   if (!cell) return "";
   const s = cell.style;
   const parts: string[] = [];
@@ -114,24 +145,14 @@ export function cellStyle(cell: CellView | undefined): string {
         `font-family:"${s.family.replace(/"/g, "")}", ui-monospace, monospace`,
       );
     if (s.color) parts.push(`color:${s.color}`);
-    if (s.bg) parts.push(`background:${s.bg}`);
-    if (s.align_h) parts.push(`text-align:${s.align_h}`);
-    if (s.align_v) parts.push(`vertical-align:${s.align_v}`);
+    // The cell's bg is set on the <td>; if the user has set a fill
+    // colour we still need .cell-content's solid background to stop
+    // spill from the left neighbour painting through. Drop the bg
+    // override here when it's applied — content's own fill comes
+    // from inheritance via background-color: inherit on .cell-content
+    // (set via the bg-styled-td flag below).
+    if (s.bg) parts.push("background:inherit");
     if (s.wrap) parts.push("white-space:normal");
-    if (s.border_top) parts.push("border-top:1px solid #000");
-    if (s.border_bottom) parts.push("border-bottom:1px solid #000");
-    if (s.border_left) parts.push("border-left:1px solid #000");
-    if (s.border_right) parts.push("border-right:1px solid #000");
-  }
-  if (!s?.align_h) {
-    // Excel default: numeric values right-align, text left-aligns.
-    // Includes formula cells whose evaluated text parses as a
-    // number. The `text !== ""` guard is critical — `Number("")`
-    // returns 0, so without it an empty formula result would
-    // spuriously right-align.
-    if (cell.text !== "" && !isNaN(Number(cell.text))) {
-      parts.push("text-align:right");
-    }
   }
   return parts.join(";");
 }
