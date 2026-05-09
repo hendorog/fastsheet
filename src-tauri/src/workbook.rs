@@ -82,7 +82,7 @@ fn load_model_for_import(path: &str) -> Result<Model<'static>, String> {
         .map(|e| e.eq_ignore_ascii_case("xls"))
         .unwrap_or(false);
     let mut model = if is_xls {
-        let (m, _, _) = load_xls(path)?;
+        let (m, _, _, _) = load_xls(path)?;
         m
     } else {
         let bytes = std::fs::read(path).ok();
@@ -124,15 +124,17 @@ pub(crate) fn open_workbook(
         .unwrap_or(false);
     let mut xls_hidden_cols: HashMap<u32, HashSet<i32>> = HashMap::new();
     let mut xls_preserved: crate::xls_preserve::PreservedXlsData = Default::default();
+    let mut xls_preserved_rgce: HashMap<(u32, i32, i32), Vec<u8>> = HashMap::new();
     // For xlsx we read the file bytes once and reuse them for both
     // MY* array-formula replication and the in-memory LoadedFile
     // snapshot used by save_preserving. Two reads of the same large
     // file across a WSL UNC share is the slowest path on cold open.
     let xlsx_bytes: Option<Vec<u8>> = if is_xls { None } else { std::fs::read(&path).ok() };
     let mut model = if is_xls {
-        let (m, hc, preserved) = load_xls(&path)?;
+        let (m, hc, preserved, prgce) = load_xls(&path)?;
         xls_hidden_cols = hc;
         xls_preserved = preserved;
+        xls_preserved_rgce = prgce;
         m
     } else {
         let mut m = load_xlsx_with_fallback(&path)?;
@@ -150,6 +152,14 @@ pub(crate) fn open_workbook(
     lap(&mut t, "load+replicate");
     model.evaluate();
     lap(&mut t, "evaluate");
+    // BUG-01 round-trip: post-evaluate, prune the raw-rgce map down
+    // to cells that actually display "#ERROR!" — those need their
+    // source bytes replayed verbatim because IronCalc's `Error::ERROR`
+    // has no BIFF representation. xlsx loads have an empty
+    // xls_preserved_rgce so this is a no-op for them.
+    if !xls_preserved_rgce.is_empty() {
+        xls_preserved_rgce = crate::xls_load::finalize_preserved_rgce(&model, xls_preserved_rgce);
+    }
     let names: Vec<String> = model
         .workbook
         .worksheets
@@ -180,7 +190,12 @@ pub(crate) fn open_workbook(
         } else {
             Some(xls_preserved)
         };
-    } else if let Some(bytes) = xlsx_bytes {
+        *state.preserved_formula_rgce.lock().unwrap() = xls_preserved_rgce;
+    } else {
+        // Non-xls open: clear any stale rgce map from a previous .xls load.
+        state.preserved_formula_rgce.lock().unwrap().clear();
+    }
+    if let Some(bytes) = xlsx_bytes {
         let sheet_paths = extract_sheet_paths(&bytes).unwrap_or_default();
         // Seed the in-memory hidden-column state from the original xlsx so
         // get_layout doesn't have to re-scrape the zip on every refresh,
@@ -247,6 +262,7 @@ pub(crate) fn new_workbook(state: State<'_, AppState>) -> Result<WorkbookInfo, S
     *state.model.lock().unwrap() = Some(model);
     *state.loaded.lock().unwrap() = None;
     *state.xls_preserved.lock().unwrap() = None;
+    state.preserved_formula_rgce.lock().unwrap().clear();
     state.dirty.lock().unwrap().clear();
     state.hidden_cols.lock().unwrap().clear();
     state.default_row_heights.lock().unwrap().clear();
@@ -385,7 +401,16 @@ fn save_workbook_inner(
             // lives in AppState's side-channel — thread it through so
             // COLINFO emits the hidden bit on save.
             let hidden = state.hidden_cols.lock().unwrap().clone();
-            let bytes = crate::xls_save::build_xls_bytes(model, Some(&hidden));
+            // BUG-01 round-trip: pass through the rgce we preserved on
+            // load for cells IronCalc couldn't parse. The writer emits
+            // those bytes verbatim instead of synthesizing a placeholder
+            // that loads back as #VALUE!.
+            let prgce = state.preserved_formula_rgce.lock().unwrap().clone();
+            let bytes = crate::xls_save::build_xls_bytes_with_options(
+                model,
+                Some(&hidden),
+                Some(&prgce),
+            );
             (bytes, preserved, vba_preserved)
         };
         let backup_path = if backup_already_created {
@@ -669,7 +694,7 @@ pub(crate) fn compare_open(
         .map(|e| e.eq_ignore_ascii_case("xls"))
         .unwrap_or(false);
     let mut right = if is_xls {
-        let (m, _hc, _preserved) = load_xls(&path)?;
+        let (m, _hc, _preserved, _prgce) = load_xls(&path)?;
         m
     } else {
         let mut m = load_xlsx_with_fallback(&path)?;

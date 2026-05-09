@@ -72,6 +72,14 @@ pub struct XlsShape {
     /// whenever calamine has a bug (comparison op swap, PtgExp
     /// shared-formula skip, PtgRef3d column quadrupling, etc.).
     pub ptgexp_cells: HashMap<(u32, i32, i32), Vec<u8>>,
+    /// Raw rgce bytes for every FORMULA cell — used only by the
+    /// .xls writer to replay an unparsable cell's bytes verbatim
+    /// (see xls_load's `preserved_rgce` capture and xls_save's
+    /// CellFormulaError emit). Does NOT feed the existing PtgExp
+    /// decoder path above; that one stays scoped to PtgExp cells
+    /// to avoid behavioural drift on normal formulas (calamine's
+    /// rendering remains authoritative for non-PtgExp cells).
+    pub formula_rgce: HashMap<(u32, i32, i32), Vec<u8>>,
     /// For each FORMULA cell, the ordered list of comparison
     /// operators (LT, LE, EQ, GE, GT, NE) actually present in the
     /// rgce. Used to correct calamine's GE/GT swap bug (opcodes
@@ -863,6 +871,19 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                     // calamine silently skips those.
                     if !rgce.is_empty() && rgce[0] == 0x01 {
                         shape.ptgexp_cells.insert(
+                            (sheet_idx as u32, rw, col),
+                            rgce.to_vec(),
+                        );
+                    }
+                    // Always cache the raw rgce regardless of the
+                    // first ptg, so the .xls writer can replay it
+                    // verbatim for cells whose formulas IronCalc
+                    // couldn't parse. Used by BUG-01 round-trip
+                    // preservation; the existing PtgExp decoder still
+                    // reads from `ptgexp_cells` above so its behaviour
+                    // doesn't broaden.
+                    if !rgce.is_empty() {
+                        shape.formula_rgce.insert(
                             (sheet_idx as u32, rw, col),
                             rgce.to_vec(),
                         );

@@ -143,7 +143,7 @@ impl PhaseTimer {
 
 pub fn load_xls(
     path: &str,
-) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>>, PreservedXlsData), String> {
+) -> Result<(Model<'static>, HashMap<u32, HashSet<i32>>, PreservedXlsData, HashMap<(u32, i32, i32), Vec<u8>>), String> {
     let mut timer = PhaseTimer::new();
     crate::util::profile_log(&format!("[load_xls] === path={path}"));
     // Read the file ONCE, then drive both calamine and the BIFF
@@ -402,12 +402,52 @@ pub fn load_xls(
                     })
                     .or_else(|| literal_to_input(cell));
 
-                let Some(v) = value else { continue };
                 let r = abs_row as i32 + 1;
                 let c = abs_col as i32 + 1;
+                // Constant-error cells (BIFF BoolErr record). Calamine
+                // surfaces these as `Data::Error`. Going through
+                // set_user_input via "=#VALUE!" style text fails to
+                // parse for VALUE/REF/NAME/NUM/NULL — IronCalc rejects
+                // those literals — so the cell would land as
+                // `CellFormulaError(ERROR)` (display "#ERROR!") and
+                // round-trip through xls_save as #VALUE!. Routing
+                // through the typed `set_cell_with_error` API stores
+                // a proper `Cell::ErrorCell` instead, which the writer
+                // emits as a BOOLERR record verbatim. Skip cells with
+                // non-empty formula text (genuine formula evaluating
+                // to an error) — those keep going through set_user_input.
+                if let Data::Error(e) = cell {
+                    if calamine_text.is_none() && own_decoded.is_none() {
+                        if r > max_row_1 { max_row_1 = r; }
+                        if c > max_col_1 { max_col_1 = c; }
+                        let ic_err = match e {
+                            calamine::CellErrorType::Null  => ironcalc::base::expressions::token::Error::NULL,
+                            calamine::CellErrorType::Div0  => ironcalc::base::expressions::token::Error::DIV,
+                            calamine::CellErrorType::Value => ironcalc::base::expressions::token::Error::VALUE,
+                            calamine::CellErrorType::Ref   => ironcalc::base::expressions::token::Error::REF,
+                            calamine::CellErrorType::Name  => ironcalc::base::expressions::token::Error::NAME,
+                            calamine::CellErrorType::Num   => ironcalc::base::expressions::token::Error::NUM,
+                            calamine::CellErrorType::NA | calamine::CellErrorType::GettingData
+                                => ironcalc::base::expressions::token::Error::NA,
+                        };
+                        if let Ok(ws) = model.workbook.worksheet_mut(sheet_idx as u32) {
+                            let _ = ws.set_cell_with_error(r, c, ic_err, 0);
+                        }
+                        continue;
+                    }
+                }
+                let Some(v) = value else { continue };
                 if r > max_row_1 { max_row_1 = r; }
                 if c > max_col_1 { max_col_1 = c; }
                 let _ = model.set_user_input(sheet_idx as u32, r, c, v);
+                // BUG-01 round-trip: if IronCalc couldn't parse the
+                // formula text we just handed it (calamine returned
+                // empty/garbage and our patches didn't recover), we
+                // lose the original formula identity. Stash the raw
+                // BIFF rgce bytes so the .xls writer can emit them
+                // verbatim instead of synthesizing a placeholder
+                // that loads back as #VALUE! instead of the
+                // original #ERROR!.
                 // For DateTime cells we wrote the raw Excel serial — apply
                 // a date number-format so it renders as a date instead of
                 // a number. (calamine doesn't surface the cell's original
@@ -832,10 +872,34 @@ pub fn load_xls(
     }
     timer.lap("my_replicate");
 
+
     // Hidden columns live in the AppState side-channel (IronCalc's Col
     // struct has no hidden field) — hand them back so the caller can
     // seed state.hidden_cols the same way xlsx does.
-    Ok((model, shape.hidden_cols, preserved))
+    // Hand the full per-cell rgce map back to the caller so it can
+    // call `finalize_preserved_rgce` after running model.evaluate()
+    // — the post-evaluate display tells us which cells actually
+    // need rgce preservation (those displaying "#ERROR!").
+    Ok((model, shape.hidden_cols, preserved, shape.formula_rgce))
+}
+
+/// Post-evaluate filter for the raw rgce map returned by `load_xls`.
+/// Keeps only entries whose cell displays as "#ERROR!" — IronCalc's
+/// catch-all error variant `Error::ERROR`, which has no BIFF code and
+/// otherwise degrades to #VALUE! on save through the placeholder-rgce
+/// path. Caller passes `model` AFTER `model.evaluate()` has run, so
+/// `get_formatted_cell_value` reflects the true post-evaluation state.
+pub fn finalize_preserved_rgce(
+    model: &Model<'_>,
+    formula_rgce: HashMap<(u32, i32, i32), Vec<u8>>,
+) -> HashMap<(u32, i32, i32), Vec<u8>> {
+    formula_rgce
+        .into_iter()
+        .filter(|((sheet, row, col), _)| {
+            let display = model.get_formatted_cell_value(*sheet, *row, *col).unwrap_or_default();
+            display == "#ERROR!"
+        })
+        .collect()
 }
 
 /// Normalize `A$1:B$1` and `$K$1:$B$65536`-style ranges so the

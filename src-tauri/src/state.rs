@@ -107,6 +107,16 @@ pub(crate) struct AppState {
     /// new_workbook and on any non-.xls open. Set to None when the
     /// source had no macros — most files.
     pub(crate) xls_preserved: Mutex<Option<crate::xls_preserve::PreservedXlsData>>,
+    /// Raw rgce bytes from FORMULA records whose formulas IronCalc
+    /// couldn't parse on load (calamine emitted empty text or
+    /// set_user_input rejected the result). Keyed by (sheet_idx, row,
+    /// col) — sheet 0-based, row/col 1-based per the existing
+    /// convention. The .xls writer uses this to emit the original
+    /// rgce verbatim for those cells, so error codes like #ERROR!
+    /// round-trip instead of being replaced by the generic
+    /// placeholder ptg sequence the encoder falls back to. Only
+    /// populated by the .xls load path; xlsx files don't need this.
+    pub(crate) preserved_formula_rgce: Mutex<HashMap<(u32, i32, i32), Vec<u8>>>,
     /// Active compare session: a right-side workbook loaded for diff
     /// purposes. Held in state so the trace command can enrich each
     /// node with the right-side value, and so the GUI can survive
@@ -144,6 +154,7 @@ impl AppState {
             workbook_dirty: Mutex::new(false),
             auto_recalc: Mutex::new(true),
             xls_preserved: Mutex::new(None),
+            preserved_formula_rgce: Mutex::new(HashMap::new()),
             compare: Mutex::new(None),
             protected_ranges: Mutex::new(HashMap::new()),
             input_ranges: Mutex::new(HashMap::new()),

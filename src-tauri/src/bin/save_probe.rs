@@ -16,8 +16,12 @@ use std::io::Read;
 fn main() {
     let path = std::env::args().nth(1).expect("usage: save_probe <input.xls>");
     println!("=== load {path}");
-    let (mut model, _hidden, _preserved) = fastsheet_lib::load_xls(&path).expect("load_xls");
+    let (mut model, _hidden, _preserved, raw_rgce) = fastsheet_lib::load_xls(&path).expect("load_xls");
     model.evaluate();
+    let prgce = fastsheet_lib::xls_load::finalize_preserved_rgce(&model, raw_rgce);
+    if !prgce.is_empty() {
+        println!("  preserved rgce for {} #ERROR!-displaying cells", prgce.len());
+    }
 
     // Optional cell-level inspection: set FASTSHEET_PROBE_CELL=sheet:row:col
     // to dump the cell's formula text + parsed Node + cell variant.
@@ -67,7 +71,8 @@ fn main() {
 
     let out = std::env::temp_dir().join("save_probe_out.xls");
     println!("=== save_xls → {}", out.display());
-    fastsheet_lib::save_xls(&model, &out).expect("save_xls");
+    let bytes = fastsheet_lib::xls_save::build_xls_bytes_with_options(&model, None, Some(&prgce));
+    fastsheet_lib::xls_save::write_xls_bytes_with_preserved(&out, &bytes, None).expect("save_xls");
     let bytes = std::fs::read(&out).expect("read back");
     println!("  wrote {} bytes", bytes.len());
 
@@ -98,7 +103,7 @@ fn main() {
     }
 
     println!("=== re-open via load_xls");
-    let (mut reloaded, _, _) = match fastsheet_lib::load_xls(&out.to_string_lossy()) {
+    let (mut reloaded, _, _, _) = match fastsheet_lib::load_xls(&out.to_string_lossy()) {
         Ok(t) => t,
         Err(e) => {
             println!("  load_xls FAILED: {e}");

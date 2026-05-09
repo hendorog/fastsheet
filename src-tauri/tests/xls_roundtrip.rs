@@ -45,7 +45,7 @@ struct Diff {
 fn round_trip(model: &Model, label: &str) -> RoundTripResult {
     let out = std::env::temp_dir().join(format!("fastsheet_rt_{label}.xls"));
     fastsheet_lib::save_xls(model, &out).expect("save_xls");
-    let (mut reloaded, _, _) =
+    let (mut reloaded, _, _, _) =
         fastsheet_lib::load_xls(&out.to_string_lossy()).expect("load_xls");
     reloaded.evaluate();
     let mut result = RoundTripResult { total: 0, mismatches: vec![] };
@@ -236,7 +236,7 @@ fn rt_column_widths_and_row_heights() {
 
     let out = std::env::temp_dir().join("fastsheet_rt_widths.xls");
     fastsheet_lib::save_xls(&m, &out).expect("save");
-    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    let (reloaded, _, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
     // get_column_width returns chars * 12 (internal form). Round to
     // tolerate u16 quantization on the BIFF wire.
     let w1 = reloaded.get_column_width(0, 1).unwrap_or(0.0).round();
@@ -259,7 +259,7 @@ fn rt_frozen_panes_rows_only() {
 
     let out = std::env::temp_dir().join("fastsheet_rt_frozen_rows.xls");
     fastsheet_lib::save_xls(&m, &out).expect("save");
-    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    let (reloaded, _, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
     std::fs::remove_file(&out).ok();
     assert_eq!(reloaded.workbook.worksheets[0].frozen_rows, 1);
     assert_eq!(reloaded.workbook.worksheets[0].frozen_columns, 0);
@@ -276,7 +276,7 @@ fn rt_frozen_panes_cols_only() {
 
     let out = std::env::temp_dir().join("fastsheet_rt_frozen_cols.xls");
     fastsheet_lib::save_xls(&m, &out).expect("save");
-    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    let (reloaded, _, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
     std::fs::remove_file(&out).ok();
     assert_eq!(reloaded.workbook.worksheets[0].frozen_rows, 0);
     assert_eq!(reloaded.workbook.worksheets[0].frozen_columns, 1);
@@ -292,7 +292,7 @@ fn rt_frozen_panes_both_axes() {
 
     let out = std::env::temp_dir().join("fastsheet_rt_frozen_both.xls");
     fastsheet_lib::save_xls(&m, &out).expect("save");
-    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    let (reloaded, _, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
     std::fs::remove_file(&out).ok();
     assert_eq!(reloaded.workbook.worksheets[0].frozen_rows, 3);
     assert_eq!(reloaded.workbook.worksheets[0].frozen_columns, 2);
@@ -306,7 +306,7 @@ fn rt_no_frozen_panes_stays_unfrozen() {
 
     let out = std::env::temp_dir().join("fastsheet_rt_unfrozen.xls");
     fastsheet_lib::save_xls(&m, &out).expect("save");
-    let (reloaded, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    let (reloaded, _, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
     std::fs::remove_file(&out).ok();
     assert_eq!(reloaded.workbook.worksheets[0].frozen_rows, 0);
     assert_eq!(reloaded.workbook.worksheets[0].frozen_columns, 0);
@@ -333,7 +333,7 @@ fn rt_hidden_cols_survive_save() {
 
     let out = std::env::temp_dir().join("fastsheet_rt_hidden_cols.xls");
     fastsheet_lib::save_xls_with_preserved(&m, &out, None, Some(&hidden)).expect("save");
-    let (_reloaded, hc_after, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    let (_reloaded, hc_after, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
     std::fs::remove_file(&out).ok();
     let cols = hc_after.get(&0).cloned().unwrap_or_default();
     assert!(cols.contains(&2), "col 2 should be hidden after round-trip");
@@ -350,7 +350,7 @@ fn rt_hidden_cols_default_state_has_none() {
 
     let out = std::env::temp_dir().join("fastsheet_rt_no_hidden.xls");
     fastsheet_lib::save_xls(&m, &out).expect("save");
-    let (_, hc_after, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    let (_, hc_after, _, _) = fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
     std::fs::remove_file(&out).ok();
     let cols = hc_after.get(&0).cloned().unwrap_or_default();
     assert!(cols.is_empty(), "no hidden cols expected, got {:?}", cols);
@@ -393,7 +393,7 @@ fn rt_external_fixture() {
         .unwrap_or(0);
 
     eprintln!("running round-trip on {}", path.display());
-    let (mut original, _, _) = fastsheet_lib::load_xls(&path.to_string_lossy()).expect("load");
+    let (mut original, _, _, _) = fastsheet_lib::load_xls(&path.to_string_lossy()).expect("load");
     original.evaluate();
     let r = round_trip(&original, "external");
     eprintln!(
@@ -439,9 +439,9 @@ fn rt_mutation_only_touches_one_cell() {
     fastsheet_lib::save_xls(&m, &mutated_path).expect("mutated save");
 
     // Reload both and diff.
-    let (mut baseline, _, _) =
+    let (mut baseline, _, _, _) =
         fastsheet_lib::load_xls(&baseline_path.to_string_lossy()).expect("reload baseline");
-    let (mut mutated, _, _) =
+    let (mut mutated, _, _, _) =
         fastsheet_lib::load_xls(&mutated_path.to_string_lossy()).expect("reload mutated");
     baseline.evaluate();
     mutated.evaluate();

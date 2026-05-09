@@ -2479,6 +2479,7 @@ fn emit_sheet_cells(
     defined_names: &DefinedNameTable,
     extern_names: &ExternNameTable,
     style_tables: &StyleTables,
+    preserved_rgce: Option<&HashMap<(u32, i32, i32), Vec<u8>>>,
 ) {
     use ironcalc::base::types::Cell;
     // Collect rows in sorted order.
@@ -2608,7 +2609,18 @@ fn emit_sheet_cells(
                 Cell::CellFormulaError { f, ei, .. } => {
                     let code = ironcalc_error_to_biff(ei);
                     let cached = FormulaCachedValue::Error(code);
-                    let rgce = encode_or_placeholder(parsed_formulas, *f, sheet_idx, anchor, xti, defined_names, extern_names, &cached, None);
+                    // BUG-01 round-trip: if we preserved the original
+                    // rgce on load (for cells whose formulas IronCalc
+                    // couldn't parse), emit those bytes verbatim. The
+                    // synthesized placeholder otherwise reloads as
+                    // #VALUE! instead of the source's #ERROR!.
+                    let key = (sheet_idx, *row, *col);
+                    let rgce = preserved_rgce
+                        .and_then(|m| m.get(&key))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            encode_or_placeholder(parsed_formulas, *f, sheet_idx, anchor, xti, defined_names, extern_names, &cached, None)
+                        });
                     w.write_record(R_FORMULA, &build_formula(rw, cl, ixfe, &cached, &rgce));
                 }
             }
@@ -2653,7 +2665,19 @@ pub fn build_xls_bytes(
     model: &ironcalc::base::Model,
     hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
 ) -> Vec<u8> {
-    build_workbook_stream(model, hidden_cols)
+    build_workbook_stream(model, hidden_cols, None)
+}
+
+/// Save-path entry that also accepts a preserved-rgce map. Cells whose
+/// IronCalc state is `CellFormulaError(ERROR)` AND have an entry here
+/// emit with the original BIFF rgce verbatim, so #ERROR! cells round-
+/// trip without degrading to #VALUE! through the placeholder path.
+pub fn build_xls_bytes_with_options(
+    model: &ironcalc::base::Model,
+    hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
+    preserved_rgce: Option<&HashMap<(u32, i32, i32), Vec<u8>>>,
+) -> Vec<u8> {
+    build_workbook_stream(model, hidden_cols, preserved_rgce)
 }
 
 pub fn write_xls_bytes_with_preserved<P: AsRef<Path>>(
@@ -2672,6 +2696,7 @@ pub fn write_xls_bytes_with_preserved<P: AsRef<Path>>(
 fn build_workbook_stream(
     model: &ironcalc::base::Model,
     hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
+    preserved_rgce: Option<&HashMap<(u32, i32, i32), Vec<u8>>>,
 ) -> Vec<u8> {
     let mut w = BiffWriter::new();
     let sheet_names: Vec<&str> = model
@@ -2895,7 +2920,7 @@ fn build_workbook_stream(
             w.write_record(R_ROW, &build_row_record(row, col_mic, col_mac));
         }
 
-        emit_sheet_cells(&mut w, ws, i as u32, &sst_table, &sst_idx, parsed, &xti, &defined_names, &extern_names, &style_tables);
+        emit_sheet_cells(&mut w, ws, i as u32, &sst_table, &sst_idx, parsed, &xti, &defined_names, &extern_names, &style_tables, preserved_rgce);
         w.write_record(R_WINDOW2, &build_window2(ws.frozen_rows, ws.frozen_columns));
         if ws.frozen_rows > 0 || ws.frozen_columns > 0 {
             w.write_record(R_PANE, &build_pane(ws.frozen_rows, ws.frozen_columns));
@@ -3263,7 +3288,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_r1c1.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         let v_rt = reloaded.get_formatted_cell_value(0, 25, 3).unwrap();
         assert_eq!(v_rt, "30", "round-trip preserves the divide");
@@ -3291,7 +3316,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_dn.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         assert_eq!(
             reloaded.get_formatted_cell_value(0, 5, 1).unwrap(),
@@ -3325,7 +3350,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_quote.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         assert_eq!(
             reloaded.get_formatted_cell_value(0, 1, 1).unwrap(),
@@ -3360,7 +3385,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_iferror.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         assert_eq!(
             reloaded.get_formatted_cell_value(0, 1, 1).unwrap(),
@@ -3388,7 +3413,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_3d.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         assert_eq!(
             reloaded.get_formatted_cell_value(0, 1, 1).unwrap(),
@@ -3415,7 +3440,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("fastsheet_xls_save_divide.xls");
         save_xls(&model, &path).expect("save_xls");
-        let (mut reloaded, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
+        let (mut reloaded, _, _, _) = load_xls(&path.to_string_lossy()).expect("load_xls");
         reloaded.evaluate();
         let v_rt = reloaded.get_formatted_cell_value(0, 3, 2).unwrap();
         assert_eq!(v_rt, "6", "after round-trip the divide should still apply");
