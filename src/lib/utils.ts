@@ -145,13 +145,13 @@ export function cellContentStyle(cell: CellView | undefined): string {
         `font-family:"${s.family.replace(/"/g, "")}", ui-monospace, monospace`,
       );
     if (s.color) parts.push(`color:${s.color}`);
-    // The cell's bg is set on the <td>; if the user has set a fill
-    // colour we still need .cell-content's solid background to stop
-    // spill from the left neighbour painting through. Drop the bg
-    // override here when it's applied — content's own fill comes
-    // from inheritance via background-color: inherit on .cell-content
-    // (set via the bg-styled-td flag below).
-    if (s.bg) parts.push("background:inherit");
+    // Set the bg explicitly on .cell-content so it paints opaquely in
+    // the table painting model's step 7. The TD's bg paints in step 6
+    // (cell backgrounds), but spill text from left neighbours paints
+    // in step 7 (cell content) too — only an opaque step-7 div masks
+    // it. `background: inherit` was tried first but didn't propagate
+    // reliably across browsers/WebView2; explicit color is robust.
+    if (s.bg) parts.push(`background-color:${s.bg}`);
     if (s.wrap) parts.push("white-space:normal");
   }
   return parts.join(";");

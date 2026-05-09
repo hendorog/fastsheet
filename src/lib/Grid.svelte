@@ -769,6 +769,8 @@
     {@const isFrozenCol = colIdx <= frozenCols}
     {@const colLeft = isFrozenCol ? frozenColLefts[colIdx] : null}
     {@const merge = mergeMap.anchors.get(cellKey)}
+    {@const right = cells.get(`${rowIdx}:${colIdx + 1}`)}
+    {@const clipRight = !!right?.text}
     <td
       class="cell"
       class:frozen-row={isFrozenRow}
@@ -785,13 +787,14 @@
         (isFrozenCol ? `left:${colLeft}px;` : "") +
         cellTdStyle(cell)}
     >
-      {#if cell?.text}
+      {#if cell?.text || cell?.style?.bg}
         <div
           class="cell-content"
           class:wrap={cell.style?.wrap}
+          class:clip-right={clipRight}
           style={cellContentStyle(cell)}
         >
-          {cell.text}
+          {cell?.text ?? ""}
         </div>
       {/if}
     </td>
@@ -1159,6 +1162,18 @@
      with the visible geometry and the cursor matches. */
   .cell-content.wrap {
     justify-content: flex-start;
+  }
+  /* Excel spill rule: text overflow stops at the first neighbour
+     cell with its own text. `overflow: visible` is the default so
+     spill flows through truly empty cells AND through bg-only
+     styled cells (matches gop.xlsx row 1 "Panelled sail Discount/
+     Lead time lookup" spilling through grey-tinted cells). When
+     the immediate right neighbour has text, we clip on the LEFT
+     cell to stop the spill before it paints over the neighbour's
+     glyphs. Keyed on `right.text` only (NOT `right.style?.bg`) — a
+     bg-only neighbour does not block spill. */
+  .cell-content.clip-right {
+    overflow: hidden;
   }
   /* Inner positioning context for the overlay layer. The table sits
      here too; both scroll together as the user drags grid-wrap. The
