@@ -178,6 +178,13 @@ fn parse_substreams(bytes: &[u8]) -> Vec<SubstreamSnapshot> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let mut current: Option<SubstreamSnapshot> = None;
+    // Depth tracker. BOF/EOF nest in the workbook stream because chart
+    // substreams CAN be embedded inside worksheet substreams (per
+    // [MS-XLS] §2.1.7.20.1), in which case the inner BOF/EOF are
+    // records of the parent — not substream boundaries. Only BOFs at
+    // depth 0 start a new top-level substream; only EOFs that close
+    // the outermost open substream end one.
+    let mut depth = 0u32;
     while i + 4 <= bytes.len() {
         let opcode = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
         let size = u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
@@ -187,30 +194,51 @@ fn parse_substreams(bytes: &[u8]) -> Vec<SubstreamSnapshot> {
         let data = bytes[i + 4..i + 4 + size].to_vec();
         i += 4 + size;
         if opcode == R_BOF {
-            // Close previous substream if it lacks an EOF (malformed
-            // but tolerable) and start a fresh one.
-            if let Some(prev) = current.take() {
-                out.push(prev);
+            if depth == 0 {
+                // Top-level BOF: start a new substream.
+                if let Some(prev) = current.take() {
+                    out.push(prev);
+                }
+                let dt = if size >= 4 {
+                    u16::from_le_bytes([data[2], data[3]])
+                } else {
+                    0
+                };
+                current = Some(SubstreamSnapshot {
+                    bof_dt: dt,
+                    records: vec![RawRecord { opcode, data }],
+                    index_in_source: out.len(),
+                });
+                depth = 1;
+                continue;
             }
-            // BOF data layout: vers(2) + dt(2) + ... — `dt` is what
-            // tells us whether this is globals/worksheet/chart/macro.
-            let dt = if size >= 4 {
-                u16::from_le_bytes([data[2], data[3]])
-            } else {
-                0
-            };
-            current = Some(SubstreamSnapshot {
-                bof_dt: dt,
-                records: vec![RawRecord { opcode, data }],
-                index_in_source: out.len(),
-            });
+            // Embedded BOF — keep it as a record of the parent.
+            depth += 1;
+        } else if opcode == R_EOF {
+            // Treat EOF symmetrically: only the outermost EOF closes
+            // the substream.
+            if depth > 1 {
+                depth -= 1;
+                if let Some(snap) = current.as_mut() {
+                    snap.records.push(RawRecord { opcode, data });
+                }
+                continue;
+            }
+            if depth == 1 {
+                if let Some(snap) = current.as_mut() {
+                    snap.records.push(RawRecord { opcode, data });
+                }
+                if let Some(prev) = current.take() {
+                    out.push(prev);
+                }
+                depth = 0;
+                continue;
+            }
+            // EOF at depth 0 — orphan; drop.
             continue;
         }
         if let Some(snap) = current.as_mut() {
             snap.records.push(RawRecord { opcode, data });
-            if opcode == R_EOF {
-                out.push(current.take().unwrap());
-            }
         }
         // Records before any BOF (shouldn't happen in a valid file)
         // are silently dropped.

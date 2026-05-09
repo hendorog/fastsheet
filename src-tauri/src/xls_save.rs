@@ -427,11 +427,18 @@ fn build_pane(frozen_rows: i32, frozen_columns: i32) -> Vec<u8> {
 /// Returns the body and the offset of the lbPlyPos field within it (so
 /// the caller can later patch the value).
 fn build_boundsheet8(name: &str) -> (Vec<u8>, usize) {
+    build_boundsheet8_full(name, 0, 0)
+}
+
+/// Variant that accepts the visibility flag and substream type — used
+/// by the preservation path to emit BOUNDSHEET8 entries for chart /
+/// macro substreams from the source.
+fn build_boundsheet8_full(name: &str, hs_state: u8, dt: u8) -> (Vec<u8>, usize) {
     let mut body = Vec::with_capacity(8 + name.len() + 2);
     let lb_ply_pos_offset = 0;
     body.put_u32(0); // lbPlyPos placeholder
-    body.put_u8(0);  // hsState: 0 = visible
-    body.put_u8(0);  // dt: 0 = sheet
+    body.put_u8(hs_state);
+    body.put_u8(dt);
     body.put_short_xl_unicode_string(name);
     (body, lb_ply_pos_offset)
 }
@@ -2820,6 +2827,22 @@ fn build_workbook_stream(
         boundsheet_patch_offsets.push(header_offset + 4 + field_offset);
     }
 
+    // Chart / macro sheets from the source. IronCalc has no
+    // representation for non-worksheet substreams, so we collect the
+    // raw record stream + BOUNDSHEET8 metadata and append both. Tab
+    // order shifts (charts move to the end) — acceptable cost for
+    // preservation.
+    let extra_substreams = preserved
+        .map(|p| crate::xls_save_passthrough::extract_extra_substreams(&p.workbook_substreams))
+        .unwrap_or_default();
+    let mut extra_patch_offsets: Vec<usize> = Vec::with_capacity(extra_substreams.len());
+    for extra in &extra_substreams {
+        let (body, field_offset) = build_boundsheet8_full(&extra.name, extra.hs_state, extra.dt);
+        let header_offset = w.pos() as usize;
+        w.write_record(R_BOUNDSHEET8, &body);
+        extra_patch_offsets.push(header_offset + 4 + field_offset);
+    }
+
     w.write_record(R_COUNTRY, &build_country());
 
     // Pre-pass: compute per-sheet extents + LABELSST refcount so the
@@ -2996,6 +3019,21 @@ fn build_workbook_stream(
         }
 
         w.write_record(R_EOF, &build_eof());
+    }
+
+    // ----- Preserved chart / macro substreams -----
+    // IronCalc doesn't represent chart sheets, so they round-tripped
+    // through nothing in the model. Emit the raw record stream for
+    // each with the BOUNDSHEET8 lbPlyPos patched to the substream's
+    // position in the output. Records (BOF, the chart's frames, EOF)
+    // are copied verbatim; cross-references inside the chart
+    // substream are self-contained.
+    for (extra, patch_off) in extra_substreams.iter().zip(extra_patch_offsets.iter()) {
+        let bof_pos = w.pos();
+        w.patch_u32(*patch_off, bof_pos);
+        for rec in extra.records {
+            w.write_record(rec.opcode, &rec.data);
+        }
     }
 
     w.into_bytes()

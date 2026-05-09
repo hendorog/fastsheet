@@ -39,9 +39,14 @@ use std::collections::HashMap;
 // Per-sheet record opcodes the writer owns. We strip these from
 // passthrough zones because the writer re-emits them from the
 // IronCalc model. Anything not in this set passes through verbatim.
+//
+// BOF/EOF are intentionally NOT in this set: at the substream
+// boundary the zone-splitting logic excludes them (zones start at
+// index 1 and stop before the trailing EOF), but EMBEDDED BOF/EOF
+// pairs — chart substreams nested inside a worksheet substream per
+// [MS-XLS] §2.1.7.20.1 — must pass through verbatim, otherwise the
+// embedded chart loses its framing on save.
 const OWNED_PER_SHEET: &[u16] = &[
-    0x0809, // BOF
-    0x000A, // EOF
     // Calculation / display headers
     0x000D, // CALCMODE
     0x000C, // CALCCOUNT
@@ -281,6 +286,63 @@ pub fn build_sheet_substream_index(globals: &SubstreamSnapshot) -> HashMap<Strin
         }
     }
     out
+}
+
+/// One non-worksheet substream found in the source — chart or macro
+/// sheets that IronCalc doesn't carry. The writer emits the
+/// substream's records verbatim after the worksheet substreams,
+/// with a corresponding BOUNDSHEET8 entry appended in globals.
+pub struct ExtraSubstream<'a> {
+    pub name: String,
+    pub hs_state: u8,
+    pub dt: u8,
+    pub records: &'a [RawRecord],
+}
+
+/// Walk the source's globals + workbook substreams to collect any
+/// substream whose BOUNDSHEET8 entry has dt != 0 (worksheet).
+/// Currently that's chart sheets (dt=2) and macro sheets (dt=1, dt=6
+/// for VB modules — but VB modules have no substream of their own).
+/// Returns slices that borrow from `substreams`, so the caller keeps
+/// the snapshot alive while emitting.
+pub fn extract_extra_substreams<'a>(
+    substreams: &'a [SubstreamSnapshot],
+) -> Vec<ExtraSubstream<'a>> {
+    let Some(globals) = substreams.iter().find(|s| s.bof_dt == 0x0005) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut sub_idx = 1usize; // index of next non-globals substream
+    for rec in &globals.records {
+        if rec.opcode == R_BOUNDSHEET8 {
+            let parsed = parse_boundsheet_full(&rec.data);
+            if let Some((name, hs_state, dt)) = parsed {
+                if dt != 0 && sub_idx < substreams.len() {
+                    out.push(ExtraSubstream {
+                        name,
+                        hs_state,
+                        dt,
+                        records: &substreams[sub_idx].records,
+                    });
+                }
+            }
+            sub_idx += 1;
+        }
+    }
+    out
+}
+
+/// Parse BOUNDSHEET8: lbPlyPos (4) + hsState (1) + dt (1) + name. The
+/// name is a ShortXLUnicodeString. Returns (name, hsState, dt) or
+/// None if malformed.
+fn parse_boundsheet_full(data: &[u8]) -> Option<(String, u8, u8)> {
+    if data.len() < 8 {
+        return None;
+    }
+    let hs_state = data[4];
+    let dt = data[5];
+    let name = parse_boundsheet_name(data)?;
+    Some((name, hs_state, dt))
 }
 
 /// BOUNDSHEET8 layout: lbPlyPos (u32), hsState (u8), dt (u8), then a
