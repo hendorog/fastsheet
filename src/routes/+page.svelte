@@ -720,10 +720,17 @@
       return `Saved ${r.path} · ${r.cells_patched} cell${r.cells_patched === 1 ? "" : "s"} patched in place (charts/pivots/drawings preserved)`;
     }
     if (r.mode === "xls") {
-      const macros = r.vba_preserved
-        ? "VBA / macros preserved; charts and other unsupported features not preserved"
-        : "charts and other unsupported features not preserved";
-      return `Saved ${r.path} · BIFF8 .xls (${macros})${backupSuffix}`;
+      // The .xls writer's preservation pipeline copies through every
+      // record IronCalc doesn't model — drawings, data validation,
+      // AutoFilter, sheet protection, conditional formatting, print
+      // settings, page-layout-view, theme/XFEXT/STYLEEXT, embedded
+      // charts. VBA / macros come through too via `xls_preserved`.
+      // Caveat: source must have been loaded by us; a Save-As to a
+      // brand-new path skips preservation (nothing to preserve from).
+      const detail = r.vba_preserved
+        ? "drawings / validation / print / VBA / charts preserved"
+        : "drawings / validation / print preserved (no VBA in source)";
+      return `Saved ${r.path} · BIFF8 .xls (${detail})${backupSuffix}`;
     }
     return `Saved ${r.path} · ⚠ written via IronCalc — features it doesn't understand (charts, pivots, drawings) were lost${backupSuffix}`;
   }

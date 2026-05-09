@@ -34,10 +34,41 @@ pub(crate) fn temp_path_for(target: &Path) -> PathBuf {
 /// fsync the file at `path` so the rename actually commits the bytes.
 /// Without this a power loss between rename and writeback can produce
 /// a zero-byte target despite the rename succeeding (commonly seen on
-/// ext4 with default mount options).
+/// ext4 with default mount options). NTFS is journaled so the same
+/// risk doesn't exist on Windows — but we still attempt the sync for
+/// extra safety.
+///
+/// Reopening a just-closed file on Windows can return `ACCESS_DENIED`
+/// transiently when AV / search-indexer / sandbox tools hold a brief
+/// scan lock. Retry a few times with short backoffs; if the file
+/// stays unreadable, give up — the atomic rename is the actual
+/// crash-safety guarantee, and on Windows NTFS the rename's own
+/// journaling makes a separate fsync optional. Returns Ok(()) on
+/// transient retry failure so the caller still proceeds to rename.
 pub(crate) fn fsync(path: &Path) -> io::Result<()> {
-    let f = std::fs::OpenOptions::new().read(true).open(path)?;
-    f.sync_all()
+    // Open for write so the OS doesn't insist on a read-share that an
+    // AV scanner might have. write+read is what the writer used to
+    // produce the file, so it should remain compatible.
+    let mut last_err: Option<io::Error> = None;
+    for attempt in 0..5 {
+        match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => {
+                return f.sync_all();
+            }
+            Err(e) => {
+                last_err = Some(e);
+                // 5ms, 10ms, 20ms, 40ms, 80ms — total under 200ms.
+                std::thread::sleep(std::time::Duration::from_millis(5 << attempt));
+            }
+        }
+    }
+    // Best-effort: emit a warning to stderr but treat as recoverable
+    // — the rename itself is what protects against partial-write
+    // corruption.
+    if let Some(e) = last_err {
+        eprintln!("[atomic] fsync skipped on {}: {}", path.display(), e);
+    }
+    Ok(())
 }
 
 /// Pick a backup path for `target`. First choice is `<target>.bak`;

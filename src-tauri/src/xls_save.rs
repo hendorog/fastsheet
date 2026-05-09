@@ -3127,7 +3127,7 @@ mod tests {
         for n in names.iter().skip(1) {
             let _ = model.add_sheet(n);
         }
-        build_workbook_stream(&model, None)
+        build_workbook_stream(&model, None, None, None)
     }
 
     #[test]
@@ -3269,7 +3269,7 @@ mod tests {
         // Force evaluation so the formula gets a cached numeric value.
         model.evaluate();
 
-        let bytes = build_workbook_stream(&model, None);
+        let bytes = build_workbook_stream(&model, None, None, None);
         let recs = read_records(&bytes);
         let types: Vec<u16> = recs.iter().map(|(t, _)| *t).collect();
 
@@ -3289,7 +3289,7 @@ mod tests {
         // colMic=1, colMac=7 (1-based last col).
         model.set_user_input(0, 3, 2, "1".to_string()).unwrap();
         model.set_user_input(0, 5, 7, "1".to_string()).unwrap();
-        let bytes = build_workbook_stream(&model, None);
+        let bytes = build_workbook_stream(&model, None, None, None);
 
         // Walk to the DIMENSIONS record in the sheet substream.
         let mut pos = 0usize;
@@ -3349,7 +3349,7 @@ mod tests {
         model.set_user_input(0, 1, 1, "foo".to_string()).unwrap();
         model.set_user_input(0, 2, 1, "foo".to_string()).unwrap();
         model.set_user_input(0, 3, 1, "bar".to_string()).unwrap();
-        let bytes = build_workbook_stream(&model, None);
+        let bytes = build_workbook_stream(&model, None, None, None);
 
         // Find the SST record and read cstTotal / cstUnique.
         let mut pos = 0usize;
@@ -3574,7 +3574,7 @@ mod tests {
 
         // Reload through our own xls reader.
         let path_str = path.to_string_lossy().into_owned();
-        let (mut reloaded, _hidden, _preserved) = load_xls(&path_str).expect("load_xls");
+        let (mut reloaded, _hidden, _preserved, _prgce) = load_xls(&path_str).expect("load_xls");
         reloaded.evaluate();
 
         // Pull cells back. IronCalc's get_formatted_cell_value gives us
@@ -3714,7 +3714,7 @@ mod tests {
         let mut model = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
         model.workbook.worksheets[0].frozen_rows = 1;
         model.workbook.worksheets[0].frozen_columns = 2;
-        let bytes = build_workbook_stream(&model, None);
+        let bytes = build_workbook_stream(&model, None, None, None);
 
         // Locate WINDOW2 + PANE positions (sheet substream only — find
         // them after the globals EOF).
@@ -3752,7 +3752,7 @@ mod tests {
     #[test]
     fn frozen_pane_omitted_when_no_freeze() {
         let model = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
-        let bytes = build_workbook_stream(&model, None);
+        let bytes = build_workbook_stream(&model, None, None, None);
         let panes = collect_bodies(&bytes, R_PANE);
         assert!(panes.is_empty(), "PANE must not be emitted without frozen panes");
     }
@@ -3768,7 +3768,7 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(5);
         hidden.insert(0u32, set);
-        let bytes = build_workbook_stream(&model, Some(&hidden));
+        let bytes = build_workbook_stream(&model, Some(&hidden), None, None);
         let bodies = collect_bodies(&bytes, R_COLINFO);
         let mut found_hidden = false;
         for body in bodies {
@@ -3789,7 +3789,7 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(3);
         hidden.insert(0u32, set);
-        let bytes = build_workbook_stream(&model, Some(&hidden));
+        let bytes = build_workbook_stream(&model, Some(&hidden), None, None);
         let bodies = collect_bodies(&bytes, R_COLINFO);
         // At least one COLINFO with the hidden bit covering col 3.
         let mut covered = false;
@@ -3813,7 +3813,7 @@ mod tests {
         set.insert(3);
         set.insert(4);
         hidden.insert(0u32, set);
-        let bytes = build_workbook_stream(&model, Some(&hidden));
+        let bytes = build_workbook_stream(&model, Some(&hidden), None, None);
         let bodies = collect_bodies(&bytes, R_COLINFO);
         let mut single_range = None;
         for body in bodies {
@@ -3842,7 +3842,7 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(3);
         hidden.insert(0u32, set);
-        let bytes = build_workbook_stream(&model, Some(&hidden));
+        let bytes = build_workbook_stream(&model, Some(&hidden), None, None);
         let bodies = collect_bodies(&bytes, R_COLINFO);
         let ranges: Vec<(u16, u16, u16)> = bodies
             .iter()
