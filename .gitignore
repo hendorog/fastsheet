@@ -25,3 +25,8 @@ vite.config.ts.timestamp-*
 CLAUDE.md
 HANDOVER_*.md
 SPIKE_FINDINGS.md
+
+# Session working notes from hands-off testing — investigation
+# artifacts, screenshots, probe output. Kept on disk for reference;
+# not part of the project history.
+/bugs/
