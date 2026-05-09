@@ -4712,7 +4712,11 @@
       <span class="menu-prompt">{breadcrumbText}&gt;</span>
       {#each levelItems as item, i}
         <span class="menu-item" class:hi={i === levelHighlight}>
-          <span class="letter">{item.letter}</span>{item.label.slice(1)}
+          {#if item.label.length > 0 && item.label[0].toLowerCase() === item.letter.toLowerCase()}
+            <span class="letter">{item.label[0]}</span>{item.label.slice(1)}
+          {:else}
+            <span class="letter">{item.letter}</span> {item.label}
+          {/if}
         </span>
       {/each}
     </div>
