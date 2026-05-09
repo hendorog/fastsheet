@@ -1329,11 +1329,19 @@ fn ironcalc_error_to_biff(e: &ironcalc::base::expressions::token::Error) -> u8 {
         Error::NAME => 0x1D,
         Error::NUM => 0x24,
         Error::NA => 0x2A,
-        // IronCalc has a few error codes BIFF doesn't natively
-        // represent (#GETTING_DATA, #SPILL!, #CIRC!, #N/IMPL!,
-        // #ERROR!). Fall back to #N/A so saved files round-trip
-        // without crashing Excel; the original value is lost in xls.
-        _ => 0x2A,
+        // IronCalc has error variants BIFF doesn't natively
+        // represent. Map to the closest BIFF equivalent:
+        //   ERROR  -> #VALUE! (Excel's catch-all for generic
+        //             evaluation failure; better than #N/A).
+        //   NIMPL  -> #VALUE! (we couldn't implement that fn).
+        //   SPILL  -> #VALUE! (no BIFF #SPILL!).
+        //   CALC   -> #VALUE! (generic calc failure).
+        //   CIRC   -> #VALUE! (Excel writes circular refs as 0,
+        //             but as a stable error we pick #VALUE!).
+        // The original variant is lost in xls; this is the
+        // best-faith mapping, and it eliminates the BUG-01
+        // "#ERROR! -> #N/A" round-trip drift.
+        Error::ERROR | Error::NIMPL | Error::SPILL | Error::CALC | Error::CIRC => 0x0F,
     }
 }
 
