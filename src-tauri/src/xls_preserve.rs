@@ -46,17 +46,46 @@ pub struct PreservedEntry {
     pub data: Option<Vec<u8>>,
 }
 
-/// Bundle of preserved entries from one source workbook. Iterating in
-/// order recreates the storage tree (parents before children — the
-/// extractor walks in CFB preorder).
+/// One BIFF record in its raw form. The writer can copy these straight
+/// into the output stream when we want to passthrough features the
+/// greenfield writer doesn't model (drawings, data validation,
+/// AutoFilter, sheet protection, conditional formatting, print
+/// settings, page-layout-view, theme/XFEXT/STYLEEXT, etc.).
+#[derive(Debug, Clone)]
+pub struct RawRecord {
+    pub opcode: u16,
+    pub data: Vec<u8>,
+}
+
+/// Records of one substream from the source `/Workbook`. `bof_dt` is
+/// the BOF dt field — 0x05 globals, 0x10 worksheet, 0x20 chart, 0x40
+/// macro sheet. `records` includes everything between BOF (inclusive)
+/// and EOF (inclusive). `index_in_source` is the original substream
+/// index in source order; needed because BOUNDSHEET8 entries in
+/// globals point at substream lbPlyPos, and we need to know which
+/// source substream corresponds to which IronCalc sheet during the
+/// splice phase.
+#[derive(Debug, Clone)]
+pub struct SubstreamSnapshot {
+    pub bof_dt: u16,
+    pub records: Vec<RawRecord>,
+    pub index_in_source: usize,
+}
+
+/// Bundle of preserved entries from one source workbook. Iterating
+/// `entries` in order recreates the VBA storage tree (parents before
+/// children — the extractor walks in CFB preorder).
+/// `workbook_substreams` is the per-substream record list of the
+/// source `/Workbook`, used by the writer's preservation splice path.
 #[derive(Debug, Clone, Default)]
 pub struct PreservedXlsData {
     pub entries: Vec<PreservedEntry>,
+    pub workbook_substreams: Vec<SubstreamSnapshot>,
 }
 
 impl PreservedXlsData {
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.workbook_substreams.is_empty()
     }
 }
 
@@ -80,6 +109,19 @@ pub fn extract(bytes: &[u8]) -> PreservedXlsData {
     let mut cfb = match cfb::CompoundFile::open(cursor) {
         Ok(c) => c,
         Err(_) => return PreservedXlsData::default(),
+    };
+    // Pull the workbook stream and split it into per-substream record
+    // lists. Used by xls_save's preservation splice to copy through
+    // features the greenfield writer doesn't model. Empty when the
+    // file isn't a valid xls.
+    let workbook_substreams = if cfb.exists("/Workbook") {
+        let mut wb_bytes = Vec::new();
+        match cfb.open_stream("/Workbook").and_then(|mut s| s.read_to_end(&mut wb_bytes).map(|_| ())) {
+            Ok(()) => parse_substreams(&wb_bytes),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
     };
     let mut entries = Vec::new();
     for root in VBA_STORAGE_ROOTS {
@@ -122,7 +164,61 @@ pub fn extract(bytes: &[u8]) -> PreservedXlsData {
             }
         }
     }
-    PreservedXlsData { entries }
+    PreservedXlsData { entries, workbook_substreams }
+}
+
+/// Walk the workbook stream byte-by-byte, splitting it at each BOF
+/// (0x0809) into a separate substream snapshot. Returns an empty
+/// vector if the stream is malformed; the caller treats absence of
+/// preserved records as "no passthrough available," which falls back
+/// to the greenfield writer's own emission.
+fn parse_substreams(bytes: &[u8]) -> Vec<SubstreamSnapshot> {
+    const R_BOF: u16 = 0x0809;
+    const R_EOF: u16 = 0x000A;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut current: Option<SubstreamSnapshot> = None;
+    while i + 4 <= bytes.len() {
+        let opcode = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        let size = u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        if i + 4 + size > bytes.len() {
+            break;
+        }
+        let data = bytes[i + 4..i + 4 + size].to_vec();
+        i += 4 + size;
+        if opcode == R_BOF {
+            // Close previous substream if it lacks an EOF (malformed
+            // but tolerable) and start a fresh one.
+            if let Some(prev) = current.take() {
+                out.push(prev);
+            }
+            // BOF data layout: vers(2) + dt(2) + ... — `dt` is what
+            // tells us whether this is globals/worksheet/chart/macro.
+            let dt = if size >= 4 {
+                u16::from_le_bytes([data[2], data[3]])
+            } else {
+                0
+            };
+            current = Some(SubstreamSnapshot {
+                bof_dt: dt,
+                records: vec![RawRecord { opcode, data }],
+                index_in_source: out.len(),
+            });
+            continue;
+        }
+        if let Some(snap) = current.as_mut() {
+            snap.records.push(RawRecord { opcode, data });
+            if opcode == R_EOF {
+                out.push(current.take().unwrap());
+            }
+        }
+        // Records before any BOF (shouldn't happen in a valid file)
+        // are silently dropped.
+    }
+    if let Some(prev) = current {
+        out.push(prev);
+    }
+    out
 }
 
 /// Replay the captured entries into a target CFB. Called by the xls
