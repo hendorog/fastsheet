@@ -71,7 +71,8 @@ fn main() {
 
     let out = std::env::temp_dir().join("save_probe_out.xls");
     println!("=== save_xls → {}", out.display());
-    let bytes = fastsheet_lib::xls_save::build_xls_bytes_with_options(&model, None, Some(&prgce));
+    let preserved = fastsheet_lib::xls_preserve::extract(&std::fs::read(&path).expect("read"));
+    let bytes = fastsheet_lib::xls_save::build_xls_bytes_with_options(&model, None, Some(&prgce), Some(&preserved));
     fastsheet_lib::xls_save::write_xls_bytes_with_preserved(&out, &bytes, None).expect("save_xls");
     let bytes = std::fs::read(&out).expect("read back");
     println!("  wrote {} bytes", bytes.len());

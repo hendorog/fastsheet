@@ -410,6 +410,7 @@ fn save_workbook_inner(
                 model,
                 Some(&hidden),
                 Some(&prgce),
+                preserved.as_ref(),
             );
             (bytes, preserved, vba_preserved)
         };

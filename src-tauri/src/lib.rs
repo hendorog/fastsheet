@@ -14,6 +14,7 @@ pub mod xls_biff;
 pub mod xls_load;
 pub mod xls_preserve;
 pub mod xls_save;
+mod xls_save_passthrough;
 mod xlsx_load;
 mod xlsx_save;
 

@@ -2657,7 +2657,7 @@ pub fn save_xls_with_preserved<P: AsRef<Path>>(
     preserved: Option<&crate::xls_preserve::PreservedXlsData>,
     hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
 ) -> Result<(), String> {
-    let bytes = build_xls_bytes(model, hidden_cols);
+    let bytes = build_xls_bytes_with_options(model, hidden_cols, None, preserved);
     write_xls_bytes_with_preserved(path, &bytes, preserved)
 }
 
@@ -2665,19 +2665,23 @@ pub fn build_xls_bytes(
     model: &ironcalc::base::Model,
     hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
 ) -> Vec<u8> {
-    build_workbook_stream(model, hidden_cols, None)
+    build_workbook_stream(model, hidden_cols, None, None)
 }
 
-/// Save-path entry that also accepts a preserved-rgce map. Cells whose
-/// IronCalc state is `CellFormulaError(ERROR)` AND have an entry here
-/// emit with the original BIFF rgce verbatim, so #ERROR! cells round-
-/// trip without degrading to #VALUE! through the placeholder path.
+/// Save-path entry that also accepts a preserved-rgce map AND the
+/// full source-substream snapshot. The rgce map handles `#ERROR!`
+/// round-trip (BUG-01); the substream snapshot drives the
+/// preservation passthrough that copies drawings, data validation,
+/// AutoFilter, sheet protection, conditional formatting, print
+/// settings, page-layout-view, theme/XFEXT/etc. through verbatim
+/// (greenfield writer doesn't model those).
 pub fn build_xls_bytes_with_options(
     model: &ironcalc::base::Model,
     hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
     preserved_rgce: Option<&HashMap<(u32, i32, i32), Vec<u8>>>,
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
 ) -> Vec<u8> {
-    build_workbook_stream(model, hidden_cols, preserved_rgce)
+    build_workbook_stream(model, hidden_cols, preserved_rgce, preserved)
 }
 
 pub fn write_xls_bytes_with_preserved<P: AsRef<Path>>(
@@ -2697,7 +2701,24 @@ fn build_workbook_stream(
     model: &ironcalc::base::Model,
     hidden_cols: Option<&HashMap<u32, HashSet<i32>>>,
     preserved_rgce: Option<&HashMap<(u32, i32, i32), Vec<u8>>>,
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
 ) -> Vec<u8> {
+    use crate::xls_save_passthrough as pt;
+    // Build sheet-name → source-substream-index map (lowercased keys
+    // for case-insensitive lookup, since BIFF is case-insensitive
+    // about sheet names). Empty when there's no preserved data, in
+    // which case every per-sheet zone lookup falls through to the
+    // greenfield emission with no passthrough.
+    let globals_substream = preserved.and_then(|p| {
+        p.workbook_substreams.iter().find(|s| s.bof_dt == 0x0005)
+    });
+    let sheet_substream_index: std::collections::HashMap<String, usize> = globals_substream
+        .map(pt::build_sheet_substream_index)
+        .unwrap_or_default();
+    let lookup_sheet_substream = |name: &str| -> Option<&crate::xls_preserve::SubstreamSnapshot> {
+        let idx = sheet_substream_index.get(&name.to_lowercase())?;
+        preserved?.workbook_substreams.get(*idx)
+    };
     let mut w = BiffWriter::new();
     let sheet_names: Vec<&str> = model
         .workbook
@@ -2861,11 +2882,24 @@ fn build_workbook_stream(
     let (sst_table, sst_idx) = build_sst_table(model);
     emit_sst(&mut w, &sst_table, total_labelsst_refs);
 
+    // Globals passthrough: append every source-globals record the
+    // writer doesn't model — MSODRAWINGGROUP (drawing-objects shared
+    // state, referenced by per-sheet MSODRAWING shape IDs), THEME,
+    // XFEXT, STYLEEXT, DXF, TABLESTYLES, XFCRC, FORCEFULLCALCULATION,
+    // EXCEL9FILE, RECALCID, FNGROUPCOUNT, TABID, etc. Position
+    // before EOF is permissive — Excel tolerates these as trailing
+    // records as long as they're inside the globals substream.
+    if let Some(globals) = globals_substream {
+        for rec in crate::xls_save_passthrough::globals_passthrough(globals) {
+            w.write_record(rec.opcode, &rec.data);
+        }
+    }
+
     w.write_record(R_EOF, &build_eof());
 
     // ----- Per-sheet substreams -----
     let empty_formulas: Vec<ironcalc::base::expressions::parser::Node> = Vec::new();
-    for (i, _name) in sheet_names.iter().enumerate() {
+    for (i, name) in sheet_names.iter().enumerate() {
         let ws = &model.workbook.worksheets[i];
         let parsed = model
             .parsed_formulas
@@ -2887,6 +2921,23 @@ fn build_workbook_stream(
         w.write_record(R_GUTS, &build_guts());
         w.write_record(R_DEFAULTROWHEIGHT, &build_defaultrowheight());
         w.write_record(R_WSBOOL, &build_wsbool());
+
+        // Preservation: per-sheet zones split out from the source
+        // substream of the sheet with the matching name. Empty zones
+        // when there's no preserved data — the writer falls back to
+        // greenfield emission.
+        let source_substream = lookup_sheet_substream(name);
+        let zones = source_substream
+            .map(crate::xls_save_passthrough::split_sheet_zones)
+            .unwrap_or_else(crate::xls_save_passthrough::SheetZones::empty);
+
+        // pre_dim zone: classic page-setup records (HEADER/FOOTER,
+        // HCENTER, VCENTER, margins, SETUP, PLS, page breaks),
+        // sheet-protection PROTECT/PASSWORD, etc. — landed here per
+        // [MS-XLS] §2.1.7.20.1 ordering.
+        for rec in &zones.pre_dim {
+            w.write_record(rec.opcode, &rec.data);
+        }
 
         // COLINFO records — derived from IronCalc Col entries layered
         // with the AppState hidden_cols side-channel. BIFF8 ordering
@@ -2921,10 +2972,29 @@ fn build_workbook_stream(
         }
 
         emit_sheet_cells(&mut w, ws, i as u32, &sst_table, &sst_idx, parsed, &xti, &defined_names, &extern_names, &style_tables, preserved_rgce);
+
+        // post_cells_pre_win2 zone: MERGECELLS, CONDFMT/CF, HLINK,
+        // DVAL/DV, PHONETICINFO, FEAT, etc. — these land between
+        // the cell table and WINDOW2 per spec.
+        for rec in &zones.post_cells_pre_win2 {
+            w.write_record(rec.opcode, &rec.data);
+        }
+
         w.write_record(R_WINDOW2, &build_window2(ws.frozen_rows, ws.frozen_columns));
         if ws.frozen_rows > 0 || ws.frozen_columns > 0 {
             w.write_record(R_PANE, &build_pane(ws.frozen_rows, ws.frozen_columns));
         }
+
+        // post_win2 zone: drawings (MSODRAWING/OBJ/TXO + CONTINUE),
+        // SHEETPROTECTION (FRT), RANGEPROTECTION, FRT HEADERFOOTER,
+        // PLV, FORCEFULLCALCULATION, FILTERMODE/AUTOFILTERINFO/
+        // AUTOFILTER. WINDOW2/PANE/SELECTION are filtered out
+        // because we re-emit them above from the model — keeps
+        // frozen-pane state consistent with edits.
+        for rec in &zones.post_win2 {
+            w.write_record(rec.opcode, &rec.data);
+        }
+
         w.write_record(R_EOF, &build_eof());
     }
 
