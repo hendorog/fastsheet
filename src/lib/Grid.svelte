@@ -717,17 +717,25 @@
   // `rowOffsets` cumulative sums use measured row heights when
   // available so wrap cells (which grow the row beyond its
   // configured height) still match the actual cell box.
+  // +1 on height covers the shared bottom border under
+  // `border-collapse: collapse` — `tr.offsetHeight` (and the
+  // configured row height) report the cell's content/inner height,
+  // but the visible cell extends through the 1px shared border with
+  // the row below. Without the bump the cursor's bottom border
+  // sits 1px above the grid line, leaving a sliver of white. Same
+  // logic for rangeBox / ghostBox / fillBox / highlights so all
+  // overlay boxes line up with the visible cell box.
   let selBox = $derived({
     top: colhdrH + (rowOffsets[selRow] ?? 0),
     left: colLefts[selCol] ?? 0,
     width: (colLefts[selCol + 1] ?? 0) - (colLefts[selCol] ?? 0),
-    height: (rowOffsets[selRow + 1] ?? 0) - (rowOffsets[selRow] ?? 0),
+    height: (rowOffsets[selRow + 1] ?? 0) - (rowOffsets[selRow] ?? 0) + 1,
   });
   let rangeBox = $derived({
     top: colhdrH + (rowOffsets[rangeBounds.r1] ?? 0),
     left: colLefts[rangeBounds.c1] ?? 0,
     width: (colLefts[rangeBounds.c2 + 1] ?? 0) - (colLefts[rangeBounds.c1] ?? 0),
-    height: (rowOffsets[rangeBounds.r2 + 1] ?? 0) - (rowOffsets[rangeBounds.r1] ?? 0),
+    height: (rowOffsets[rangeBounds.r2 + 1] ?? 0) - (rowOffsets[rangeBounds.r1] ?? 0) + 1,
   });
   let ghostBox = $derived(
     ghostRange
@@ -735,7 +743,7 @@
           top: colhdrH + (rowOffsets[ghostRange.r1] ?? 0),
           left: colLefts[ghostRange.c1] ?? 0,
           width: (colLefts[ghostRange.c2 + 1] ?? 0) - (colLefts[ghostRange.c1] ?? 0),
-          height: (rowOffsets[ghostRange.r2 + 1] ?? 0) - (rowOffsets[ghostRange.r1] ?? 0),
+          height: (rowOffsets[ghostRange.r2 + 1] ?? 0) - (rowOffsets[ghostRange.r1] ?? 0) + 1,
         }
       : null,
   );
@@ -744,7 +752,7 @@
       top: colhdrH + (rowOffsets[h.r1] ?? 0),
       left: colLefts[h.c1] ?? 0,
       width: (colLefts[h.c2 + 1] ?? 0) - (colLefts[h.c1] ?? 0),
-      height: (rowOffsets[h.r2 + 1] ?? 0) - (rowOffsets[h.r1] ?? 0),
+      height: (rowOffsets[h.r2 + 1] ?? 0) - (rowOffsets[h.r1] ?? 0) + 1,
       color: h.color,
       label: h.label ?? null,
     })),
@@ -755,7 +763,7 @@
     const cellTop = colhdrH + (rowOffsets[r] ?? 0);
     const cellLeft = colLefts[c] ?? 0;
     const cellW = (colLefts[c + 1] ?? 0) - (colLefts[c] ?? 0);
-    const cellH = (rowOffsets[r + 1] ?? 0) - (rowOffsets[r] ?? 0);
+    const cellH = (rowOffsets[r + 1] ?? 0) - (rowOffsets[r] ?? 0) + 1;
     const top = freeCorner === "tl" || freeCorner === "tr" ? cellTop - 3 : cellTop + cellH - 4;
     const left = freeCorner === "tl" || freeCorner === "bl" ? cellLeft - 3 : cellLeft + cellW - 4;
     return { top, left };
