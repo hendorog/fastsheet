@@ -5076,10 +5076,20 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    /* Suggestions strip below has `flex-basis: 100%` to take a full
+       row of its own; without `flex-wrap: wrap` the row overflows
+       and the label/input shrink to make room — squashing the
+       description text once the user starts typing. */
+    flex-wrap: wrap;
   }
   .menu-prompt-label {
     color: #f0c419;
     font-weight: 600;
+    /* Pin the label to its natural width — it must never shrink as
+       the input fills, even on narrow windows. The label IS the
+       feature description; truncating it makes the prompt
+       unreadable. */
+    flex-shrink: 0;
   }
   .menu-prompt-input {
     flex: 1;
