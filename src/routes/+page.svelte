@@ -2199,9 +2199,20 @@
       statusMsg = "Clipboard empty";
       return;
     }
-    const internal = internalClipboard && text === internalClipboard.displayTsv
-      ? internalClipboard
-      : null;
+    // Windows normalises clipboard text to CRLF and may add a trailing
+    // newline on round-trip. Compare normalized forms so paste from
+    // our own clipboard matches and we use stored .rows (formulas
+    // intact, relative-ref adjustment applied) instead of falling
+    // through to the OS-TSV split path which only carries display
+    // values. Without this, internal copy/paste flattens formulas
+    // to literals on Windows.
+    const normalizeClip = (s: string) =>
+      s.replace(/\r\n/g, "\n").replace(/\n+$/, "");
+    const internal =
+      internalClipboard &&
+      normalizeClip(text) === normalizeClip(internalClipboard.displayTsv)
+        ? internalClipboard
+        : null;
     const rowDelta = internal && !internal.cut ? selRow - internal.r1 : 0;
     const colDelta = internal && !internal.cut ? selCol - internal.c1 : 0;
     const rows = internal
