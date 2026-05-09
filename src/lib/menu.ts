@@ -450,7 +450,11 @@ export function saveMenuItems(cb: SaveMenuCallbacks): MenuItem[] {
     {
       letter: "R",
       label: "Replace",
-      description: "Overwrite the existing file (⚠ unsupported features lost)",
+      // The post-save status message describes the actual outcome
+      // (preserving xlsx, IronCalc fallback, xls greenfield) based
+      // on SaveResult.method. The pre-save prompt has no info to
+      // make a feature-loss warning accurate, so don't pretend.
+      description: "Overwrite the existing file",
       action: cb.replace,
     },
     {

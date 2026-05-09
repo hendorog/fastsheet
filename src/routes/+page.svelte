@@ -700,7 +700,10 @@
       await resizeViewportToSheet();
       await refreshViewport({ clear: true });
       await refreshNameCache();
-      statusMsg = `Opened ${p} (sheets: ${workbook.sheet_names.join(", ")})`;
+      // Sheet names are visible in <SheetTabs/> immediately above
+      // the status bar. Listing them all here would overflow the
+      // footer for big workbooks (gop has 40 sheets ≈ 400 chars).
+      statusMsg = `Opened ${p}`;
       focusGrid();
     } catch (e) {
       statusMsg = `Open failed: ${e}`;
@@ -5001,7 +5004,7 @@
     {#if selectionSummary}
       <span class="sel-summary">{selectionSummary}</span>
     {/if}
-    {statusMsg}
+    {#if statusMsg}<span class="status-msg" title={statusMsg}>{statusMsg}</span>{/if}
   </footer>
 </div>
 
@@ -5186,6 +5189,20 @@
     display: flex;
     gap: 0.6rem;
     align-items: center;
+    /* Keep the footer to a single line. statusMsg can be long;
+       individual flex children clip with ellipsis (see .status-msg)
+       rather than wrapping and pushing UI around. */
+    white-space: nowrap;
+    overflow: hidden;
+    flex: 0 0 auto;
+  }
+  .status-msg {
+    /* The free-text statusMsg slot. Truncates with ellipsis when
+       there isn't room; full text is in the title tooltip. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+    flex: 1 1 auto;
   }
   .path-tag {
     color: #1f6feb;
