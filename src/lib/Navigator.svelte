@@ -5,6 +5,11 @@
 
   type Props = {
     mode: "open" | "save";
+    /// What file kind the picker is for. "workbook" lists .xlsx / .xls
+    /// and shows the recents-of-workbooks block. "text" lists
+    /// .csv / .tsv / .txt and suppresses recents (workbook recents
+    /// would be misleading and there's no text-file recents store).
+    fileKind?: "workbook" | "text";
     currentPath: string;
     startDir?: string;
     onOpenFile: (path: string) => void | Promise<void>;
@@ -16,6 +21,7 @@
 
   let {
     mode,
+    fileKind = "workbook",
     currentPath,
     startDir = "",
     onOpenFile,
@@ -56,7 +62,7 @@
   async function navTo(path: string, cwd: string | null) {
     try {
       const previous = listing?.dir ?? null;
-      const result = await invoke<DirListing>("list_dir", { path, cwd });
+      const result = await invoke<DirListing>("list_dir", { path, cwd, kind: fileKind });
       listing = result;
       onDirectoryChange?.(result.dir);
       filter = "";
@@ -74,6 +80,14 @@
   }
 
   async function refreshRecents() {
+    // Recents are workbook-opens. For text pickers (/D Import) those
+    // would be misleading entries that the user can't actually pick
+    // (the backend filter rejects them), so suppress entirely.
+    if (fileKind === "text") {
+      recents = [];
+      recentDirs = [];
+      return;
+    }
     try {
       const [files, dirs] = await Promise.all([
         invoke<RecentEntry[]>("query_recents", { query: filter, limit: 8 }),

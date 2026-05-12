@@ -4806,6 +4806,7 @@
   {#if navOpen}
     <Navigator
       mode={navMode}
+      fileKind={navImportTarget ? "text" : "workbook"}
       {currentPath}
       startDir={fileDirectory}
       onOpenFile={async (p) => {
