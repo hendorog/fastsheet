@@ -5,15 +5,22 @@
 
   type Props = {
     mode: "open" | "save";
-    /// What file kind the picker is for. "workbook" lists .xlsx / .xls
-    /// and shows the recents-of-workbooks block. "text" lists
-    /// .csv / .tsv / .txt and suppresses recents (workbook recents
-    /// would be misleading and there's no text-file recents store).
-    fileKind?: "workbook" | "text";
+    /// What file kind the picker is for.
+    ///  - "workbook" lists .xlsx / .xls and shows the workbook-recents block.
+    ///  - "text" lists .csv / .tsv / .txt and suppresses recents.
+    ///  - "directory" lists directories only; prepends a synthetic
+    ///    "[Select this directory]" row that commits the current dir
+    ///    via onSelectDir. Recent-dirs surface as favourites and stay
+    ///    visible while browsing (no hasInteracted collapse).
+    fileKind?: "workbook" | "text" | "directory";
     currentPath: string;
     startDir?: string;
     onOpenFile: (path: string) => void | Promise<void>;
     onSaveFile: (path: string) => void | Promise<void>;
+    /// Called when fileKind === "directory" and the user commits a
+    /// directory (Enter on the synthetic select row, on a recent-dir
+    /// favourite, or by typing a nav-token path and pressing Enter).
+    onSelectDir?: (path: string) => void | Promise<void>;
     onDirectoryChange?: (dir: string) => void;
     onClose: () => void;
     onStatus: (msg: string) => void;
@@ -26,6 +33,7 @@
     startDir = "",
     onOpenFile,
     onSaveFile,
+    onSelectDir,
     onDirectoryChange,
     onClose,
     onStatus,
@@ -82,10 +90,21 @@
   async function refreshRecents() {
     // Recents are workbook-opens. For text pickers (/D Import) those
     // would be misleading entries that the user can't actually pick
-    // (the backend filter rejects them), so suppress entirely.
+    // (the backend filter rejects them), so suppress entirely. For
+    // directory pickers we still want the recent-dirs as favourites,
+    // but the file-recents are noise — fetch only the dirs.
     if (fileKind === "text") {
       recents = [];
       recentDirs = [];
+      return;
+    }
+    if (fileKind === "directory") {
+      try {
+        recents = [];
+        recentDirs = await invoke<RecentDir[]>("query_recent_dirs", { query: filter, limit: 12 });
+      } catch {
+        recentDirs = [];
+      }
       return;
     }
     try {
@@ -116,11 +135,20 @@
 
   let rows = $derived.by<NavRow[]>(() => {
     const out: NavRow[] = [];
-    if (!hasInteracted) {
+    const dirMode = fileKind === "directory";
+    if (dirMode && listing) {
+      // Always offer "select THIS directory" as the topmost row when
+      // picking a directory — without it, Enter on every list entry
+      // would navigate deeper and there'd be no way to commit the
+      // current dir.
+      out.push({ kind: "select_current", dir: listing.dir });
+    }
+    if (!hasInteracted || dirMode) {
       // Recent files first (newest open first, sorted server-side).
       // Then recent directories — a fallback "I want to go to a place
       // I've been recently" list. Both hidden once the user crosses
-      // into a new directory.
+      // into a new directory, EXCEPT in dir-pick mode where recent
+      // dirs ARE the favourites and stay visible while browsing.
       for (const r of recents) out.push({ kind: "recent", recent: r });
       for (const d of recentDirs) out.push({ kind: "recent_dir", recent_dir: d });
     }
@@ -192,14 +220,24 @@
   }
 
   async function activateRow(row: NavRow) {
+    if (row.kind === "select_current") {
+      await onSelectDir?.(row.dir);
+      return;
+    }
     if (row.kind === "recent") {
       await onOpenFile(row.recent.path);
       return;
     }
     if (row.kind === "recent_dir") {
-      // Re-base navigation at the chosen directory; navTo flips
-      // hasInteracted so both recents lists collapse and the user
-      // continues browsing from there. No file is opened yet.
+      // In dir-pick mode a recent dir IS the answer — commit it
+      // rather than re-basing navigation at it.
+      if (fileKind === "directory") {
+        await onSelectDir?.(row.recent_dir.dir);
+        return;
+      }
+      // Otherwise re-base navigation at the chosen directory; navTo
+      // flips hasInteracted so both recents lists collapse and the
+      // user continues browsing from there. No file is opened yet.
       await navTo(row.recent_dir.dir, null);
       return;
     }
@@ -289,8 +327,29 @@
       autofocus
     />
     <div class="nav-list" role="listbox">
-      {#each rows as row, i (row.kind + ":" + (row.kind === "recent" ? row.recent.path : row.kind === "recent_dir" ? row.recent_dir.dir : row.entry.name) + ":" + i)}
-        {#if row.kind === "recent"}
+      {#each rows as row, i (row.kind + ":" + (row.kind === "recent" ? row.recent.path : row.kind === "recent_dir" ? row.recent_dir.dir : row.kind === "select_current" ? row.dir : row.entry.name) + ":" + i)}
+        {#if row.kind === "select_current"}
+          <div
+            class="nav-row select-current"
+            class:sel={i === selectedIdx}
+            role="option"
+            aria-selected={i === selectedIdx}
+            tabindex="-1"
+            onclick={() => {
+              selectedIdx = i;
+              activateRow(row);
+            }}
+            onkeydown={(e) => {
+              if (e.key === "Enter") {
+                selectedIdx = i;
+                activateRow(row);
+              }
+            }}
+          >
+            <span class="nav-tag dir-tag">pick</span>
+            <span class="nav-name">[Select this directory] {row.dir}</span>
+          </div>
+        {:else if row.kind === "recent"}
           <div
             class="nav-row recent"
             class:sel={i === selectedIdx}
@@ -367,7 +426,13 @@
         <div class="nav-empty">no matches</div>
       {/if}
     </div>
-    <div class="nav-hint">↑/↓ Tab to select · Enter open · Esc cancel</div>
+    <div class="nav-hint">
+      {#if fileKind === "directory"}
+        ↑/↓ to select · Enter to pick directory or drill in · Esc cancel
+      {:else}
+        ↑/↓ Tab to select · Enter open · Esc cancel
+      {/if}
+    </div>
   </div>
 {/if}
 
@@ -428,10 +493,12 @@
     color: #d0e0ff;
   }
   .nav-row.recent,
-  .nav-row.recent-dir {
+  .nav-row.recent-dir,
+  .nav-row.select-current {
     gap: 0.6rem;
   }
-  .nav-row.recent-dir .nav-name {
+  .nav-row.recent-dir .nav-name,
+  .nav-row.select-current .nav-name {
     color: #1f6feb;
     font-weight: 600;
     flex: 1;
@@ -439,7 +506,8 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .nav-row.recent-dir.sel .nav-name {
+  .nav-row.recent-dir.sel .nav-name,
+  .nav-row.select-current.sel .nav-name {
     color: #fff;
   }
   .nav-tag {

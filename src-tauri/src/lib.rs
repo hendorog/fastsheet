@@ -104,6 +104,7 @@ pub fn run() {
             workbook::workbook_info,
             cells::get_cells,
             cells::set_cell,
+            cells::set_cells,
             cells::protect_range,
             cells::unprotect_range,
             cells::restrict_input_range,

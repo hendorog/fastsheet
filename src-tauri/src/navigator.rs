@@ -144,11 +144,13 @@ fn is_wsl_unc_root(path: &Path) -> bool {
 
 /// File-kind hint controlling which extensions `list_dir` surfaces. Workbook
 /// pickers (Open / Save As / Compare) show .xlsx + .xls; text pickers (the /D
-/// Import flow) show .csv + .tsv + .txt. Unknown values fall back to workbook.
-fn allowed_extensions(kind: Option<&str>) -> &'static [&'static str] {
+/// Import flow) show .csv + .tsv + .txt; directory pickers (/F D) hide every
+/// file entirely. Unknown values fall back to workbook.
+fn allowed_extensions(kind: Option<&str>) -> Option<&'static [&'static str]> {
     match kind {
-        Some("text") => &["csv", "tsv", "txt"],
-        _ => &["xlsx", "xls"],
+        Some("directory") => Some(&[]),
+        Some("text") => Some(&["csv", "tsv", "txt"]),
+        _ => Some(&["xlsx", "xls"]),
     }
 }
 
@@ -160,7 +162,7 @@ pub(crate) fn list_dir(
 ) -> Result<DirListing, String> {
     let cwd_path = cwd.as_deref().map(Path::new);
     let resolved = resolve_input(&path, cwd_path)?;
-    let exts = allowed_extensions(kind.as_deref());
+    let exts = allowed_extensions(kind.as_deref()).unwrap_or(&["xlsx", "xls"]);
     // Special case: server-root UNC paths like \\wsl.localhost\ — Rust's
     // read_dir can't enumerate these, so we synthesise the listing from
     // wsl.exe instead.
@@ -212,6 +214,10 @@ pub(crate) fn list_dir(
         // (/D Import) accept .csv / .tsv / .txt. Extensions matched
         // case-insensitively.
         if !is_dir {
+            if exts.is_empty() {
+                // Directory pickers (/F D) — hide every file.
+                continue;
+            }
             let lower = name.to_lowercase();
             let ok = exts.iter().any(|e| {
                 lower.len() > e.len() + 1

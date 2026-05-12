@@ -70,7 +70,10 @@ export type RecentDir = {
 export type NavRow =
   | { kind: "recent"; recent: RecentEntry }
   | { kind: "recent_dir"; recent_dir: RecentDir }
-  | { kind: "entry"; entry: DirEntry };
+  | { kind: "entry"; entry: DirEntry }
+  /// Synthetic row only used in fileKind="directory" pickers — Enter
+  /// commits the navigator's current listing.dir via onSelectDir.
+  | { kind: "select_current"; dir: string };
 
 export type MenuItem = {
   letter: string; // single uppercase char used for keyboard descent

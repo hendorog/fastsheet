@@ -381,6 +381,75 @@ pub(crate) fn set_cell(
         .unwrap_or_default())
 }
 
+#[derive(Deserialize)]
+pub(crate) struct CellInput {
+    row: u32,
+    col: u32,
+    value: String,
+}
+
+#[derive(Serialize, Default)]
+pub(crate) struct BulkSetResult {
+    applied: usize,
+    skipped: usize,
+}
+
+/// Batch counterpart to `set_cell`. Acquires the model mutex once for
+/// the whole vector instead of per-cell — collapses N IPC roundtrips
+/// down to one and lets the recalc-suspended import path actually
+/// stay fast. Per-cell protection / input-range checks still apply;
+/// cells that fail those checks are silently skipped and counted in
+/// `skipped`. Auto-recalc runs once at the end if enabled, not per
+/// cell.
+#[tauri::command]
+pub(crate) fn set_cells(
+    sheet: u32,
+    cells: Vec<CellInput>,
+    state: State<'_, AppState>,
+) -> Result<BulkSetResult, String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let mut dirty_map = state.dirty.lock().unwrap();
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+    let mut any_changed = false;
+    for cell in &cells {
+        if !cell_allowed_by_input_ranges(&state, sheet, cell.row, cell.col)
+            || cell_is_protected(&state, sheet, cell.row, cell.col)
+        {
+            skipped += 1;
+            continue;
+        }
+        let previous = model
+            .get_localized_cell_content(sheet, cell.row as i32, cell.col as i32)
+            .unwrap_or_default();
+        let changed = previous != cell.value;
+        let outcome = if cell.value.is_empty() {
+            model.cell_clear_contents(sheet, cell.row as i32, cell.col as i32)
+        } else {
+            model.set_user_input(sheet, cell.row as i32, cell.col as i32, cell.value.clone())
+        };
+        if outcome.is_err() {
+            skipped += 1;
+            continue;
+        }
+        dirty_map.insert((sheet, cell.row as i32, cell.col as i32), cell.value.clone());
+        if changed {
+            any_changed = true;
+        }
+        applied += 1;
+    }
+    drop(dirty_map);
+    let auto = *state.auto_recalc.lock().unwrap();
+    if auto && applied > 0 {
+        model.evaluate();
+    }
+    if any_changed {
+        *state.workbook_dirty.lock().unwrap() = true;
+    }
+    Ok(BulkSetResult { applied, skipped })
+}
+
 #[tauri::command]
 pub(crate) fn protect_range(
     sheet: u32,
