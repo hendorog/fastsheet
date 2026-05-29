@@ -199,6 +199,18 @@ Both use the active selection as the source. Arrow keys steer the
 destination cursor while the menu is in copy/move mode; Enter
 commits, Esc cancels.
 
+Copy and Move carry the full cell — values, formulas, formatting
+(font, fill, alignment, borders, number format) and any merged
+ranges fully inside the source — onto the destination. Move also
+clears the source's formatting and merges. The whole transfer is a
+single undo step.
+
+Move follows Excel's cut-&-paste rule for formula references: a
+reference that points at a moved cell follows the data to its new
+location (whether the reference lives in a moved formula or anywhere
+else in the workbook, including other sheets), while a reference that
+points outside the moved range is left exactly as written.
+
 ### `/F` File
 
 ```

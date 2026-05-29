@@ -1118,6 +1118,64 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// fastsheet addition. Rewrites a formula that STAYS at `cell` while
+    /// some other `area` is cut-and-pasted by (`row_delta`,
+    /// `column_delta`). This is the companion to
+    /// [Model::move_cell_value_to_area] (which rewrites the formulas that
+    /// are themselves being moved): together they implement Excel's full
+    /// cut && paste, where every reference targeting a moved cell follows
+    /// the data to its new home and every other reference is left verbatim.
+    ///
+    /// `move_cell_value_to_area` requires its `source` to lie inside
+    /// `area`; this method is for the cells OUTSIDE `area` whose formulas
+    /// merely reference into it, so it does not relocate `cell` — it only
+    /// displaces the in-area references.
+    ///
+    /// References that do not point into `area` are returned unchanged
+    /// (including their original textual form). Pass `row_delta == 0 &&
+    /// column_delta == 0` to obtain the formula's re-stringified baseline;
+    /// callers diff against that to detect whether any reference actually
+    /// moved before deciding to overwrite the cell.
+    pub fn displace_formula_for_cut(
+        &mut self,
+        value: &str,
+        cell: &CellReferenceIndex,
+        area: &Area,
+        row_delta: i32,
+        column_delta: i32,
+    ) -> Result<String, String> {
+        let Some(formula) = value.strip_prefix('=') else {
+            return Ok(value.to_string());
+        };
+        let sheet_name = self
+            .workbook
+            .worksheet(cell.sheet)
+            .map_err(|e| format!("Could not find worksheet: {e}"))?
+            .get_name();
+        let cell_reference = CellReferenceRC {
+            sheet: sheet_name.clone(),
+            row: cell.row,
+            column: cell.column,
+        };
+        let formula_str = move_formula(
+            &self.parser.parse(formula, &cell_reference),
+            &MoveContext {
+                source_sheet_name: &sheet_name,
+                row: cell.row,
+                column: cell.column,
+                area,
+                // The formula does not move, so its own anchor sheet is
+                // unchanged — only the referenced `area` is being moved.
+                target_sheet_name: &sheet_name,
+                row_delta,
+                column_delta,
+            },
+            self.locale,
+            self.language,
+        );
+        Ok(format!("={formula_str}"))
+    }
+
     /// 'Extends' the value from cell (`sheet`, `row`, `column`) to (`target_row`, `target_column`) in the same sheet
     ///
     /// # Examples

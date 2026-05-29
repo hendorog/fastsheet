@@ -895,6 +895,31 @@ pub(crate) fn apply_style_indices(
     Ok(())
 }
 
+/// Per-cell style indices for a rectangle, row-major (r outer, c inner).
+/// Mirrors the ordering `apply_style_indices` consumes, so a /Copy or
+/// /Move can read the source rectangle's indices and replay them onto
+/// the destination — the index points into the workbook-global style
+/// table, so reusing it gives the destination the identical style.
+#[tauri::command]
+pub(crate) fn get_range_style_indices(
+    sheet: u32,
+    r1: i32,
+    c1: i32,
+    r2: i32,
+    c2: i32,
+    state: State<'_, AppState>,
+) -> Result<Vec<i32>, String> {
+    let guard = state.model.lock().unwrap();
+    let model = guard.as_ref().ok_or("no workbook open")?;
+    let mut out = Vec::with_capacity(((r2 - r1 + 1) * (c2 - c1 + 1)).max(0) as usize);
+    for r in r1..=r2 {
+        for c in c1..=c2 {
+            out.push(model.get_cell_style_index(sheet, r, c)?);
+        }
+    }
+    Ok(out)
+}
+
 /// Apply a number-format string to every cell in a rectangle. Other style
 /// attributes (font, fill, alignment, borders) are preserved per-cell —
 /// we round-trip through get_style_for_cell so the format change doesn't
@@ -1238,6 +1263,191 @@ pub(crate) fn unmerge_cells(
         *state.workbook_dirty.lock().unwrap() = true;
     }
     Ok(removed)
+}
+
+/// Replace a sheet's entire merged-cell list. Used by /Copy and /Move
+/// (which translate the source's merges onto the destination) and by
+/// the undo/redo replay of those operations. Each range is validated +
+/// normalized through `parse_merge_range`; an unparseable entry fails
+/// the whole call so a bad list can't silently corrupt the model.
+#[tauri::command]
+pub(crate) fn set_sheet_merges(
+    sheet: u32,
+    ranges: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut normalized = Vec::with_capacity(ranges.len());
+    for raw in &ranges {
+        let (top, left, bottom, right) =
+            parse_merge_range(raw).ok_or_else(|| format!("Invalid merge range: {raw}"))?;
+        normalized.push(format_cell_range(top, left, bottom, right));
+    }
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    let ws = model
+        .workbook
+        .worksheets
+        .get_mut(sheet as usize)
+        .ok_or("bad sheet index")?;
+    let changed = ws.merge_cells != normalized;
+    ws.merge_cells = normalized;
+    drop(guard);
+    if changed {
+        *state.structural_dirty.lock().unwrap() = true;
+        *state.workbook_dirty.lock().unwrap() = true;
+    }
+    Ok(())
+}
+
+/// One cell-content change planned by `plan_move`: the cell's current
+/// localized input (`prev`) and what it must become (`next`). An empty
+/// `next` clears the cell. Three populations contribute: the moved cells
+/// rewritten at the destination (formulas rebased with
+/// `move_cell_value_to_area`), the vacated source cells, and every other
+/// formula in the workbook whose references point into the moved range
+/// (rebased with `displace_formula_for_cut`).
+#[derive(Serialize)]
+pub(crate) struct CellContentChange {
+    sheet: u32,
+    row: i32,
+    col: i32,
+    prev: String,
+    next: String,
+}
+
+/// Compute — but do NOT apply — the full set of cell-content changes for
+/// a /Move with Excel cut-&-paste reference semantics: a reference that
+/// targets a moved cell follows it to the new location; any other
+/// reference is left verbatim. The frontend applies the returned `next`
+/// values through the normal `set_cell` path, so the existing undo /
+/// recalc-suspend / dirty machinery stays in charge and this command only
+/// reads the model. Styles and merged ranges are handled separately by the
+/// caller.
+#[tauri::command]
+pub(crate) fn plan_move(
+    sheet: u32,
+    src_r1: i32,
+    src_c1: i32,
+    src_r2: i32,
+    src_c2: i32,
+    dst_r1: i32,
+    dst_c1: i32,
+    state: State<'_, AppState>,
+) -> Result<Vec<CellContentChange>, String> {
+    let mut guard = state.model.lock().unwrap();
+    let model = guard.as_mut().ok_or("no workbook open")?;
+    compute_move_changes(
+        model,
+        sheet,
+        (src_r1, src_c1, src_r2, src_c2),
+        (dst_r1, dst_c1),
+    )
+}
+
+/// Pure core behind [plan_move] — takes a `&mut Model` (mutable only
+/// because IronCalc's parser cache is `&mut`; no cells are written) and
+/// returns the planned changes. Callable from probes / tests without the
+/// Tauri `State` harness.
+pub(crate) fn compute_move_changes(
+    model: &mut ironcalc::base::Model<'_>,
+    sheet: u32,
+    src: (i32, i32, i32, i32),
+    dst: (i32, i32),
+) -> Result<Vec<CellContentChange>, String> {
+    use ironcalc::base::expressions::types::{Area, CellReferenceIndex};
+    let (src_r1, src_c1, src_r2, src_c2) = src;
+    let (dst_r1, dst_c1) = dst;
+    let (sr1, sc1, sr2, sc2) = normalize_cell_range(src_r1, src_c1, src_r2, src_c2)?;
+    let height = sr2 - sr1 + 1;
+    let width = sc2 - sc1 + 1;
+    let row_delta = dst_r1 - sr1;
+    let col_delta = dst_c1 - sc1;
+    let (dr1, dc1, dr2, dc2) = (dst_r1, dst_c1, dst_r1 + height - 1, dst_c1 + width - 1);
+    if dr1 < 1 || dc1 < 1 || dr2 > LAST_ROW || dc2 > LAST_COLUMN {
+        return Err("Move destination is out of bounds".to_string());
+    }
+
+    let area = Area { sheet, row: sr1, column: sc1, width, height };
+    let in_src = |s: u32, r: i32, c: i32| s == sheet && r >= sr1 && r <= sr2 && c >= sc1 && c <= sc2;
+    let in_dst = |s: u32, r: i32, c: i32| s == sheet && r >= dr1 && r <= dr2 && c >= dc1 && c <= dc2;
+
+    let mut changes = Vec::new();
+
+    // 1. Each destination cell takes the (rebased) content of the source
+    //    cell that maps onto it. Read from the unmodified model, so an
+    //    overlapping move is correct — every dest reads its own source.
+    for r in dr1..=dr2 {
+        for c in dc1..=dc2 {
+            let sr = r - row_delta;
+            let sc = c - col_delta;
+            let src_input = model.get_localized_cell_content(sheet, sr, sc)?;
+            let next = if src_input.is_empty() {
+                String::new()
+            } else {
+                let source = CellReferenceIndex { sheet, row: sr, column: sc };
+                let target = CellReferenceIndex { sheet, row: r, column: c };
+                model.move_cell_value_to_area(&src_input, &source, &target, &area)?
+            };
+            let prev = model.get_localized_cell_content(sheet, r, c)?;
+            if prev != next {
+                changes.push(CellContentChange { sheet, row: r, col: c, prev, next });
+            }
+        }
+    }
+
+    // 2. Source cells the destination does not cover are vacated.
+    for r in sr1..=sr2 {
+        for c in sc1..=sc2 {
+            if in_dst(sheet, r, c) {
+                continue;
+            }
+            let prev = model.get_localized_cell_content(sheet, r, c)?;
+            if !prev.is_empty() {
+                changes.push(CellContentChange { sheet, row: r, col: c, prev, next: String::new() });
+            }
+        }
+    }
+
+    // 3. Every other formula in the workbook whose references point into
+    //    the moved range follows the data. Cells inside the source or
+    //    destination rectangles are already settled by steps 1-2.
+    let sheet_count = model.workbook.worksheets.len() as u32;
+    for s in 0..sheet_count {
+        // Snapshot formula-cell coordinates first: the displace call below
+        // borrows the model mutably (parser cache), so we can't hold an
+        // iterator into sheet_data across it.
+        let mut formula_cells: Vec<(i32, i32)> = Vec::new();
+        {
+            let ws = model.workbook.worksheet(s)?;
+            for (row, cols) in &ws.sheet_data {
+                for (col, cell) in cols {
+                    if cell.has_formula() {
+                        formula_cells.push((*row, *col));
+                    }
+                }
+            }
+        }
+        for (row, col) in formula_cells {
+            if in_src(s, row, col) || in_dst(s, row, col) {
+                continue;
+            }
+            let value = model.get_localized_cell_content(s, row, col)?;
+            if !value.starts_with('=') {
+                continue;
+            }
+            let cell = CellReferenceIndex { sheet: s, row, column: col };
+            // Diff against the zero-delta re-stringification so only a real
+            // reference displacement — not cosmetic re-formatting — counts.
+            let baseline = model.displace_formula_for_cut(&value, &cell, &area, 0, 0)?;
+            let candidate =
+                model.displace_formula_for_cut(&value, &cell, &area, row_delta, col_delta)?;
+            if candidate != baseline {
+                changes.push(CellContentChange { sheet: s, row, col, prev: value, next: candidate });
+            }
+        }
+    }
+
+    Ok(changes)
 }
 
 /// Move one cell's content + style from (sr, sc) to (tr, tc), going
@@ -1792,4 +2002,57 @@ pub(crate) fn jump_edge(
         steps += 1;
     }
     Ok((r as u32, c as u32))
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+    use ironcalc::base::Model;
+
+    fn find(changes: &[CellContentChange], row: i32, col: i32) -> Option<&CellContentChange> {
+        changes.iter().find(|c| c.row == row && c.col == col)
+    }
+
+    /// /Move rebases references that point INTO the moved range (whether
+    /// inside a moved formula or in a formula elsewhere) and leaves
+    /// references pointing outside verbatim.
+    #[test]
+    fn move_rebases_internal_and_external_pointing_refs() {
+        let mut model = Model::new_empty("t", "en", "UTC", "en").unwrap();
+        // Column B block, rows 2-4. B4 references B2+B3 (internal to the block).
+        model.set_user_input(0, 2, 2, "10".to_string()).unwrap();
+        model.set_user_input(0, 3, 2, "20".to_string()).unwrap();
+        model.set_user_input(0, 4, 2, "=B2+B3".to_string()).unwrap();
+        // F1 references B2 (inside the block); G1 references A1 (outside).
+        model.set_user_input(0, 1, 6, "=B2*2".to_string()).unwrap();
+        model.set_user_input(0, 1, 7, "=A1".to_string()).unwrap();
+        model.evaluate();
+
+        // Move B2:B4 -> D2:D4 (two columns right).
+        let changes = compute_move_changes(&mut model, 0, (2, 2, 4, 2), (2, 4)).unwrap();
+
+        // Moved formula's internal refs follow the data.
+        assert_eq!(find(&changes, 4, 4).unwrap().next, "=D2+D3");
+        // Moved plain values land at the destination.
+        assert_eq!(find(&changes, 2, 4).unwrap().next, "10");
+        assert_eq!(find(&changes, 3, 4).unwrap().next, "20");
+        // Source cells are vacated.
+        assert_eq!(find(&changes, 2, 2).unwrap().next, "");
+        assert_eq!(find(&changes, 4, 2).unwrap().next, "");
+        // An external formula pointing into the moved block follows it.
+        assert_eq!(find(&changes, 1, 6).unwrap().next, "=D2*2");
+        // An external formula pointing outside the block is untouched.
+        assert!(find(&changes, 1, 7).is_none());
+    }
+
+    /// A moved formula whose reference points OUTSIDE the moved range keeps
+    /// pointing at the same absolute cell (text stays verbatim).
+    #[test]
+    fn move_keeps_out_of_area_refs_verbatim() {
+        let mut model = Model::new_empty("t", "en", "UTC", "en").unwrap();
+        model.set_user_input(0, 2, 2, "=Z1".to_string()).unwrap();
+        model.evaluate();
+        let changes = compute_move_changes(&mut model, 0, (2, 2, 2, 2), (2, 4)).unwrap();
+        assert_eq!(find(&changes, 2, 4).unwrap().next, "=Z1");
+    }
 }

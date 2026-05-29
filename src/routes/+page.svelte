@@ -1982,10 +1982,11 @@
   };
   type ValueUndoEntry = { kind: "value"; description: string; sheet: number; edits: EditOp[] };
   type StyleUndoEntry = { kind: "style"; description: string; sheet: number; edit: StyleEdit };
+  type MergeUndoEntry = { kind: "merge"; description: string; sheet: number; prev: string[]; next: string[] };
+  type LeafUndoEntry = ValueUndoEntry | StyleUndoEntry | MergeUndoEntry;
   type UndoEntry =
-    | ValueUndoEntry
-    | StyleUndoEntry
-    | { kind: "compound"; description: string; sheet: number; entries: (ValueUndoEntry | StyleUndoEntry)[] };
+    | LeafUndoEntry
+    | { kind: "compound"; description: string; sheet: number; entries: LeafUndoEntry[] };
   let history = $state<UndoEntry[]>([]);
   let historyIdx = $state(0);
   type InternalClipboard = {
@@ -2078,7 +2079,20 @@
     }
   }
 
-  async function restoreUndoEntry(entry: UndoEntry | ValueUndoEntry | StyleUndoEntry, restore: "prev" | "next") {
+  /// Replace a sheet's merged-cell list on the backend, then mirror it
+  /// into the local `mergedRanges` state when it's the active sheet so
+  /// the grid re-renders without a full layout refetch.
+  async function applyMerges(sheet: number, ranges: string[]) {
+    try {
+      await invoke("set_sheet_merges", { sheet, ranges });
+      if (sheet === activeSheet) mergedRanges = ranges;
+      markWorkbookDirty();
+    } catch (e) {
+      statusMsg = `Merge restore failed: ${e}`;
+    }
+  }
+
+  async function restoreUndoEntry(entry: UndoEntry | LeafUndoEntry, restore: "prev" | "next") {
     if (entry.kind === "compound") {
       const entries = restore === "prev" ? [...entry.entries].reverse() : entry.entries;
       for (const child of entries) {
@@ -2096,6 +2110,10 @@
         })),
       );
       noteRecalcPending(entry.edits.length);
+      return;
+    }
+    if (entry.kind === "merge") {
+      await applyMerges(entry.sheet, restore === "prev" ? entry.prev : entry.next);
       return;
     }
     await applyStyleIndices(entry.sheet, entry.edit, restore);
@@ -3509,6 +3527,55 @@
     growViewportToInclude(pendingMove.anchor.row, pendingMove.anchor.col);
   }
 
+  type Rect = { r1: number; c1: number; r2: number; c2: number };
+
+  /// Parse a merged-range string ("A1:B2", or "A1" for a degenerate
+  /// single cell) into a normalized Rect. Returns null on malformed
+  /// input so callers can drop unparseable entries.
+  function parseMergeRangeFrontend(s: string): Rect | null {
+    const parts = s.split(":");
+    const a = parseA1Frontend(parts[0]);
+    const b = parts[1] ? parseA1Frontend(parts[1]) : a;
+    if (!a || !b) return null;
+    return {
+      r1: Math.min(a.row, b.row), c1: Math.min(a.col, b.col),
+      r2: Math.max(a.row, b.row), c2: Math.max(a.col, b.col),
+    };
+  }
+  const serializeRect = (m: Rect) => `${addr(m.r1, m.c1)}:${addr(m.r2, m.c2)}`;
+  const rectsIntersect = (a: Rect, b: Rect) =>
+    a.r1 <= b.r2 && a.r2 >= b.r1 && a.c1 <= b.c2 && a.c2 >= b.c1;
+  const rectWithin = (inner: Rect, outer: Rect) =>
+    inner.r1 >= outer.r1 && inner.r2 <= outer.r2 &&
+    inner.c1 >= outer.c1 && inner.c2 <= outer.c2;
+  const arraysEqual = (a: number[], b: number[]) =>
+    a.length === b.length && a.every((v, i) => v === b[i]);
+
+  /// Build the destination's merged-cell list for a /Copy or /Move:
+  /// translate the source's fully-contained merges by the move offset,
+  /// drop any current merges the destination overwrites or (for move)
+  /// vacates, and drop kept merges that would collide with an incoming
+  /// translated one. Returns the de-duplicated next list.
+  function nextMergesForTransfer(
+    kind: "copy" | "move",
+    source: Rect,
+    dest: Rect,
+    dr: number,
+    dc: number,
+  ): string[] {
+    const cur = mergedRanges
+      .map((raw) => parseMergeRangeFrontend(raw))
+      .filter((m): m is Rect => m !== null);
+    const translated = cur
+      .filter((m) => rectWithin(m, source))
+      .map((m) => ({ r1: m.r1 + dr, c1: m.c1 + dc, r2: m.r2 + dr, c2: m.c2 + dc }));
+    let keep = cur.filter((m) => !rectsIntersect(m, dest));
+    if (kind === "move") keep = keep.filter((m) => !rectWithin(m, source));
+    keep = keep.filter((m) => !translated.some((t) => rectsIntersect(m, t)));
+    const next = [...keep, ...translated].map(serializeRect);
+    return [...new Set(next)];
+  }
+
   async function commitPendingMove() {
     if (!pendingMove) return;
     const { kind, source, anchor } = pendingMove;
@@ -3517,79 +3584,181 @@
     const sheet = activeSheet;
     const h = source.r2 - source.r1 + 1;
     const w = source.c2 - source.c1 + 1;
-    // Both source and destination rectangles need to be in the cells
-    // Map before we read inputs for the edit list. ensureRowsLoaded
-    // only walks the currently-loaded column band, so wide selections
-    // (e.g. B..W when only A..E is in the viewport) silently lose
-    // every column past the band. fetchBand explicitly loads the
-    // full row × col rectangle for both source and destination.
-    statusMsg = `${kind === "move" ? "Moving" : "Copying"}…`;
-    const srcResult = await fetchBand(source.r1, source.r2, source.c1, source.c2);
-    const dstResult = await fetchBand(
-      anchor.row,
-      anchor.row + h - 1,
-      anchor.col,
-      anchor.col + w - 1,
-    );
-    if (!srcResult || !dstResult) {
-      statusMsg = "Move cancelled — failed to load cells";
-      return;
-    }
-    // Index the freshly-loaded cells locally so subsequent reads see
-    // the values regardless of what's in the viewport's cells Map.
-    const srcByKey = new Map<string, string>();
-    for (const c of srcResult.list) srcByKey.set(key(c.row, c.col), c.input);
-    const dstByKey = new Map<string, string>();
-    for (const c of dstResult.list) dstByKey.set(key(c.row, c.col), c.input);
-    const edits: EditOp[] = [];
-    for (let r = 0; r < h; r++) {
-      for (let c = 0; c < w; c++) {
-        const srcVal = srcByKey.get(key(source.r1 + r, source.c1 + c)) ?? "";
-        const tgtR = anchor.row + r;
-        const tgtC = anchor.col + c;
-        const prev = dstByKey.get(key(tgtR, tgtC)) ?? "";
-        if (prev !== srcVal) edits.push({ row: tgtR, col: tgtC, prev, next: srcVal });
-      }
-    }
-    if (kind === "move") {
-      for (let r = source.r1; r <= source.r2; r++) {
-        for (let c = source.c1; c <= source.c2; c++) {
-          const overlap =
-            r >= anchor.row && r < anchor.row + h &&
-            c >= anchor.col && c < anchor.col + w;
-          if (overlap) continue;
-          const prev = srcByKey.get(key(r, c)) ?? "";
-          if (prev !== "") edits.push({ row: r, col: c, prev, next: "" });
-        }
-      }
-    }
-    await withSuspendedRecalc(async () => {
-      await withSuspendedRecalc(async () => {
-        await withSuspendedRecalc(async () => {
-          for (const op of edits) {
-            try {
-              await invoke("set_cell", { sheet, row: op.row, col: op.col, value: op.next });
-            } catch {}
-          }
-        });
-      });
-    });
-    if (edits.length > 0) markWorkbookDirty();
-    // Both source and destination row ranges may have changed (move
-    // clears source, both touch dest). Span the union.
-    await refreshRows(
-      Math.min(source.r1, anchor.row),
-      Math.max(source.r2, anchor.row + h - 1),
-    );
-    noteRecalcPending(edits.length);
+    const dr = anchor.row - source.r1;
+    const dc = anchor.col - source.c1;
     const span = source.r1 === source.r2 && source.c1 === source.c2
       ? addr(source.r1, source.c1)
       : `${addr(source.r1, source.c1)}:${addr(source.r2, source.c2)}`;
-    pushHistory({
-      description: `${kind === "move" ? "Move" : "Copy"} ${span} → ${addr(anchor.row, anchor.col)}`,
-      sheet,
-      edits,
+    if (dr === 0 && dc === 0) {
+      statusMsg = `${kind === "move" ? "Move" : "Copy"} destination matches source — nothing to do`;
+      return;
+    }
+    const destRect: Rect = {
+      r1: anchor.row, c1: anchor.col, r2: anchor.row + h - 1, c2: anchor.col + w - 1,
+    };
+    statusMsg = `${kind === "move" ? "Moving" : "Copying"}…`;
+
+    // Value/formula transfer, grouped by sheet (a /Move can rewrite
+    // formulas on other sheets). /Move uses Excel cut-&-paste semantics:
+    // the backend `plan_move` rewrites every reference that targets a
+    // moved cell — in the moved formulas AND anywhere else in the
+    // workbook — to follow the data, leaving all other references
+    // verbatim. /Copy is a verbatim input-string copy of the source
+    // rectangle onto the destination.
+    const valueEditsBySheet = new Map<number, EditOp[]>();
+    if (kind === "move") {
+      let planChanges: { sheet: number; row: number; col: number; prev: string; next: string }[];
+      try {
+        planChanges = await invoke("plan_move", {
+          sheet,
+          srcR1: source.r1, srcC1: source.c1, srcR2: source.r2, srcC2: source.c2,
+          dstR1: anchor.row, dstC1: anchor.col,
+        });
+      } catch (e) {
+        statusMsg = `Move cancelled — ${e}`;
+        return;
+      }
+      for (const ch of planChanges) {
+        const arr = valueEditsBySheet.get(ch.sheet) ?? [];
+        arr.push({ row: ch.row, col: ch.col, prev: ch.prev, next: ch.next });
+        valueEditsBySheet.set(ch.sheet, arr);
+      }
+    } else {
+      // Copy: fetch the full source + destination rectangles so a wide
+      // selection outside the loaded column band still copies in full.
+      const srcResult = await fetchBand(source.r1, source.r2, source.c1, source.c2);
+      const dstResult = await fetchBand(destRect.r1, destRect.r2, destRect.c1, destRect.c2);
+      if (!srcResult || !dstResult) {
+        statusMsg = "Copy cancelled — failed to load cells";
+        return;
+      }
+      const srcByKey = new Map<string, string>();
+      for (const c of srcResult.list) srcByKey.set(key(c.row, c.col), c.input);
+      const dstByKey = new Map<string, string>();
+      for (const c of dstResult.list) dstByKey.set(key(c.row, c.col), c.input);
+      const edits: EditOp[] = [];
+      for (let r = 0; r < h; r++) {
+        for (let c = 0; c < w; c++) {
+          const srcVal = srcByKey.get(key(source.r1 + r, source.c1 + c)) ?? "";
+          const tgtR = anchor.row + r;
+          const tgtC = anchor.col + c;
+          const prev = dstByKey.get(key(tgtR, tgtC)) ?? "";
+          if (prev !== srcVal) edits.push({ row: tgtR, col: tgtC, prev, next: srcVal });
+        }
+      }
+      if (edits.length > 0) valueEditsBySheet.set(sheet, edits);
+    }
+
+    // Per-cell style indices point into the workbook-global style table,
+    // so replaying the source rectangle's indices onto the destination
+    // reproduces formatting (font, fill, alignment, borders, number
+    // format) exactly. Order matters for /Move into an overlapping
+    // region: clear the source rect to default (entry A) BEFORE writing
+    // destination styles (entry B), so the overlap keeps the moved
+    // style instead of the cleared one. A ⟹ B is enforced below.
+    let srcIdx: number[] = [];
+    let dstPrevIdx: number[] = [];
+    try {
+      srcIdx = await invoke<number[]>("get_range_style_indices", {
+        sheet, r1: source.r1, c1: source.c1, r2: source.r2, c2: source.c2,
+      });
+      dstPrevIdx = await invoke<number[]>("get_range_style_indices", {
+        sheet, r1: destRect.r1, c1: destRect.c1, r2: destRect.r2, c2: destRect.c2,
+      });
+    } catch (e) {
+      statusMsg = `Move cancelled — could not read formatting: ${e}`;
+      return;
+    }
+    const styleEntries: StyleUndoEntry[] = [];
+    const moveClearsSource = kind === "move" && srcIdx.some((v) => v !== 0);
+    if (moveClearsSource) {
+      styleEntries.push({
+        kind: "style", description: "", sheet,
+        edit: {
+          r1: source.r1, c1: source.c1, r2: source.r2, c2: source.c2,
+          prev_indices: srcIdx, next_indices: srcIdx.map(() => 0),
+        },
+      });
+    }
+    if (!arraysEqual(dstPrevIdx, srcIdx) || moveClearsSource) {
+      styleEntries.push({
+        kind: "style", description: "", sheet,
+        edit: {
+          r1: destRect.r1, c1: destRect.c1, r2: destRect.r2, c2: destRect.c2,
+          prev_indices: dstPrevIdx, next_indices: srcIdx,
+        },
+      });
+    }
+
+    const prevMerges = [...mergedRanges];
+    const nextMerges = nextMergesForTransfer(kind, source, destRect, dr, dc);
+    const mergeChanged =
+      JSON.stringify([...prevMerges].sort()) !== JSON.stringify([...nextMerges].sort());
+
+    // Values first (recalc-suspended so a large transfer doesn't fire a
+    // full evaluate per cell), then styles (which set_user_input would
+    // not carry), then merges. This forward order mirrors the compound
+    // undo entry below so redo reproduces it step-for-step.
+    let totalEdits = 0;
+    await withSuspendedRecalc(async () => {
+      for (const [sht, edits] of valueEditsBySheet) {
+        for (const op of edits) {
+          totalEdits++;
+          try {
+            await invoke("set_cell", { sheet: sht, row: op.row, col: op.col, value: op.next });
+          } catch {}
+        }
+      }
     });
+    for (const se of styleEntries) {
+      try {
+        await invoke("apply_style_indices", {
+          sheet,
+          r1: se.edit.r1, c1: se.edit.c1, r2: se.edit.r2, c2: se.edit.c2,
+          indices: se.edit.next_indices,
+        });
+      } catch (e) {
+        statusMsg = `Formatting transfer failed: ${e}`;
+      }
+    }
+    if (mergeChanged) {
+      try {
+        await invoke("set_sheet_merges", { sheet, ranges: nextMerges });
+        mergedRanges = nextMerges;
+      } catch (e) {
+        statusMsg = `Merge transfer failed: ${e}`;
+      }
+    }
+
+    const changed = totalEdits > 0 || styleEntries.length > 0 || mergeChanged;
+    if (changed) markWorkbookDirty();
+    // A /Move can rewrite referencing formulas anywhere on the sheet, so
+    // reload the whole viewport; /Copy only touches the source + dest rows.
+    if (kind === "move") {
+      await refreshViewport();
+    } else {
+      await refreshRows(
+        Math.min(source.r1, anchor.row),
+        Math.max(source.r2, anchor.row + h - 1),
+      );
+    }
+    noteRecalcPending(totalEdits);
+
+    const undoEntries: LeafUndoEntry[] = [];
+    for (const [sht, edits] of valueEditsBySheet) {
+      undoEntries.push({ kind: "value", description: "", sheet: sht, edits });
+    }
+    undoEntries.push(...styleEntries);
+    if (mergeChanged) {
+      undoEntries.push({ kind: "merge", description: "", sheet, prev: prevMerges, next: nextMerges });
+    }
+    const description = `${kind === "move" ? "Move" : "Copy"} ${span} → ${addr(anchor.row, anchor.col)}`;
+    if (undoEntries.length === 1) {
+      undoEntries[0].description = description;
+      pushHistory(undoEntries[0]);
+    } else if (undoEntries.length > 1) {
+      pushHistory({ kind: "compound", description, sheet, entries: undoEntries });
+    }
     statusMsg = `${kind === "move" ? "Moved" : "Copied"} ${span} → ${addr(anchor.row, anchor.col)}`;
     // Move the cursor to the destination so the user can keep working there.
     selRow = anchor.row;
