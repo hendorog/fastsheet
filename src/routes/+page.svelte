@@ -383,6 +383,17 @@
   // loaded set is what's currently in the `cells` Map; clearing it
   // forces a re-fetch (used after edits / recalc / sheet switch).
   let loadedRows = new Set<number>();
+  // Bound the `cells` cache (#80): paged fetch grows the Map as the user
+  // scrolls a tall sheet and, without this, never shrinks. `rowLru` is a
+  // recency-ordered view of the loaded rows (JS Map preserves insertion
+  // order; `touchRows` re-inserts to push a row to the most-recent end).
+  // When `loadedRows.size` crosses MAX_LOADED_ROWS, `evictDistantRows`
+  // drops the least-recently-fetched rows outside the visible band down
+  // to TARGET_LOADED_ROWS. Generous enough that normal scroll-back never
+  // refetches; only a long session over a very tall sheet hits it.
+  const MAX_LOADED_ROWS = 2000;
+  const TARGET_LOADED_ROWS = 1200;
+  let rowLru = new Map<number, true>();
   let bandStart = 1;
   let bandEnd = 0;
   let bandLoadRaf: number | null = null;
@@ -459,6 +470,48 @@
     return { list, layout };
   }
 
+  /// Mark rows [r1..r2] most-recently-used. Re-inserting moves them to
+  /// the recent end of `rowLru` so eviction drops the front (oldest).
+  function touchRows(r1: number, r2: number) {
+    for (let r = r1; r <= r2; r++) {
+      rowLru.delete(r);
+      rowLru.set(r, true);
+    }
+  }
+
+  /// Bound the `cells` cache (#80). When more than MAX_LOADED_ROWS rows
+  /// are cached, evict the least-recently-fetched rows — skipping the
+  /// protected (visible / just-fetched) band so on-screen rows never go
+  /// blank — until back down to TARGET_LOADED_ROWS. An evicted row drops
+  /// its cells, its row height, and its loaded/recency bookkeeping, so it
+  /// transparently re-fetches when scrolled back into view. Cold path
+  /// only (called from fetchRowBand), and the O(cells.size) sweep runs at
+  /// most once per ~(MAX-TARGET) newly-loaded rows.
+  function evictDistantRows(protectLo: number, protectHi: number) {
+    if (loadedRows.size <= MAX_LOADED_ROWS) return;
+    const dropCount = loadedRows.size - TARGET_LOADED_ROWS;
+    const evict = new Set<number>();
+    for (const r of rowLru.keys()) {
+      if (evict.size >= dropCount) break;
+      if (r >= protectLo && r <= protectHi) continue;
+      evict.add(r);
+    }
+    if (evict.size === 0) return;
+    const newCells = new Map(cells);
+    for (const k of newCells.keys()) {
+      // key(r, c) === `${r}:${c}` — parseInt stops at the colon.
+      if (evict.has(parseInt(k, 10))) newCells.delete(k);
+    }
+    cells = newCells;
+    const newRH = new Map(rowHeights);
+    for (const r of evict) {
+      newRH.delete(r);
+      loadedRows.delete(r);
+      rowLru.delete(r);
+    }
+    rowHeights = newRH;
+  }
+
   /// the visible band moves outside it.
   async function fetchRowBand(r1: number, r2: number) {
     if (!workbook || r1 > r2 || loadedColStart > loadedColEnd) return;
@@ -480,6 +533,14 @@
     for (const [r, h] of layout.row_heights) newRH.set(r, rowHeightPx(h));
     rowHeights = newRH;
     for (let r = r1; r <= r2; r++) loadedRows.add(r);
+    touchRows(r1, r2);
+    // Protect both the just-fetched rows and the current visible band
+    // (the scrolled-back-up case: visible rows that are old in fetch
+    // order must not be evicted while on screen).
+    evictDistantRows(
+      Math.min(r1, bandStart > 0 ? bandStart : r1),
+      Math.max(r2, bandEnd),
+    );
   }
 
   /// Walk [r1..r2], find each contiguous gap of un-loaded rows, fetch it.
@@ -559,6 +620,7 @@
       rowHeights = new Map();
     }
     loadedRows = new Set();
+    rowLru = new Map();
     await loadSheetLayout();
     loadedColStart = Math.max(1, colBandStart);
     loadedColEnd = Math.min(viewportCols, colBandEnd > 0 ? colBandEnd : 60);
@@ -651,6 +713,8 @@
       // ensureRowsLoaded will refetch them at the new span.
       loadedRows = new Set();
       for (let r = r1; r <= r2; r++) loadedRows.add(r);
+      rowLru = new Map();
+      touchRows(r1, r2);
     });
   }
 
