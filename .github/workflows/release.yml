@@ -77,14 +77,14 @@ jobs:
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           releaseName: 'fastsheet ${{ github.ref_name }}'
           releaseBody: |
-            See [CHANGELOG](../../blob/main/CHANGELOG.md) or `git log` between releases.
+            See the [commit history](../../commits/${{ github.ref_name }}) for what changed in this release.
 
             **Windows install:** download the `*_x64-setup.exe` (NSIS)
             or `*_x64_en-US.msi` from below and run it. Both install
             to your user profile — no admin required.
 
-            **Portable:** the standalone `fastsheet.exe` is also
-            attached and runs without installation.
+            **Portable:** the standalone `*_x64-portable.exe` is also
+            attached and runs without installation (no admin, no setup).
 
             **First launch:** Windows SmartScreen may show
             "Windows protected your PC" since this build is unsigned.
@@ -94,3 +94,19 @@ jobs:
             runtime — pre-installed on supported versions).
           releaseDraft: true
           prerelease: false
+
+      - name: Attach portable executable
+        # tauri-action uploads the installers (.msi + NSIS setup .exe)
+        # but not the raw binary. Attach the standalone exe too, so users
+        # who want a no-install download get one. Tag runs only — that's
+        # when a release exists to upload to (workflow_dispatch builds
+        # without releasing).
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          portable="fastsheet_${version}_x64-portable.exe"
+          cp "src-tauri/target/release/fastsheet.exe" "$portable"
+          gh release upload "$GITHUB_REF_NAME" "$portable" --clobber
