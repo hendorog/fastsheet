@@ -558,6 +558,50 @@
     }
   }
 
+  /// Pull the active sheet's row heights for rows 1..targetRow into the
+  /// `rowHeights` map. Cheap (heights only — single narrow column), but
+  /// makes the cumulative `rowOffsets` accurate all the way to the
+  /// target so a jump-scroll lands precisely. Without it, the rows
+  /// between the current band and a far target carry default heights and
+  /// the scroll computation drifts (lands short of the target).
+  async function ensureRowHeightsThrough(targetRow: number) {
+    if (!workbook || targetRow < 1) return;
+    // Cap at the used-row count: rows past it carry the default height,
+    // so the cumulative offset stays exact without fetching a giant
+    // (and slow — get_layout is O(rows)) range for a far jump.
+    const endRow = Math.min(targetRow, viewportRows);
+    try {
+      const layout = await invoke<LayoutData>("get_layout", {
+        sheet: activeSheet,
+        startRow: 1,
+        endRow,
+        startCol: 1,
+        endCol: 1,
+      });
+      if (layout.row_heights.length === 0) return;
+      const newRH = new Map(rowHeights);
+      for (const [r, h] of layout.row_heights) newRH.set(r, rowHeightPx(h));
+      rowHeights = newRH;
+    } catch {}
+  }
+
+  /// Programmatic jump (F5 goto, trace/compare navigation) to a cell.
+  /// The lazy row loader hasn't fetched the rows between the current view
+  /// and a far target, so Grid's scroll-into-view runs on estimated
+  /// geometry, lands short, and the target cell is never fetched —
+  /// rendering blank with an empty formula bar. Make the geometry exact
+  /// through the target, fetch the target's own band so its data is
+  /// present, then request the scroll (whose band-change tops up the
+  /// rest of the landing viewport).
+  async function jumpScrollTo(row: number, col: number) {
+    if (!workbook) return;
+    await ensureRowHeightsThrough(row);
+    await ensureRowsLoaded(row, row);
+    scrollTarget = { row, col };
+    await tick();
+    scrollTarget = null;
+  }
+
   /// Column auto-fit must inspect more than the current visible row band.
   /// Fetch the selected columns across the used row span into the same
   /// cell cache that autoFitColumnPx scans, without changing viewport
@@ -1557,9 +1601,10 @@
       await switchSheet(d.sheet_idx);
     }
     growViewportToInclude(d.row, d.col);
-    // Fire a one-shot scroll target so the grid centers on the diff
-    // cell without changing the cursor.
-    scrollTarget = { row: d.row, col: d.col };
+    // Load + scroll to the diff cell (jumpScrollTo handles far targets
+    // the lazy loader hasn't fetched — otherwise the previewed cell can
+    // render blank). Doesn't change the cursor.
+    await jumpScrollTo(d.row, d.col);
   }
 
   /// Highlight overlays for every visible diff on the active sheet.
@@ -1649,7 +1694,7 @@
           label: node.address,
         },
       ];
-      scrollTarget = { row: range.r1, col: range.c1 };
+      await jumpScrollTo(range.r1, range.c1);
       return;
     }
     if (node.sheet === null || node.row === null || node.col === null) {
@@ -1671,7 +1716,7 @@
         color: "#ff8800",
       },
     ];
-    scrollTarget = { row: node.row, col: node.col };
+    await jumpScrollTo(node.row, node.col);
   }
 
   async function closeTrace(restoreCursor: boolean) {
@@ -2532,6 +2577,7 @@
         if (sheetIdx !== activeSheet) await switchSheet(sheetIdx);
         selRow = 1; selCol = 1;
         rangeEndRow = 1; rangeEndCol = 1;
+        await jumpScrollTo(1, 1);
         return true;
       }
     }
@@ -2559,6 +2605,7 @@
     rangeEndRow = selRow;
     rangeEndCol = selCol;
     growViewportToInclude(selRow, selCol);
+    await jumpScrollTo(selRow, selCol);
     return true;
   }
 

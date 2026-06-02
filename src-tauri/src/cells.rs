@@ -296,10 +296,14 @@ pub(crate) fn get_layout(
     let file_default_internal: Option<f64> = default_rh_guard
         .get(&sheet)
         .map(|pt| pt * 2.0);
+    // Index explicit Row entries once (O(rows)) instead of a linear scan
+    // per requested row — the jump-scroll path requests wide ranges
+    // (1..target), which would otherwise be O(range × row_entries).
+    let row_index: std::collections::HashMap<i32, &ironcalc::base::types::Row> =
+        ws.rows.iter().map(|r| (r.r, r)).collect();
     let mut row_heights = Vec::new();
     for row in start_row..=end_row {
-        let row_entry = ws.rows.iter().find(|r| r.r == row as i32);
-        let h = match row_entry {
+        let h = match row_index.get(&(row as i32)) {
             Some(r) if r.hidden => 0.0,
             Some(r) => r.height * 2.0, // ROW_HEIGHT_FACTOR; matches get_row_height
             None => file_default_internal
