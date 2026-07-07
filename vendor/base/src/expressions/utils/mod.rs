@@ -242,7 +242,8 @@ pub fn is_valid_identifier(name: &str) -> bool {
         return false;
     }
     for ch in chars {
-        if !(ch.is_alphanumeric() || ch == '_' || ch == '.') {
+        // After the first character Excel also allows '?' and '\'
+        if !(ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == '?' || ch == '\\') {
             return false;
         }
     }

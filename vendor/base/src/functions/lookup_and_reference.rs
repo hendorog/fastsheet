@@ -171,13 +171,12 @@ impl<'a> Model<'a> {
         if target.is_error() {
             return target;
         }
-        if matches!(target, CalcResult::EmptyCell) {
-            return CalcResult::Error {
-                error: Error::NA,
-                origin: cell,
-                message: "Cannot match empty cell".to_string(),
-            };
-        }
+        // Excel treats a blank lookup value as the number 0
+        let target = if matches!(target, CalcResult::EmptyCell) {
+            CalcResult::Number(0.0)
+        } else {
+            target
+        };
         let match_type = if args.len() == 3 {
             match self.get_number(&args[2], cell) {
                 Ok(v) => v as i32,
@@ -352,6 +351,13 @@ impl<'a> Model<'a> {
         if lookup_value.is_error() {
             return lookup_value;
         }
+        // Excel treats a blank lookup value as the number 0 (and blank
+        // cells in the lookup row never match)
+        let lookup_value = if matches!(lookup_value, CalcResult::EmptyCell) {
+            CalcResult::Number(0.0)
+        } else {
+            lookup_value
+        };
         let row_index = match self.get_number(&args[2], cell) {
             Ok(v) => v.floor() as i32,
             Err(s) => return s,
@@ -410,7 +416,12 @@ impl<'a> Model<'a> {
                                 Box::new(move |_| false)
                             }
                         } else {
-                            Box::new(move |x| compare_values(x, &lookup_value) == 0)
+                            // Blank cells in the lookup vector never match in
+                            // Excel (compare_values would coerce them to 0)
+                            Box::new(move |x| {
+                                !matches!(x, CalcResult::EmptyCell)
+                                    && compare_values(x, &lookup_value) == 0
+                            })
                         };
                     for l in 0..n {
                         let value = self.evaluate_cell(CellReferenceIndex {
@@ -459,6 +470,13 @@ impl<'a> Model<'a> {
         if lookup_value.is_error() {
             return lookup_value;
         }
+        // Excel treats a blank lookup value as the number 0 (and blank
+        // cells in the lookup column never match)
+        let lookup_value = if matches!(lookup_value, CalcResult::EmptyCell) {
+            CalcResult::Number(0.0)
+        } else {
+            lookup_value
+        };
         let column_index = match self.get_number(&args[2], cell) {
             Ok(v) => v.floor() as i32,
             Err(s) => return s,
@@ -517,7 +535,12 @@ impl<'a> Model<'a> {
                                 Box::new(move |_| false)
                             }
                         } else {
-                            Box::new(move |x| compare_values(x, &lookup_value) == 0)
+                            // Blank cells in the lookup vector never match in
+                            // Excel (compare_values would coerce them to 0)
+                            Box::new(move |x| {
+                                !matches!(x, CalcResult::EmptyCell)
+                                    && compare_values(x, &lookup_value) == 0
+                            })
                         };
                     for l in 0..n {
                         let value = self.evaluate_cell(CellReferenceIndex {
@@ -570,6 +593,12 @@ impl<'a> Model<'a> {
         if target.is_error() {
             return target;
         }
+        // Excel treats a blank lookup value as the number 0
+        let target = if matches!(target, CalcResult::EmptyCell) {
+            CalcResult::Number(0.0)
+        } else {
+            target
+        };
         let value = self.evaluate_node_in_context(&args[1], cell);
         match value {
             CalcResult::Range { left, right } => {

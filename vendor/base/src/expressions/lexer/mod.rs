@@ -601,7 +601,13 @@ impl<'a> Lexer<'a> {
         let mut position = self.position;
         while position < self.len {
             let next_char = self.chars[position];
-            if next_char.is_alphanumeric() || next_char == '_' || next_char == '.' {
+            // '?' and '\' are legal in Excel defined names (e.g. Is_Ulx_Allowed?)
+            if next_char.is_alphanumeric()
+                || next_char == '_'
+                || next_char == '.'
+                || next_char == '?'
+                || next_char == '\\'
+            {
                 position += 1;
             } else {
                 break;

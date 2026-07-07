@@ -82,25 +82,15 @@ impl<'a> Model<'a> {
     }
 
     pub(crate) fn fn_and(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
-        self.logical_nary(
-            args,
-            cell,
-            |acc, value| acc.unwrap_or(true) && value,
-            Some(false),
-        )
+        self.logical_nary(args, cell, |acc, value| acc.unwrap_or(true) && value)
     }
 
     pub(crate) fn fn_or(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
-        self.logical_nary(
-            args,
-            cell,
-            |acc, value| acc.unwrap_or(false) || value,
-            Some(true),
-        )
+        self.logical_nary(args, cell, |acc, value| acc.unwrap_or(false) || value)
     }
 
     pub(crate) fn fn_xor(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
-        self.logical_nary(args, cell, |acc, value| acc.unwrap_or(false) ^ value, None)
+        self.logical_nary(args, cell, |acc, value| acc.unwrap_or(false) ^ value)
     }
 
     /// Base function for AND, OR, XOR. These are all n-ary functions that perform a boolean operation on a series of
@@ -120,13 +110,14 @@ impl<'a> Model<'a> {
     /// **`fold_fn`:** The function that combines the running result with the next value boolean value. The running result
     /// starts as `None`.
     ///
-    /// **`short_circuit_value`:** If the running result reaches `short_circuit_value`, the function returns early.
+    /// Note: Excel's AND/OR are NOT lazy — every argument is evaluated and an
+    /// error in any of them propagates even when the result is already
+    /// decided (=AND(FALSE,NA()) is #N/A), so there is no short-circuiting.
     fn logical_nary(
         &mut self,
         args: &[Node],
         cell: CellReferenceIndex,
         fold_fn: fn(Option<bool>, bool) -> bool,
-        short_circuit_value: Option<bool>,
     ) -> CalcResult {
         if args.is_empty() {
             return CalcResult::new_args_number_error(cell);
@@ -169,13 +160,6 @@ impl<'a> Model<'a> {
                                     }
                                 }
                             }
-                            if let (Some(current_result), Some(short_circuit_value)) =
-                                (result, short_circuit_value)
-                            {
-                                if current_result == short_circuit_value {
-                                    return CalcResult::Boolean(current_result);
-                                }
-                            }
                         }
                     }
                 }
@@ -198,13 +182,6 @@ impl<'a> Model<'a> {
                         origin: cell,
                         message: "Arrays not supported yet".to_string(),
                     }
-                }
-            }
-
-            if let (Some(current_result), Some(short_circuit_value)) = (result, short_circuit_value)
-            {
-                if current_result == short_circuit_value {
-                    return CalcResult::Boolean(current_result);
                 }
             }
         }
