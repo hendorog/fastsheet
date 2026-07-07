@@ -294,40 +294,58 @@ pub fn load_xls(
                 // but we have raw rgce (because the cell starts with
                 // PtgExp pointing to a shared formula), decode the
                 // shared formula ourselves.
-                let own_decoded: Option<String> = shape
-                    .ptgexp_cells
-                    .get(&(sheet_key_early, r_1based_early, c_1based_early))
-                    .and_then(|rgce| {
-                        let raw_defined: Vec<String> = wb
-                            .defined_names()
-                            .iter()
-                            .map(|(n, _)| n.clone())
-                            .collect();
-                        let result = crate::xls_biff::decode_full_formula(
-                            rgce,
-                            &raw_defined,
-                            &shape.xti_table,
-                            &shape.biff_sheet_names,
-                            &shape.extern_names,
-                            &shape.shared_formulas,
-                            sheet_key_early,
-                            r_1based_early,
-                            c_1based_early,
-                        );
-                        if std::env::var("FASTSHEET_XLS_DEBUG_DECODE").is_ok() {
-                            eprintln!(
-                                "DECODE s{} r{} c{}: rgce={:02x?} → {:?}",
-                                sheet_key_early, r_1based_early, c_1based_early,
-                                rgce, result
-                            );
-                        }
-                        result
-                    });
-                let calamine_text = formulas
+                let calamine_raw = formulas
                     .as_ref()
                     .and_then(|f| f.get_value((abs_row as u32, abs_col as u32)))
                     .filter(|s| !s.is_empty())
                     .cloned();
+                // Ptgs calamine can't decode (e.g. PtgMemFunc) surface as an
+                // "Unrecognised formula ..." error string — treat those as
+                // no-text and let our own rgce decoder have a go.
+                let calamine_unusable = calamine_raw
+                    .as_deref()
+                    .is_some_and(|s| s.contains("Unrecognised formula"));
+                let calamine_text = calamine_raw.filter(|_| !calamine_unusable);
+                let decode_own = |rgce: &[u8]| -> Option<String> {
+                    let raw_defined: Vec<String> = wb
+                        .defined_names()
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    let result = crate::xls_biff::decode_full_formula(
+                        rgce,
+                        &raw_defined,
+                        &shape.xti_table,
+                        &shape.biff_sheet_names,
+                        &shape.extern_names,
+                        &shape.shared_formulas,
+                        sheet_key_early,
+                        r_1based_early,
+                        c_1based_early,
+                    );
+                    if std::env::var("FASTSHEET_XLS_DEBUG_DECODE").is_ok() {
+                        eprintln!(
+                            "DECODE s{} r{} c{}: rgce={:02x?} → {:?}",
+                            sheet_key_early, r_1based_early, c_1based_early,
+                            rgce, result
+                        );
+                    }
+                    result
+                };
+                let own_decoded: Option<String> = shape
+                    .ptgexp_cells
+                    .get(&(sheet_key_early, r_1based_early, c_1based_early))
+                    .and_then(|rgce| decode_own(rgce))
+                    .or_else(|| {
+                        if calamine_unusable {
+                            shape
+                                .formula_rgce
+                                .get(&(sheet_key_early, r_1based_early, c_1based_early))
+                                .and_then(|rgce| decode_own(rgce))
+                        } else {
+                            None
+                        }
+                    });
                 // Prefer our own decoded text for shared-formula cells
                 // (calamine returns empty); fall back to patched
                 // calamine text otherwise.
@@ -398,6 +416,10 @@ pub fn load_xls(
                                 .map(|idxs| patch_ptg_name_x(&ref_fixed, idxs, &shape.extern_names))
                                 .unwrap_or(ref_fixed) };
                         let unwrapped = unwrap_user_xlfn(&patched);
+                        // A 3D ref whose sheet AND cell are both deleted
+                        // renders as `#REF!#REF!`; collapse to the single
+                        // error literal IronCalc can parse.
+                        let unwrapped = unwrapped.replace("#REF!#REF!", "#REF!");
                         quote_sheet_refs(&unwrapped, &names_needing_quotes)
                     })
                     .or_else(|| literal_to_input(cell));

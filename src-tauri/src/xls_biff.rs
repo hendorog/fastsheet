@@ -1209,13 +1209,18 @@ pub fn extract_refs_with_xti(
     xtis: &[XtiEntry],
     sheet_names: &[String],
 ) -> Vec<(bool, String)> {
-    let resolve_sheet = |ixti: u16| -> Option<String> {
-        let xti = xtis.get(ixti as usize)?;
+    // Ok(Some(name)) = resolved sheet; Ok(None) = deleted sheet (itab -1,
+    // must surface as #REF!); Err(()) = tables missing/out of bounds
+    // (keep calamine's sheet text).
+    let resolve_sheet = |ixti: u16| -> Result<Option<String>, ()> {
+        let xti = xtis.get(ixti as usize).ok_or(())?;
         if xti.itab_first < 0 {
-            return None;
+            return Ok(None);
         }
-        let sheet = sheet_names.get(xti.itab_first as usize)?;
-        Some(sheet.clone())
+        match sheet_names.get(xti.itab_first as usize) {
+            Some(sheet) => Ok(Some(sheet.clone())),
+            None => Err(()),
+        }
     };
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -1250,8 +1255,10 @@ pub fn extract_refs_with_xti(
                 let colu = u16::from_le_bytes([rgce[i + 4], rgce[i + 5]]);
                 let a1 = format_ref(rwu, colu);
                 let text = match resolve_sheet(ixti) {
-                    Some(name) => format!("{}!{}", quoted_sheet(&name), a1),
-                    None => a1,
+                    Ok(Some(name)) => format!("{}!{}", quoted_sheet(&name), a1),
+                    // Deleted sheet: the reference is a #REF! error
+                    Ok(None) => format!("#REF!{a1}"),
+                    Err(()) => a1,
                 };
                 out.push((true, text));
                 6
@@ -1270,8 +1277,10 @@ pub fn extract_refs_with_xti(
                     format_ref(rw2, col2)
                 );
                 let text = match resolve_sheet(ixti) {
-                    Some(name) => format!("{}!{}", quoted_sheet(&name), range),
-                    None => range,
+                    Ok(Some(name)) => format!("{}!{}", quoted_sheet(&name), range),
+                    // Deleted sheet: the reference is a #REF! error
+                    Ok(None) => format!("#REF!{range}"),
+                    Err(()) => range,
                 };
                 out.push((true, text));
                 10
@@ -1527,9 +1536,12 @@ fn decode_formula_inner(
                         if xti.itab_first >= 0 {
                             sheet_names.get(xti.itab_first as usize).cloned()
                         } else { None }
-                    })
-                    .unwrap_or_else(|| "#REF".into());
-                stack.push(format!("{}!{}", quoted_sheet(&sheet), a1));
+                    });
+                match sheet {
+                    Some(sheet) => stack.push(format!("{}!{}", quoted_sheet(&sheet), a1)),
+                    // Deleted sheet: the reference is a #REF! error
+                    None => stack.push(format!("#REF!{a1}")),
+                }
                 i += 6;
             }
             // PtgArea3d
@@ -1551,9 +1563,12 @@ fn decode_formula_inner(
                         if xti.itab_first >= 0 {
                             sheet_names.get(xti.itab_first as usize).cloned()
                         } else { None }
-                    })
-                    .unwrap_or_else(|| "#REF".into());
-                stack.push(format!("{}!{}", quoted_sheet(&sheet), range));
+                    });
+                match sheet {
+                    Some(sheet) => stack.push(format!("{}!{}", quoted_sheet(&sheet), range)),
+                    // Deleted sheet: the reference is a #REF! error
+                    None => stack.push(format!("#REF!{range}")),
+                }
                 i += 10;
             }
             // Binary ops (0x03..=0x11)
@@ -1643,6 +1658,17 @@ fn decode_formula_inner(
                     (f.to_string(), args)
                 };
                 stack.push(format!("{fname}({})", real_args.join(",")));
+            }
+            // PtgMemArea / PtgMemErr / PtgMemNoMem: transparent containers,
+            // the wrapped tokens follow inline — skip the 6-byte payload.
+            0x26 | 0x46 | 0x66 | 0x27 | 0x47 | 0x67 | 0x28 | 0x48 | 0x68 => {
+                if i + 6 > rgce.len() { return None; }
+                i += 6;
+            }
+            // PtgMemFunc: same, with a 2-byte cce payload.
+            0x29 | 0x49 | 0x69 => {
+                if i + 2 > rgce.len() { return None; }
+                i += 2;
             }
             _ => return None,
         }

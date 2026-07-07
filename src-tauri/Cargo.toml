@@ -39,6 +39,11 @@ name = "trace_probe"
 path = "src/bin/trace_probe.rs"
 required-features = ["dev-bins"]
 
+[[bin]]
+name = "oracle_probe"
+path = "src/bin/oracle_probe.rs"
+required-features = ["dev-bins"]
+
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
