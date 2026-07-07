@@ -4,7 +4,7 @@ use crate::{
     expressions::{parser::Node, token::Error, types::CellReferenceIndex},
     formatter::format::{format_number, parse_formatted_number},
     model::Model,
-    number_format::to_precision,
+    number_format::{to_excel_precision_str, to_precision},
 };
 
 use super::{
@@ -56,7 +56,7 @@ impl<'a> Model<'a> {
         for arg in args {
             match self.evaluate_node_in_context(arg, cell) {
                 CalcResult::String(value) => result = format!("{result}{value}"),
-                CalcResult::Number(value) => result = format!("{result}{value}"),
+                CalcResult::Number(value) => result.push_str(&to_excel_precision_str(value)),
                 CalcResult::EmptyCell | CalcResult::EmptyArg => {}
                 CalcResult::Boolean(value) => {
                     if value {
@@ -84,7 +84,7 @@ impl<'a> Model<'a> {
                                 CalcResult::String(value) => {
                                     result = format!("{result}{value}");
                                 }
-                                CalcResult::Number(value) => result = format!("{result}{value}"),
+                                CalcResult::Number(value) => result.push_str(&to_excel_precision_str(value)),
                                 CalcResult::Boolean(value) => {
                                     if value {
                                         result = format!("{result}TRUE");
@@ -281,7 +281,7 @@ impl<'a> Model<'a> {
         if args.len() == 1 {
             let result = self.evaluate_node_in_context(&args[0], cell);
             let s = match result {
-                CalcResult::Number(v) => format!("{v}"),
+                CalcResult::Number(v) => to_excel_precision_str(v),
                 CalcResult::String(v) => v,
                 CalcResult::Boolean(b) => {
                     if b {
@@ -316,7 +316,7 @@ impl<'a> Model<'a> {
     pub(crate) fn fn_trim(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.len() == 1 {
             let s = match self.evaluate_node_in_context(&args[0], cell) {
-                CalcResult::Number(v) => format!("{v}"),
+                CalcResult::Number(v) => to_excel_precision_str(v),
                 CalcResult::String(v) => v,
                 CalcResult::Boolean(b) => {
                     if b {
@@ -358,7 +358,7 @@ impl<'a> Model<'a> {
     pub(crate) fn fn_lower(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.len() == 1 {
             let s = match self.evaluate_node_in_context(&args[0], cell) {
-                CalcResult::Number(v) => format!("{v}"),
+                CalcResult::Number(v) => to_excel_precision_str(v),
                 CalcResult::String(v) => v,
                 CalcResult::Boolean(b) => {
                     if b {
@@ -439,7 +439,7 @@ impl<'a> Model<'a> {
     pub(crate) fn fn_unicode(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.len() == 1 {
             let s = match self.evaluate_node_in_context(&args[0], cell) {
-                CalcResult::Number(v) => format!("{v}"),
+                CalcResult::Number(v) => to_excel_precision_str(v),
                 CalcResult::String(v) => v,
                 CalcResult::Boolean(b) => {
                     if b {
@@ -493,7 +493,7 @@ impl<'a> Model<'a> {
     pub(crate) fn fn_upper(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.len() == 1 {
             let s = match self.evaluate_node_in_context(&args[0], cell) {
-                CalcResult::Number(v) => format!("{v}"),
+                CalcResult::Number(v) => to_excel_precision_str(v),
                 CalcResult::String(v) => v,
                 CalcResult::Boolean(b) => {
                     if b {
@@ -530,7 +530,7 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
         let s = match self.evaluate_node_in_context(&args[0], cell) {
-            CalcResult::Number(v) => format!("{v}"),
+            CalcResult::Number(v) => to_excel_precision_str(v),
             CalcResult::String(v) => v,
             CalcResult::Boolean(b) => {
                 if b {
@@ -590,7 +590,7 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
         let s = match self.evaluate_node_in_context(&args[0], cell) {
-            CalcResult::Number(v) => format!("{v}"),
+            CalcResult::Number(v) => to_excel_precision_str(v),
             CalcResult::String(v) => v,
             CalcResult::Boolean(b) => {
                 if b {
@@ -650,7 +650,7 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
         let s = match self.evaluate_node_in_context(&args[0], cell) {
-            CalcResult::Number(v) => format!("{v}"),
+            CalcResult::Number(v) => to_excel_precision_str(v),
             CalcResult::String(v) => v,
             CalcResult::Boolean(b) => {
                 if b {
@@ -983,7 +983,7 @@ impl<'a> Model<'a> {
         let mut values = Vec::new();
         for arg in &args[2..] {
             match self.evaluate_node_in_context(arg, cell) {
-                CalcResult::Number(value) => values.push(format!("{value}")),
+                CalcResult::Number(value) => values.push(to_excel_precision_str(value)),
                 CalcResult::Range { left, right } => {
                     if left.sheet != right.sheet {
                         return CalcResult::new_error(
@@ -1028,7 +1028,7 @@ impl<'a> Model<'a> {
                                 column,
                             }) {
                                 CalcResult::Number(value) => {
-                                    values.push(format!("{value}"));
+                                    values.push(to_excel_precision_str(value));
                                 }
                                 CalcResult::String(value) => values.push(value),
                                 CalcResult::Boolean(value) => {

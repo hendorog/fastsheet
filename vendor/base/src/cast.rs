@@ -7,6 +7,7 @@ use crate::{
     },
     formatter::format::parse_formatted_number,
     model::Model,
+    number_format::to_excel_precision_str,
 };
 
 pub(crate) enum NumberOrArray {
@@ -182,10 +183,9 @@ impl<'a> Model<'a> {
         result: CalcResult,
         cell: CellReferenceIndex,
     ) -> Result<String, CalcResult> {
-        // FIXME: I think when casting a number we should convert it to_precision(x, 15)
-        // See function Exact
         match result {
-            CalcResult::Number(f) => Ok(format!("{f}")),
+            // Excel coerces numbers to text at 15 significant digits
+            CalcResult::Number(f) => Ok(to_excel_precision_str(f)),
             CalcResult::String(s) => Ok(s),
             CalcResult::Boolean(f) => {
                 if f {

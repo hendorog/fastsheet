@@ -135,7 +135,7 @@ fn test_to_excel_precision_str() {
     let test_cases = vec![
         TestCase {
             value: 2e-23,
-            str: "2e-23",
+            str: "2E-23",
         },
         TestCase {
             value: 42.0,
@@ -143,11 +143,27 @@ fn test_to_excel_precision_str() {
         },
         TestCase {
             value: 200.0e-23,
-            str: "2e-21",
+            str: "2E-21",
         },
         TestCase {
             value: -200e-23,
-            str: "-2e-21",
+            str: "-2E-21",
+        },
+        TestCase {
+            value: 1e16,
+            str: "10000000000000000",
+        },
+        TestCase {
+            value: 1.23456e22,
+            str: "1.23456E+22",
+        },
+        TestCase {
+            value: 0.00001,
+            str: "1E-05",
+        },
+        TestCase {
+            value: 0.0001,
+            str: "0.0001",
         },
         TestCase {
             value: 10.002,

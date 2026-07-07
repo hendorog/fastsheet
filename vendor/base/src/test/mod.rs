@@ -65,6 +65,7 @@ mod engineering;
 mod statistical;
 mod test_fn_offset;
 mod test_number_format;
+mod test_number_to_string;
 mod test_numeric_equality;
 
 mod test_arrays;

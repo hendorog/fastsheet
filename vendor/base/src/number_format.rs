@@ -113,7 +113,67 @@ pub fn to_precision(value: f64, precision: usize) -> f64 {
 /// This intends to be equivalent to the js: `${parseFloat(value.toPrecision(precision)})`
 /// See ([ecma](https://tc39.es/ecma262/#sec-number.prototype.toprecision)).
 pub fn to_excel_precision_str(value: f64) -> String {
-    to_precision_str(value, 15)
+    let text = to_precision_str(value, 15);
+    if !value.is_finite() || value == 0.0 {
+        return text;
+    }
+    // ryu picks scientific notation by shortness (from 1e16 up, sporadically
+    // below 1e-4). Excel renders plain decimal for 1e-4 <= |v| < 1e21 and
+    // uppercase scientific with a signed two-digit exponent outside that.
+    let (sign, body) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    // Extract the significant digits and the decimal exponent of the first one
+    let (digits, exp) = match body.split_once(['e', 'E']) {
+        Some((mantissa, exp_str)) => {
+            let Ok(exp) = exp_str.parse::<i32>() else {
+                return text;
+            };
+            (mantissa.replace('.', ""), exp)
+        }
+        None => match body.split_once('.') {
+            Some((int_part, frac_part)) => {
+                if int_part == "0" {
+                    let zeros = frac_part.len() - frac_part.trim_start_matches('0').len();
+                    (frac_part[zeros..].to_string(), -(zeros as i32) - 1)
+                } else {
+                    (format!("{int_part}{frac_part}"), int_part.len() as i32 - 1)
+                }
+            }
+            None => (body.to_string(), body.len() as i32 - 1),
+        },
+    };
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    if (-4..21).contains(&exp) {
+        let mut out = String::from(sign);
+        if exp >= 0 {
+            let e = exp as usize;
+            if digits.len() > e + 1 {
+                out.push_str(&digits[..=e]);
+                out.push('.');
+                out.push_str(&digits[e + 1..]);
+            } else {
+                out.push_str(digits);
+                out.push_str(&"0".repeat(e + 1 - digits.len()));
+            }
+        } else {
+            out.push_str("0.");
+            out.push_str(&"0".repeat((-exp - 1) as usize));
+            out.push_str(digits);
+        }
+        out
+    } else {
+        let mut out = format!("{sign}{}", &digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push_str(if exp < 0 { "E-" } else { "E+" });
+        out.push_str(&format!("{:02}", exp.abs()));
+        out
+    }
 }
 
 pub fn to_excel_precision(value: f64, precision: usize) -> f64 {
