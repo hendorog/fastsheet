@@ -13,17 +13,18 @@ impl<'a> Model<'a> {
         let row_num;
         let col_num;
         if args.len() == 3 {
+            // A row_num/col_num of 0 means "the whole column/row" in Excel
             row_num = match self.get_number(&args[1], cell) {
                 Ok(f) => f,
                 Err(s) => {
                     return s;
                 }
             };
-            if row_num < 1.0 {
+            if row_num < 0.0 {
                 return CalcResult::Error {
                     error: Error::VALUE,
                     origin: cell,
-                    message: "Argument must be >= 1".to_string(),
+                    message: "Argument must be >= 0".to_string(),
                 };
             }
             col_num = match self.get_number(&args[2], cell) {
@@ -32,11 +33,11 @@ impl<'a> Model<'a> {
                     return s;
                 }
             };
-            if col_num < 1.0 {
+            if col_num < 0.0 {
                 return CalcResult::Error {
                     error: Error::VALUE,
                     origin: cell,
-                    message: "Argument must be >= 1".to_string(),
+                    message: "Argument must be >= 0".to_string(),
                 };
             }
         } else if args.len() == 2 {
@@ -46,11 +47,11 @@ impl<'a> Model<'a> {
                     return s;
                 }
             };
-            if row_num < 1.0 {
+            if row_num < 0.0 {
                 return CalcResult::Error {
                     error: Error::VALUE,
                     origin: cell,
-                    message: "Argument must be >= 1".to_string(),
+                    message: "Argument must be >= 0".to_string(),
                 };
             }
             col_num = -1.0;
@@ -59,6 +60,56 @@ impl<'a> Model<'a> {
         }
         match self.evaluate_node_in_context(&args[0], cell) {
             CalcResult::Range { left, right } => {
+                if row_num as i32 == 0 && args.len() == 3 && col_num as i32 >= 1 {
+                    // Whole column of the range
+                    let column = left.column + (col_num as i32) - 1;
+                    if column > right.column {
+                        return CalcResult::Error {
+                            error: Error::REF,
+                            origin: cell,
+                            message: "Wrong reference".to_string(),
+                        };
+                    }
+                    return CalcResult::Range {
+                        left: CellReferenceIndex {
+                            sheet: left.sheet,
+                            row: left.row,
+                            column,
+                        },
+                        right: CellReferenceIndex {
+                            sheet: right.sheet,
+                            row: right.row,
+                            column,
+                        },
+                    };
+                }
+                if col_num as i32 == 0 && row_num as i32 >= 1 {
+                    // Whole row of the range
+                    let row = left.row + (row_num as i32) - 1;
+                    if row > right.row {
+                        return CalcResult::Error {
+                            error: Error::REF,
+                            origin: cell,
+                            message: "Wrong reference".to_string(),
+                        };
+                    }
+                    return CalcResult::Range {
+                        left: CellReferenceIndex {
+                            sheet: left.sheet,
+                            row,
+                            column: left.column,
+                        },
+                        right: CellReferenceIndex {
+                            sheet: right.sheet,
+                            row,
+                            column: right.column,
+                        },
+                    };
+                }
+                if row_num as i32 == 0 {
+                    // INDEX(range, 0) / INDEX(range, 0, 0): the whole range
+                    return CalcResult::Range { left, right };
+                }
                 let row;
                 let column;
                 if (col_num + 1.0).abs() < f64::EPSILON {
