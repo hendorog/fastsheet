@@ -780,68 +780,10 @@ impl<'a> Model<'a> {
             Err(s) => return s,
         };
         let mut values = Vec::new();
-        for arg in &args[1..] {
-            match self.evaluate_node_in_context(arg, cell) {
-                CalcResult::Number(value) => values.push(value),
-                CalcResult::Range { left, right } => {
-                    if left.sheet != right.sheet {
-                        return CalcResult::new_error(
-                            Error::VALUE,
-                            cell,
-                            "Ranges are in different sheets".to_string(),
-                        );
-                    }
-                    let row1 = left.row;
-                    let mut row2 = right.row;
-                    let column1 = left.column;
-                    let mut column2 = right.column;
-                    if row1 == 1 && row2 == LAST_ROW {
-                        row2 = match self.workbook.worksheet(left.sheet) {
-                            Ok(s) => s.dimension().max_row,
-                            Err(_) => {
-                                return CalcResult::new_error(
-                                    Error::ERROR,
-                                    cell,
-                                    format!("Invalid worksheet index: '{}'", left.sheet),
-                                );
-                            }
-                        };
-                    }
-                    if column1 == 1 && column2 == LAST_COLUMN {
-                        column2 = match self.workbook.worksheet(left.sheet) {
-                            Ok(s) => s.dimension().max_column,
-                            Err(_) => {
-                                return CalcResult::new_error(
-                                    Error::ERROR,
-                                    cell,
-                                    format!("Invalid worksheet index: '{}'", left.sheet),
-                                );
-                            }
-                        };
-                    }
-                    for row in row1..row2 + 1 {
-                        for column in column1..(column2 + 1) {
-                            match self.evaluate_cell(CellReferenceIndex {
-                                sheet: left.sheet,
-                                row,
-                                column,
-                            }) {
-                                CalcResult::Number(value) => {
-                                    values.push(value);
-                                }
-                                error @ CalcResult::Error { .. } => return error,
-                                _ => {
-                                    // We ignore booleans and strings
-                                }
-                            }
-                        }
-                    }
-                }
-                error @ CalcResult::Error { .. } => return error,
-                _ => {
-                    // We ignore booleans and strings
-                }
-            };
+        // Visits values in argument order (ranges row-major), which NPV
+        // depends on; direct scalar text/booleans coerce like in Excel.
+        if let Err(e) = self.for_each_value(&args[1..], cell, |value| values.push(value)) {
+            return e;
         }
         match compute_npv(rate, &values) {
             Ok(f) => CalcResult::Number(f),

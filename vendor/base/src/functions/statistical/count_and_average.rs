@@ -8,7 +8,45 @@ use crate::{
 };
 
 impl<'a> Model<'a> {
-    fn for_each_value<F>(
+    /// Shrink whole-column/whole-row ranges to the sheet's used dimension so
+    /// iterating them stays proportional to the data, not to 1M rows.
+    fn clamped_range_bounds(
+        &mut self,
+        left: &CellReferenceIndex,
+        right: &CellReferenceIndex,
+        cell: CellReferenceIndex,
+    ) -> Result<(i32, i32, i32, i32), CalcResult> {
+        let row1 = left.row;
+        let mut row2 = right.row;
+        let column1 = left.column;
+        let mut column2 = right.column;
+        if (row1 == 1 && row2 == LAST_ROW) || (column1 == 1 && column2 == LAST_COLUMN) {
+            let dimension = match self.workbook.worksheet(left.sheet) {
+                Ok(s) => s.dimension(),
+                Err(_) => {
+                    return Err(CalcResult::new_error(
+                        Error::ERROR,
+                        cell,
+                        format!("Invalid worksheet index: '{}'", left.sheet),
+                    ));
+                }
+            };
+            if row1 == 1 && row2 == LAST_ROW {
+                row2 = dimension.max_row;
+            }
+            if column1 == 1 && column2 == LAST_COLUMN {
+                column2 = dimension.max_column;
+            }
+        }
+        Ok((row1, row2, column1, column2))
+    }
+
+    /// Visit every numeric value of the argument list the way Excel's plain
+    /// aggregates (SUM, AVERAGE, MIN, ...) do: direct scalar arguments are
+    /// coerced (TRUE -> 1, "2" -> 2, non-numeric text -> #VALUE!), while text
+    /// and logicals reached through references are ignored. Arrays iterate
+    /// numbers and booleans; errors propagate.
+    pub(crate) fn for_each_value<F>(
         &mut self,
         args: &[Node],
         cell: CellReferenceIndex,
@@ -72,9 +110,10 @@ impl<'a> Model<'a> {
                             "Ranges are in different sheets".to_string(),
                         ));
                     }
-
-                    for row in left.row..=right.row {
-                        for column in left.column..=right.column {
+                    let (row1, row2, column1, column2) =
+                        self.clamped_range_bounds(&left, &right, cell)?;
+                    for row in row1..=row2 {
+                        for column in column1..=column2 {
                             match self.evaluate_cell(CellReferenceIndex {
                                 sheet: left.sheet,
                                 row,
@@ -105,7 +144,10 @@ impl<'a> Model<'a> {
         Ok(())
     }
 
-    fn for_each_value_a<F>(
+    /// Like [`Model::for_each_value`] but with the "A" family semantics
+    /// (AVERAGEA, MAXA, MINA): text found through references counts as 0 and
+    /// logicals count as 1/0 instead of being ignored.
+    pub(crate) fn for_each_value_a<F>(
         &mut self,
         args: &[Node],
         cell: CellReferenceIndex,
@@ -119,22 +161,22 @@ impl<'a> Model<'a> {
                 CalcResult::Number(value) => {
                     f(value);
                 }
+                // The "A" family counts logicals even through references
                 CalcResult::Boolean(value) => {
-                    if !matches!(arg, Node::ReferenceKind { .. }) {
-                        f(if value { 1.0 } else { 0.0 });
-                    }
+                    f(if value { 1.0 } else { 0.0 });
                 }
                 CalcResult::String(value) => {
-                    if !matches!(arg, Node::ReferenceKind { .. }) {
-                        if let Some(parsed) = self.cast_number(&value) {
-                            f(parsed);
-                        } else {
-                            return Err(CalcResult::new_error(
-                                Error::VALUE,
-                                cell,
-                                "Argument cannot be cast into number".to_string(),
-                            ));
-                        }
+                    if matches!(arg, Node::ReferenceKind { .. }) {
+                        // Text reached through a reference counts as 0
+                        f(0.0);
+                    } else if let Some(parsed) = self.cast_number(&value) {
+                        f(parsed);
+                    } else {
+                        return Err(CalcResult::new_error(
+                            Error::VALUE,
+                            cell,
+                            "Argument cannot be cast into number".to_string(),
+                        ));
                     }
                 }
                 CalcResult::Array(array) => {
@@ -169,9 +211,10 @@ impl<'a> Model<'a> {
                             "Ranges are in different sheets".to_string(),
                         ));
                     }
-
-                    for row in left.row..=right.row {
-                        for column in left.column..=right.column {
+                    let (row1, row2, column1, column2) =
+                        self.clamped_range_bounds(&left, &right, cell)?;
+                    for row in row1..=row2 {
+                        for column in column1..=column2 {
                             match self.evaluate_cell(CellReferenceIndex {
                                 sheet: left.sheet,
                                 row,
@@ -237,89 +280,11 @@ impl<'a> Model<'a> {
         }
         let mut count = 0.0;
         let mut sum = 0.0;
-        for arg in args {
-            match self.evaluate_node_in_context(arg, cell) {
-                CalcResult::Range { left, right } => {
-                    if left.sheet != right.sheet {
-                        return CalcResult::new_error(
-                            Error::VALUE,
-                            cell,
-                            "Ranges are in different sheets".to_string(),
-                        );
-                    }
-                    for row in left.row..(right.row + 1) {
-                        for column in left.column..(right.column + 1) {
-                            match self.evaluate_cell(CellReferenceIndex {
-                                sheet: left.sheet,
-                                row,
-                                column,
-                            }) {
-                                CalcResult::String(_) => count += 1.0,
-                                CalcResult::Number(value) => {
-                                    count += 1.0;
-                                    sum += value;
-                                }
-                                CalcResult::Boolean(b) => {
-                                    if b {
-                                        sum += 1.0;
-                                    }
-                                    count += 1.0;
-                                }
-                                error @ CalcResult::Error { .. } => return error,
-                                CalcResult::Range { .. } => {
-                                    return CalcResult::new_error(
-                                        Error::ERROR,
-                                        cell,
-                                        "Unexpected Range".to_string(),
-                                    );
-                                }
-                                CalcResult::EmptyCell | CalcResult::EmptyArg => {}
-                                CalcResult::Array(_) => {
-                                    return CalcResult::Error {
-                                        error: Error::NIMPL,
-                                        origin: cell,
-                                        message: "Arrays not supported yet".to_string(),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                CalcResult::Number(value) => {
-                    count += 1.0;
-                    sum += value;
-                }
-                CalcResult::String(s) => {
-                    if let Node::ReferenceKind { .. } = arg {
-                        // Do nothing
-                        count += 1.0;
-                    } else if let Ok(t) = s.parse::<f64>() {
-                        sum += t;
-                        count += 1.0;
-                    } else {
-                        return CalcResult::Error {
-                            error: Error::VALUE,
-                            origin: cell,
-                            message: "Argument cannot be cast into number".to_string(),
-                        };
-                    }
-                }
-                CalcResult::Boolean(b) => {
-                    count += 1.0;
-                    if b {
-                        sum += 1.0;
-                    }
-                }
-                error @ CalcResult::Error { .. } => return error,
-                CalcResult::EmptyCell | CalcResult::EmptyArg => {}
-                CalcResult::Array(_) => {
-                    return CalcResult::Error {
-                        error: Error::NIMPL,
-                        origin: cell,
-                        message: "Arrays not supported yet".to_string(),
-                    }
-                }
-            };
+        if let Err(e) = self.for_each_value_a(args, cell, |f| {
+            count += 1.0;
+            sum += f;
+        }) {
+            return e;
         }
         if count == 0.0 {
             return CalcResult::Error {
@@ -351,6 +316,16 @@ impl<'a> Model<'a> {
                         result += 1.0;
                     }
                 }
+                CalcResult::Array(array) => {
+                    // Inline arrays count only their numbers
+                    for row in array {
+                        for value in row {
+                            if matches!(value, ArrayNode::Number(_)) {
+                                result += 1.0;
+                            }
+                        }
+                    }
+                }
                 CalcResult::Range { left, right } => {
                     if left.sheet != right.sheet {
                         return CalcResult::new_error(
@@ -359,8 +334,13 @@ impl<'a> Model<'a> {
                             "Ranges are in different sheets".to_string(),
                         );
                     }
-                    for row in left.row..(right.row + 1) {
-                        for column in left.column..(right.column + 1) {
+                    let (row1, row2, column1, column2) =
+                        match self.clamped_range_bounds(&left, &right, cell) {
+                            Ok(b) => b,
+                            Err(e) => return e,
+                        };
+                    for row in row1..=row2 {
+                        for column in column1..=column2 {
                             if let CalcResult::Number(_) = self.evaluate_cell(CellReferenceIndex {
                                 sheet: left.sheet,
                                 row,
@@ -387,6 +367,12 @@ impl<'a> Model<'a> {
         for arg in args {
             match self.evaluate_node_in_context(arg, cell) {
                 CalcResult::EmptyCell | CalcResult::EmptyArg => {}
+                CalcResult::Array(array) => {
+                    // Inline arrays have no empty elements: count them all
+                    for row in array {
+                        result += row.len() as f64;
+                    }
+                }
                 CalcResult::Range { left, right } => {
                     if left.sheet != right.sheet {
                         return CalcResult::new_error(
@@ -395,8 +381,13 @@ impl<'a> Model<'a> {
                             "Ranges are in different sheets".to_string(),
                         );
                     }
-                    for row in left.row..(right.row + 1) {
-                        for column in left.column..(right.column + 1) {
+                    let (row1, row2, column1, column2) =
+                        match self.clamped_range_bounds(&left, &right, cell) {
+                            Ok(b) => b,
+                            Err(e) => return e,
+                        };
+                    for row in row1..=row2 {
+                        for column in column1..=column2 {
                             match self.evaluate_cell(CellReferenceIndex {
                                 sheet: left.sheet,
                                 row,

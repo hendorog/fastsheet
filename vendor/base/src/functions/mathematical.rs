@@ -3,7 +3,7 @@ use crate::constants::{EXCEL_PRECISION, LAST_COLUMN, LAST_ROW};
 use crate::expressions::parser::ArrayNode;
 use crate::expressions::types::CellReferenceIndex;
 use crate::functions::math_util::{excel_round, from_roman, to_roman_with_form, RoundMode};
-use crate::number_format::{to_excel_precision, to_precision};
+use crate::number_format::to_excel_precision;
 use crate::single_number_fn;
 use crate::{
     calc_result::CalcResult, expressions::parser::Node, expressions::token::Error, model::Model,
@@ -50,40 +50,8 @@ pub fn random() -> f64 {
 impl<'a> Model<'a> {
     pub(crate) fn fn_min(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         let mut result = f64::NAN;
-        for arg in args {
-            match self.evaluate_node_in_context(arg, cell) {
-                CalcResult::Number(value) => result = value.min(result),
-                CalcResult::Range { left, right } => {
-                    if left.sheet != right.sheet {
-                        return CalcResult::new_error(
-                            Error::VALUE,
-                            cell,
-                            "Ranges are in different sheets".to_string(),
-                        );
-                    }
-                    for row in left.row..(right.row + 1) {
-                        for column in left.column..(right.column + 1) {
-                            match self.evaluate_cell(CellReferenceIndex {
-                                sheet: left.sheet,
-                                row,
-                                column,
-                            }) {
-                                CalcResult::Number(value) => {
-                                    result = value.min(result);
-                                }
-                                error @ CalcResult::Error { .. } => return error,
-                                _ => {
-                                    // We ignore booleans and strings
-                                }
-                            }
-                        }
-                    }
-                }
-                error @ CalcResult::Error { .. } => return error,
-                _ => {
-                    // We ignore booleans and strings
-                }
-            };
+        if let Err(e) = self.for_each_value(args, cell, |value| result = value.min(result)) {
+            return e;
         }
         if result.is_nan() || result.is_infinite() {
             return CalcResult::Number(0.0);
@@ -93,40 +61,8 @@ impl<'a> Model<'a> {
 
     pub(crate) fn fn_max(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         let mut result = f64::NAN;
-        for arg in args {
-            match self.evaluate_node_in_context(arg, cell) {
-                CalcResult::Number(value) => result = value.max(result),
-                CalcResult::Range { left, right } => {
-                    if left.sheet != right.sheet {
-                        return CalcResult::new_error(
-                            Error::VALUE,
-                            cell,
-                            "Ranges are in different sheets".to_string(),
-                        );
-                    }
-                    for row in left.row..(right.row + 1) {
-                        for column in left.column..(right.column + 1) {
-                            match self.evaluate_cell(CellReferenceIndex {
-                                sheet: left.sheet,
-                                row,
-                                column,
-                            }) {
-                                CalcResult::Number(value) => {
-                                    result = value.max(result);
-                                }
-                                error @ CalcResult::Error { .. } => return error,
-                                _ => {
-                                    // We ignore booleans and strings
-                                }
-                            }
-                        }
-                    }
-                }
-                error @ CalcResult::Error { .. } => return error,
-                _ => {
-                    // We ignore booleans and strings
-                }
-            };
+        if let Err(e) = self.for_each_value(args, cell, |value| result = value.max(result)) {
+            return e;
         }
         if result.is_nan() || result.is_infinite() {
             return CalcResult::Number(0.0);
@@ -541,94 +477,9 @@ impl<'a> Model<'a> {
         if args.is_empty() {
             return CalcResult::new_args_number_error(cell);
         }
-
         let mut result = 0.0;
-        for arg in args {
-            match self.evaluate_node_in_context(arg, cell) {
-                CalcResult::Number(value) => result += value,
-                CalcResult::Range { left, right } => {
-                    if left.sheet != right.sheet {
-                        return CalcResult::new_error(
-                            Error::VALUE,
-                            cell,
-                            "Ranges are in different sheets".to_string(),
-                        );
-                    }
-                    // TODO: We should do this for all functions that run through ranges
-                    // Running cargo test for the ironcalc takes around .8 seconds with this speedup
-                    // and ~ 3.5 seconds without it. Note that once properly in place sheet.dimension should be almost a noop
-                    let row1 = left.row;
-                    let mut row2 = right.row;
-                    let column1 = left.column;
-                    let mut column2 = right.column;
-                    if row1 == 1 && row2 == LAST_ROW {
-                        row2 = match self.workbook.worksheet(left.sheet) {
-                            Ok(s) => s.dimension().max_row,
-                            Err(_) => {
-                                return CalcResult::new_error(
-                                    Error::ERROR,
-                                    cell,
-                                    format!("Invalid worksheet index: '{}'", left.sheet),
-                                );
-                            }
-                        };
-                    }
-                    if column1 == 1 && column2 == LAST_COLUMN {
-                        column2 = match self.workbook.worksheet(left.sheet) {
-                            Ok(s) => s.dimension().max_column,
-                            Err(_) => {
-                                return CalcResult::new_error(
-                                    Error::ERROR,
-                                    cell,
-                                    format!("Invalid worksheet index: '{}'", left.sheet),
-                                );
-                            }
-                        };
-                    }
-                    for row in row1..row2 + 1 {
-                        for column in column1..(column2 + 1) {
-                            match self.evaluate_cell(CellReferenceIndex {
-                                sheet: left.sheet,
-                                row,
-                                column,
-                            }) {
-                                CalcResult::Number(value) => {
-                                    result += value;
-                                }
-                                error @ CalcResult::Error { .. } => return error,
-                                _ => {
-                                    // We ignore booleans and strings
-                                }
-                            }
-                        }
-                    }
-                }
-                CalcResult::Array(array) => {
-                    for row in array {
-                        for value in row {
-                            match value {
-                                ArrayNode::Number(value) => {
-                                    result += value;
-                                }
-                                ArrayNode::Error(error) => {
-                                    return CalcResult::Error {
-                                        error,
-                                        origin: cell,
-                                        message: "Error in array".to_string(),
-                                    }
-                                }
-                                _ => {
-                                    // We ignore booleans and strings
-                                }
-                            }
-                        }
-                    }
-                }
-                error @ CalcResult::Error { .. } => return error,
-                _ => {
-                    // We ignore booleans and strings
-                }
-            };
+        if let Err(e) = self.for_each_value(args, cell, |value| result += value) {
+            return e;
         }
         CalcResult::Number(result)
     }
@@ -734,72 +585,11 @@ impl<'a> Model<'a> {
         }
         let mut result = 1.0;
         let mut seen_value = false;
-        for arg in args {
-            match self.evaluate_node_in_context(arg, cell) {
-                CalcResult::Number(value) => {
-                    seen_value = true;
-                    result *= value;
-                }
-                CalcResult::Range { left, right } => {
-                    if left.sheet != right.sheet {
-                        return CalcResult::new_error(
-                            Error::VALUE,
-                            cell,
-                            "Ranges are in different sheets".to_string(),
-                        );
-                    }
-                    let row1 = left.row;
-                    let mut row2 = right.row;
-                    let column1 = left.column;
-                    let mut column2 = right.column;
-                    if row1 == 1 && row2 == LAST_ROW {
-                        row2 = match self.workbook.worksheet(left.sheet) {
-                            Ok(s) => s.dimension().max_row,
-                            Err(_) => {
-                                return CalcResult::new_error(
-                                    Error::ERROR,
-                                    cell,
-                                    format!("Invalid worksheet index: '{}'", left.sheet),
-                                );
-                            }
-                        };
-                    }
-                    if column1 == 1 && column2 == LAST_COLUMN {
-                        column2 = match self.workbook.worksheet(left.sheet) {
-                            Ok(s) => s.dimension().max_column,
-                            Err(_) => {
-                                return CalcResult::new_error(
-                                    Error::ERROR,
-                                    cell,
-                                    format!("Invalid worksheet index: '{}'", left.sheet),
-                                );
-                            }
-                        };
-                    }
-                    for row in row1..row2 + 1 {
-                        for column in column1..(column2 + 1) {
-                            match self.evaluate_cell(CellReferenceIndex {
-                                sheet: left.sheet,
-                                row,
-                                column,
-                            }) {
-                                CalcResult::Number(value) => {
-                                    seen_value = true;
-                                    result *= value;
-                                }
-                                error @ CalcResult::Error { .. } => return error,
-                                _ => {
-                                    // We ignore booleans and strings
-                                }
-                            }
-                        }
-                    }
-                }
-                error @ CalcResult::Error { .. } => return error,
-                _ => {
-                    // We ignore booleans and strings
-                }
-            };
+        if let Err(e) = self.for_each_value(args, cell, |value| {
+            seen_value = true;
+            result *= value;
+        }) {
+            return e;
         }
         if !seen_value {
             return CalcResult::Number(0.0);
