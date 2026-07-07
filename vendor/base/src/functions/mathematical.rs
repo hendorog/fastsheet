@@ -2,7 +2,7 @@ use crate::cast::NumberOrArray;
 use crate::constants::{EXCEL_PRECISION, LAST_COLUMN, LAST_ROW};
 use crate::expressions::parser::ArrayNode;
 use crate::expressions::types::CellReferenceIndex;
-use crate::functions::math_util::{from_roman, to_roman_with_form};
+use crate::functions::math_util::{excel_round, from_roman, to_roman_with_form, RoundMode};
 use crate::number_format::{to_excel_precision, to_precision};
 use crate::single_number_fn;
 use crate::{
@@ -837,21 +837,18 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
         let value = match self.get_number(&args[0], cell) {
-            Ok(f) => to_precision(f, 15),
+            Ok(f) => f,
             Err(s) => return s,
         };
         let number_of_digits = match self.get_number(&args[1], cell) {
-            Ok(f) => {
-                if f > 0.0 {
-                    f.floor()
-                } else {
-                    f.ceil()
-                }
-            }
+            Ok(f) => f.trunc(),
             Err(s) => return s,
         };
-        let scale = 10.0_f64.powf(number_of_digits);
-        CalcResult::Number((value * scale).round() / scale)
+        CalcResult::Number(excel_round(
+            value,
+            number_of_digits,
+            RoundMode::HalfAwayFromZero,
+        ))
     }
 
     pub(crate) fn fn_roundup(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
@@ -859,25 +856,14 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
         let value = match self.get_number(&args[0], cell) {
-            Ok(f) => to_precision(f, 15),
+            Ok(f) => f,
             Err(s) => return s,
         };
         let number_of_digits = match self.get_number(&args[1], cell) {
-            Ok(f) => {
-                if f > 0.0 {
-                    f.floor()
-                } else {
-                    f.ceil()
-                }
-            }
+            Ok(f) => f.trunc(),
             Err(s) => return s,
         };
-        let scale = 10.0_f64.powf(number_of_digits);
-        if value > 0.0 {
-            CalcResult::Number((value * scale).ceil() / scale)
-        } else {
-            CalcResult::Number((value * scale).floor() / scale)
-        }
+        CalcResult::Number(excel_round(value, number_of_digits, RoundMode::Up))
     }
 
     pub(crate) fn fn_rounddown(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
@@ -885,25 +871,14 @@ impl<'a> Model<'a> {
             return CalcResult::new_args_number_error(cell);
         }
         let value = match self.get_number(&args[0], cell) {
-            Ok(f) => to_precision(f, 15),
+            Ok(f) => f,
             Err(s) => return s,
         };
         let number_of_digits = match self.get_number(&args[1], cell) {
-            Ok(f) => {
-                if f > 0.0 {
-                    f.floor()
-                } else {
-                    f.ceil()
-                }
-            }
+            Ok(f) => f.trunc(),
             Err(s) => return s,
         };
-        let scale = 10.0_f64.powf(number_of_digits);
-        if value > 0.0 {
-            CalcResult::Number((value * scale).floor() / scale)
-        } else {
-            CalcResult::Number((value * scale).ceil() / scale)
-        }
+        CalcResult::Number(excel_round(value, number_of_digits, RoundMode::Down))
     }
 
     // (number, divisor)

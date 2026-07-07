@@ -198,3 +198,68 @@ pub fn to_roman_with_form(n: u32, form: i32) -> Result<String, String> {
     }
     Ok(s)
 }
+
+/// Rounding directions for [`excel_round`].
+pub(crate) enum RoundMode {
+    /// ROUND: ties round away from zero
+    HalfAwayFromZero,
+    /// ROUNDUP: away from zero
+    Up,
+    /// ROUNDDOWN: toward zero
+    Down,
+}
+
+/// Round `value` at `digits` decimal places the way Excel does: on the
+/// 15-significant-digit *decimal* representation, not on the binary value.
+/// Binary scaling gets classic cases wrong (`2.675 * 100` is `267.4999…`,
+/// so `ROUND(2.675, 2)` would give 2.67 instead of Excel's 2.68).
+pub(crate) fn excel_round(value: f64, digits: f64, mode: RoundMode) -> f64 {
+    if value == 0.0 || !value.is_finite() {
+        return value;
+    }
+    let digits = digits.clamp(-400.0, 400.0) as i64;
+    // Exact 15-significant-digit decimal view: m holds all 15 digits, e is
+    // the decimal exponent ("2.67500000000000e0" -> m = 2675…0, e = 0).
+    let s = format!("{:.14e}", value.abs());
+    let (m, e) = match s.split_once('e') {
+        Some((mantissa, exp)) => match (mantissa.replace('.', "").parse::<i64>(), exp.parse::<i64>())
+        {
+            (Ok(m), Ok(e)) => (m, e),
+            _ => return value,
+        },
+        None => return value,
+    };
+    // Number of leading decimal digits kept when rounding at 10^-digits
+    let kept = e + digits + 1;
+    if kept >= 15 {
+        // The rounding unit is below the 15-digit resolution: nothing to drop
+        return crate::number_format::to_precision(value, 15);
+    }
+    let q: i64 = if kept <= 0 {
+        // |value| is smaller than the rounding unit
+        match mode {
+            RoundMode::Down => 0,
+            RoundMode::Up => 1,
+            RoundMode::HalfAwayFromZero => {
+                i64::from(kept == 0 && m >= 5 * 10_i64.pow(14))
+            }
+        }
+    } else {
+        let div = 10_i64.pow((15 - kept) as u32);
+        let (q, r) = (m / div, m % div);
+        match mode {
+            RoundMode::Down => q,
+            RoundMode::Up => q + i64::from(r > 0),
+            RoundMode::HalfAwayFromZero => q + i64::from(r >= div / 2),
+        }
+    };
+    if q == 0 {
+        return 0.0;
+    }
+    // Reconstruct decimally so we land on the nearest double to the exact
+    // decimal result (multiplying by powers of ten would reintroduce error).
+    let sign = if value < 0.0 { "-" } else { "" };
+    format!("{sign}{q}e{}", -digits)
+        .parse::<f64>()
+        .unwrap_or(value)
+}
