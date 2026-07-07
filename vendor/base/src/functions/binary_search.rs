@@ -180,28 +180,23 @@ impl<'a> Model<'a> {
         is_row_vector: bool,
     ) -> i32 {
         let array = self.prepare_array(left, right, is_row_vector);
-        // We apply binary search leftmost for value in the range
+        // Upper-bound search: Excel's approximate match returns the *last*
+        // element <= target, so runs of equal keys resolve to the last one.
         let mut l = 0;
         let mut r = array.len();
         while l < r {
             let m = (l + r) / 2;
-            match compare_values(&array[m], target) {
-                -1 => {
-                    l = m + 1;
-                }
-                1 => {
-                    r = m;
-                }
-                _ => {
-                    return m as i32;
-                }
+            if compare_values(&array[m], target) <= 0 {
+                l = m + 1;
+            } else {
+                r = m;
             }
         }
         // If target is less than the minimum return #N/A
         if l == 0 {
             return -2;
         }
-        // Now l points to the leftmost element
+        // Now l points past the last element <= target
         (l - 1) as i32
     }
 }

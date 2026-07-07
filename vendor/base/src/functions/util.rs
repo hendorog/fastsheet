@@ -6,16 +6,20 @@ use crate::{
     number_format::to_excel_precision,
 };
 
+/// Excel compares numbers after rounding both to 15 significant digits,
+/// so floating-point noise from different computations does not break equality
+/// (e.g. 0.1+0.2 equals 0.3).
+pub(crate) fn numbers_are_equal(value1: f64, value2: f64) -> bool {
+    to_excel_precision(value1, 15) == to_excel_precision(value2, 15)
+}
+
 /// This test for exact match (modulo case).
 ///   * strings are not cast into bools or numbers
 ///   * empty cell is not cast into empty string or zero
 pub(crate) fn values_are_equal(left: &CalcResult, right: &CalcResult) -> bool {
     match (left, right) {
         (CalcResult::Number(value1), CalcResult::Number(value2)) => {
-            if (value2 - value1).abs() < f64::EPSILON {
-                return true;
-            }
-            false
+            numbers_are_equal(*value1, *value2)
         }
         (CalcResult::String(value1), CalcResult::String(value2)) => {
             let value1 = value1.to_uppercase();
@@ -39,7 +43,7 @@ pub(crate) fn compare_values(left: &CalcResult, right: &CalcResult) -> i32 {
         (CalcResult::Number(value1), CalcResult::Number(value2)) => {
             let value1 = to_excel_precision(*value1, 15);
             let value2 = to_excel_precision(*value2, 15);
-            if (value2 - value1).abs() < f64::EPSILON {
+            if value1 == value2 {
                 return 0;
             }
             if value1 < value2 {
@@ -127,18 +131,10 @@ pub(crate) fn from_wildcard_to_regex(
 // In the rest of the cases calc_result needs to be a number (cannot be the string "23", for instance)
 fn result_is_equal_to_number(calc_result: &CalcResult, target: f64) -> bool {
     match calc_result {
-        CalcResult::Number(f) => {
-            if (f - target).abs() < f64::EPSILON {
-                return true;
-            }
-            false
-        }
+        CalcResult::Number(f) => numbers_are_equal(*f, target),
         CalcResult::String(s) => {
             if let Ok(f) = s.parse::<f64>() {
-                if (f - target).abs() < f64::EPSILON {
-                    return true;
-                }
-                return false;
+                return numbers_are_equal(f, target);
             }
             false
         }
@@ -176,15 +172,10 @@ fn result_is_greater_or_equal_than_number(calc_result: &CalcResult, target: f64)
 
 fn result_is_not_equal_to_number(calc_result: &CalcResult, target: f64) -> bool {
     match calc_result {
-        CalcResult::Number(f) => {
-            if (f - target).abs() > f64::EPSILON {
-                return true;
-            }
-            false
-        }
+        CalcResult::Number(f) => !numbers_are_equal(*f, target),
         // Mirror the equality branch: numeric text is compared as a number
         CalcResult::String(s) => match s.parse::<f64>() {
-            Ok(f) => (f - target).abs() > f64::EPSILON,
+            Ok(f) => !numbers_are_equal(f, target),
             Err(_) => true,
         },
         _ => true,
