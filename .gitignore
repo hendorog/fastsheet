@@ -30,3 +30,4 @@ SPIKE_FINDINGS.md
 # artifacts, screenshots, probe output. Kept on disk for reference;
 # not part of the project history.
 /bugs/
+/vendor/base/Cargo.lock

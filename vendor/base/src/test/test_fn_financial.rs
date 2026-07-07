@@ -23,7 +23,8 @@ fn fn_arguments() {
 
     model._set("E1", "=RATE()");
     model._set("E2", "=RATE(1,1)");
-    model._set("E3", "=RATE(1,1,1,1,1,1)");
+    // RATE takes up to 6 arguments (guess); 7 is an error
+    model._set("E3", "=RATE(1,1,1,1,1,1,1)");
 
     model.evaluate();
 

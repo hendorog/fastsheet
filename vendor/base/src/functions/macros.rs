@@ -9,12 +9,17 @@ macro_rules! single_number_fn {
             if args.len() != 1 {
                 return CalcResult::new_args_number_error(cell);
             }
+            // Excel reports out-of-domain results (NaN/infinity) as #NUM!
+            let op = |f: f64| match $op(f) {
+                Ok(x) if !x.is_finite() => Err(Error::NUM),
+                other => other,
+            };
             // 2) Try to get a "NumberOrArray"
             match self.get_number_or_array(&args[0], cell) {
                 // -----------------------------------------
                 // Case A: It's a single number
                 // -----------------------------------------
-                Ok(NumberOrArray::Number(f)) => match $op(f) {
+                Ok(NumberOrArray::Number(f)) => match op(f) {
                     Ok(x) => CalcResult::Number(x),
                     Err(Error::DIV) => CalcResult::Error {
                         error: Error::DIV,
@@ -46,7 +51,7 @@ macro_rules! single_number_fn {
                                 // If Boolean, treat as 0.0 or 1.0
                                 ArrayNode::Boolean(b) => {
                                     let n = if b { 1.0 } else { 0.0 };
-                                    match $op(n) {
+                                    match op(n) {
                                         Ok(x) => data_row.push(ArrayNode::Number(x)),
                                         Err(Error::DIV) => {
                                             data_row.push(ArrayNode::Error(Error::DIV))
@@ -58,7 +63,7 @@ macro_rules! single_number_fn {
                                     }
                                 }
                                 // If Number, apply directly
-                                ArrayNode::Number(n) => match $op(n) {
+                                ArrayNode::Number(n) => match op(n) {
                                     Ok(x) => data_row.push(ArrayNode::Number(x)),
                                     Err(Error::DIV) => data_row.push(ArrayNode::Error(Error::DIV)),
                                     Err(Error::VALUE) => {
@@ -69,7 +74,7 @@ macro_rules! single_number_fn {
                                 // If String, parse to f64 then apply or #VALUE! error
                                 ArrayNode::String(s) => {
                                     let node = match self.cast_number(&s) {
-                                        Some(f) => match $op(f) {
+                                        Some(f) => match op(f) {
                                             Ok(x) => ArrayNode::Number(x),
                                             Err(Error::DIV) => ArrayNode::Error(Error::DIV),
                                             Err(Error::VALUE) => ArrayNode::Error(Error::VALUE),

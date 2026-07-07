@@ -182,6 +182,11 @@ fn result_is_not_equal_to_number(calc_result: &CalcResult, target: f64) -> bool 
             }
             false
         }
+        // Mirror the equality branch: numeric text is compared as a number
+        CalcResult::String(s) => match s.parse::<f64>() {
+            Ok(f) => (f - target).abs() > f64::EPSILON,
+            Err(_) => true,
+        },
         _ => true,
     }
 }

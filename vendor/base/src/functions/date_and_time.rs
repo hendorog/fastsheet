@@ -1052,7 +1052,8 @@ impl<'a> Model<'a> {
             Ok(f) => f,
             Err(e) => return e,
         };
-        let total_seconds = hour.floor() * 3600.0 + minute.floor() * 60.0 + second.floor();
+        // Excel truncates components toward zero (negative values may cancel out)
+        let total_seconds = hour.trunc() * 3600.0 + minute.trunc() * 60.0 + second.trunc();
         if total_seconds < 0.0 {
             return CalcResult::Error {
                 error: Error::NUM,

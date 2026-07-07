@@ -201,7 +201,7 @@ impl<'a> Model<'a> {
         }
         let start_num = start_num as usize;
 
-        if start_num > within_text.len() {
+        if start_num > within_text.chars().count() {
             return CalcResult::Error {
                 error: Error::VALUE,
                 origin: cell,
@@ -253,7 +253,7 @@ impl<'a> Model<'a> {
         }
         let start_num = start_num as usize;
 
-        if start_num > within_text.len() {
+        if start_num > within_text.chars().count() {
             return CalcResult::Error {
                 error: Error::VALUE,
                 origin: cell,
@@ -343,7 +343,14 @@ impl<'a> Model<'a> {
                     }
                 }
             };
-            return CalcResult::String(s.trim().to_owned());
+            // Excel's TRIM strips only the ASCII space (32) and collapses
+            // internal runs of spaces; tabs, newlines and NBSP are kept.
+            let trimmed = s
+                .split(' ')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return CalcResult::String(trimmed);
         }
         CalcResult::new_args_number_error(cell)
     }
@@ -551,8 +558,9 @@ impl<'a> Model<'a> {
             }
         };
         let num_chars = if args.len() == 2 {
-            match self.evaluate_node_in_context(&args[1], cell) {
-                CalcResult::Number(v) => {
+            // Excel coerces numeric text and booleans here
+            match self.get_number(&args[1], cell) {
+                Ok(v) => {
                     if v < 0.0 {
                         return CalcResult::Error {
                             error: Error::VALUE,
@@ -562,30 +570,7 @@ impl<'a> Model<'a> {
                     }
                     v.floor() as usize
                 }
-                CalcResult::Boolean(_) | CalcResult::String(_) => {
-                    return CalcResult::Error {
-                        error: Error::VALUE,
-                        origin: cell,
-                        message: "Expecting number".to_string(),
-                    };
-                }
-                error @ CalcResult::Error { .. } => return error,
-                CalcResult::Range { .. } => {
-                    // Implicit Intersection not implemented
-                    return CalcResult::Error {
-                        error: Error::NIMPL,
-                        origin: cell,
-                        message: "Implicit Intersection not implemented".to_string(),
-                    };
-                }
-                CalcResult::EmptyCell | CalcResult::EmptyArg => 0,
-                CalcResult::Array(_) => {
-                    return CalcResult::Error {
-                        error: Error::NIMPL,
-                        origin: cell,
-                        message: "Arrays not supported yet".to_string(),
-                    }
-                }
+                Err(s) => return s,
             }
         } else {
             1
@@ -633,8 +618,9 @@ impl<'a> Model<'a> {
             }
         };
         let num_chars = if args.len() == 2 {
-            match self.evaluate_node_in_context(&args[1], cell) {
-                CalcResult::Number(v) => {
+            // Excel coerces numeric text and booleans here
+            match self.get_number(&args[1], cell) {
+                Ok(v) => {
                     if v < 0.0 {
                         return CalcResult::Error {
                             error: Error::VALUE,
@@ -644,30 +630,7 @@ impl<'a> Model<'a> {
                     }
                     v.floor() as usize
                 }
-                CalcResult::Boolean(_) | CalcResult::String(_) => {
-                    return CalcResult::Error {
-                        error: Error::VALUE,
-                        origin: cell,
-                        message: "Expecting number".to_string(),
-                    };
-                }
-                error @ CalcResult::Error { .. } => return error,
-                CalcResult::Range { .. } => {
-                    // Implicit Intersection not implemented
-                    return CalcResult::Error {
-                        error: Error::NIMPL,
-                        origin: cell,
-                        message: "Implicit Intersection not implemented".to_string(),
-                    };
-                }
-                CalcResult::EmptyCell | CalcResult::EmptyArg => 0,
-                CalcResult::Array(_) => {
-                    return CalcResult::Error {
-                        error: Error::NIMPL,
-                        origin: cell,
-                        message: "Arrays not supported yet".to_string(),
-                    }
-                }
+                Err(s) => return s,
             }
         } else {
             1
@@ -714,8 +677,9 @@ impl<'a> Model<'a> {
                 }
             }
         };
-        let start_num = match self.evaluate_node_in_context(&args[1], cell) {
-            CalcResult::Number(v) => {
+        // Excel coerces numeric text and booleans for both count arguments
+        let start_num = match self.get_number(&args[1], cell) {
+            Ok(v) => {
                 if v < 1.0 {
                     return CalcResult::Error {
                         error: Error::VALUE,
@@ -725,25 +689,10 @@ impl<'a> Model<'a> {
                 }
                 v.floor() as usize
             }
-            error @ CalcResult::Error { .. } => return error,
-            CalcResult::Range { .. } => {
-                // Implicit Intersection not implemented
-                return CalcResult::Error {
-                    error: Error::NIMPL,
-                    origin: cell,
-                    message: "Implicit Intersection not implemented".to_string(),
-                };
-            }
-            _ => {
-                return CalcResult::Error {
-                    error: Error::VALUE,
-                    origin: cell,
-                    message: "Expecting number".to_string(),
-                };
-            }
+            Err(s) => return s,
         };
-        let num_chars = match self.evaluate_node_in_context(&args[2], cell) {
-            CalcResult::Number(v) => {
+        let num_chars = match self.get_number(&args[2], cell) {
+            Ok(v) => {
                 if v < 0.0 {
                     return CalcResult::Error {
                         error: Error::VALUE,
@@ -753,37 +702,7 @@ impl<'a> Model<'a> {
                 }
                 v.floor() as usize
             }
-            CalcResult::String(_) => {
-                return CalcResult::Error {
-                    error: Error::VALUE,
-                    origin: cell,
-                    message: "Expecting number".to_string(),
-                };
-            }
-            CalcResult::Boolean(_) => {
-                return CalcResult::Error {
-                    error: Error::VALUE,
-                    origin: cell,
-                    message: "Expecting number".to_string(),
-                }
-            }
-            error @ CalcResult::Error { .. } => return error,
-            CalcResult::Range { .. } => {
-                // Implicit Intersection not implemented
-                return CalcResult::Error {
-                    error: Error::NIMPL,
-                    origin: cell,
-                    message: "Implicit Intersection not implemented".to_string(),
-                };
-            }
-            CalcResult::EmptyCell | CalcResult::EmptyArg => 0,
-            CalcResult::Array(_) => {
-                return CalcResult::Error {
-                    error: Error::NIMPL,
-                    origin: cell,
-                    message: "Arrays not supported yet".to_string(),
-                }
-            }
+            Err(s) => return s,
         };
         let mut result = "".to_string();
         let mut count: usize = 0;
