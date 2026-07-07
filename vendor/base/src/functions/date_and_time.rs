@@ -37,7 +37,7 @@ fn is_feb_29_between_dates(start: chrono::NaiveDate, end: chrono::NaiveDate) -> 
 // Generate DAY / MONTH / YEAR helpers – simply convert the serial number to a
 // NaiveDate and return the requested component as a number.
 macro_rules! date_part_fn {
-    ($name:ident, $method:ident) => {
+    ($name:ident, $index:tt) => {
         pub(crate) fn $name(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
             if args.len() != 1 {
                 return CalcResult::new_args_number_error(cell);
@@ -46,11 +46,16 @@ macro_rules! date_part_fn {
                 Ok(num) => num.floor() as i64,
                 Err(e) => return e,
             };
-            let date = match self.excel_date(serial_number, cell) {
-                Ok(d) => d,
-                Err(e) => return e,
-            };
-            CalcResult::Number(date.$method() as f64)
+            // excel_date_components handles serial 0 (1900-01-00) and the
+            // fictitious serial 60 (1900-02-29)
+            match excel_date_components(serial_number) {
+                Ok(components) => CalcResult::Number(components.$index as f64),
+                Err(_) => CalcResult::Error {
+                    error: Error::NUM,
+                    origin: cell,
+                    message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
+                },
+            }
         }
     };
 }
@@ -84,16 +89,17 @@ use crate::constants::MAXIMUM_DATE_SERIAL_NUMBER;
 use crate::constants::MINIMUM_DATE_SERIAL_NUMBER;
 use crate::expressions::types::CellReferenceIndex;
 use crate::formatter::dates::date_to_serial_number;
+use crate::formatter::dates::excel_date_components;
+use crate::formatter::dates::excel_weekday_from_serial;
 use crate::formatter::dates::permissive_date_to_serial_number;
 use crate::formatter::dates::DATE_OUT_OF_RANGE_MESSAGE;
 use crate::model::get_milliseconds_since_epoch;
 use crate::number_format::to_precision;
 use crate::{
     calc_result::CalcResult,
-    constants::EXCEL_DATE_BASE,
     expressions::parser::{ArrayNode, Node},
     expressions::token::Error,
-    formatter::dates::from_excel_date,
+    formatter::dates::{convert_to_serial_number, from_excel_date},
     model::Model,
 };
 
@@ -520,9 +526,9 @@ impl<'a> Model<'a> {
     // -----------------------------------------------------------------------
     // Auto-generated DATE part helpers (DAY / MONTH / YEAR)
     // -----------------------------------------------------------------------
-    date_part_fn!(fn_day, day);
-    date_part_fn!(fn_month, month);
-    date_part_fn!(fn_year, year);
+    date_part_fn!(fn_year, 0);
+    date_part_fn!(fn_month, 1);
+    date_part_fn!(fn_day, 2);
 
     pub(crate) fn fn_eomonth(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         let args_count = args.len();
@@ -605,7 +611,12 @@ impl<'a> Model<'a> {
                         message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
                     };
                 }
-                t
+                // Excel interprets years 0..=1899 as 1900..=3799
+                if t <= 1899 {
+                    t + 1900
+                } else {
+                    t
+                }
             }
             Err(s) => return s,
         };
@@ -663,7 +674,7 @@ impl<'a> Model<'a> {
             date - Months::new(months_abs)
         };
 
-        let serial_number = native_date.num_days_from_ce() - EXCEL_DATE_BASE;
+        let serial_number = convert_to_serial_number(native_date);
         if serial_number < MINIMUM_DATE_SERIAL_NUMBER {
             return CalcResult::Error {
                 error: Error::NUM,
@@ -785,7 +796,7 @@ impl<'a> Model<'a> {
         let seconds = get_milliseconds_since_epoch() / 1000;
         DateTime::from_timestamp(seconds, 0).map(|dt| {
             let local_time = dt.with_timezone(&tz);
-            let days_from_1900 = local_time.num_days_from_ce() - EXCEL_DATE_BASE;
+            let days_from_1900 = convert_to_serial_number(local_time.date_naive());
             let fraction = (local_time.num_seconds_from_midnight() as f64) / (60.0 * 60.0 * 24.0);
             days_from_1900 as f64 + fraction
         })
@@ -819,13 +830,15 @@ impl<'a> Model<'a> {
         } else {
             (end_serial, start_serial, -1.0)
         };
+        // Validate the endpoints once; the weekday itself is pure serial math
+        for endpoint in [from, to] {
+            if let Err(e) = self.excel_date(endpoint, cell) {
+                return e;
+            }
+        }
         let mut count = 0i64;
         for serial in from..=to {
-            let date = match self.excel_date(serial, cell) {
-                Ok(d) => d,
-                Err(e) => return e,
-            };
-            let weekday = date.weekday().number_from_monday();
+            let weekday = excel_weekday_from_serial(serial).number_from_monday();
             let is_weekend = matches!(weekday, 6 | 7);
             if !is_weekend && !holidays.contains(&serial) {
                 count += 1;
@@ -965,13 +978,15 @@ impl<'a> Model<'a> {
         } else {
             (end_serial, start_serial, -1.0)
         };
+        // Validate the endpoints once; the weekday itself is pure serial math
+        for endpoint in [from, to] {
+            if let Err(e) = self.excel_date(endpoint, cell) {
+                return e;
+            }
+        }
         let mut count = 0i64;
         for serial in from..=to {
-            let date = match self.excel_date(serial, cell) {
-                Ok(d) => d,
-                Err(e) => return e,
-            };
-            let weekday = date.weekday().number_from_monday() as usize - 1;
+            let weekday = excel_weekday_from_serial(serial).number_from_monday() as usize - 1;
             if !weekend_pattern[weekday] && !holidays.contains(&serial) {
                 count += 1;
             }
@@ -1358,10 +1373,14 @@ impl<'a> Model<'a> {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
-        let date = match self.excel_date(serial, cell) {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
+        // Serial 0 (1900-01-00) is a valid WEEKDAY argument in Excel
+        if !(0..=MAXIMUM_DATE_SERIAL_NUMBER as i64).contains(&serial) {
+            return CalcResult::Error {
+                error: Error::NUM,
+                origin: cell,
+                message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
+            };
+        }
         let return_type = if args.len() == 2 {
             match self.get_number(&args[1], cell) {
                 Ok(f) => f as i32,
@@ -1370,7 +1389,7 @@ impl<'a> Model<'a> {
         } else {
             1
         };
-        let weekday = date.weekday();
+        let weekday = excel_weekday_from_serial(serial);
         let num = match return_type {
             1 => weekday.num_days_from_sunday() + 1,
             2 => weekday.number_from_monday(),
@@ -1426,9 +1445,11 @@ impl<'a> Model<'a> {
             }
             _ => return CalcResult::new_error(Error::NUM, cell, "Invalid return_type".to_string()),
         };
-        let mut first = match chrono::NaiveDate::from_ymd_opt(date.year(), 1, 1) {
-            Some(d) => d,
-            None => {
+        // Work in serial space so the week boundaries follow Excel's weekday
+        // cycle (which includes the fictitious 1900-02-29)
+        let mut first_serial = match date_to_serial_number(1, 1, date.year()) {
+            Ok(s) => s as i64,
+            Err(_) => {
                 return CalcResult::new_error(
                     Error::NUM,
                     cell,
@@ -1436,10 +1457,10 @@ impl<'a> Model<'a> {
                 );
             }
         };
-        while first.weekday() != start_offset {
-            first -= chrono::Duration::days(1);
+        while excel_weekday_from_serial(first_serial) != start_offset {
+            first_serial -= 1;
         }
-        let week = (date - first).num_days() / 7 + 1;
+        let week = (serial - first_serial) / 7 + 1;
         CalcResult::Number(week as f64)
     }
 
@@ -1478,10 +1499,9 @@ impl<'a> Model<'a> {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
-        let mut date = match self.excel_date(start_serial, cell) {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
+        if let Err(e) = self.excel_date(start_serial, cell) {
+            return e;
+        }
         let mut days = match self.get_number(&args[1], cell) {
             Ok(f) => f as i32,
             Err(s) => return s,
@@ -1491,20 +1511,34 @@ impl<'a> Model<'a> {
             Ok(h) => h,
             Err(e) => return e,
         };
+        // Walk in serial space so the weekday cycle matches Excel's
+        let mut serial = start_serial;
         while days != 0 {
             if days > 0 {
-                date += chrono::Duration::days(1);
-                if !Self::is_weekend(date.weekday(), &weekend) && !holiday_set.contains(&date) {
+                serial += 1;
+                if !Self::is_weekend(excel_weekday_from_serial(serial), &weekend)
+                    && !holiday_set.contains(&serial)
+                {
                     days -= 1;
                 }
             } else {
-                date -= chrono::Duration::days(1);
-                if !Self::is_weekend(date.weekday(), &weekend) && !holiday_set.contains(&date) {
+                serial -= 1;
+                if !Self::is_weekend(excel_weekday_from_serial(serial), &weekend)
+                    && !holiday_set.contains(&serial)
+                {
                     days += 1;
                 }
             }
         }
-        let serial = date.num_days_from_ce() - EXCEL_DATE_BASE;
+        if !(MINIMUM_DATE_SERIAL_NUMBER as i64..=MAXIMUM_DATE_SERIAL_NUMBER as i64)
+            .contains(&serial)
+        {
+            return CalcResult::Error {
+                error: Error::NUM,
+                origin: cell,
+                message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
+            };
+        }
         CalcResult::Number(serial as f64)
     }
 
@@ -1512,13 +1546,13 @@ impl<'a> Model<'a> {
         &mut self,
         arg_option: Option<&Node>,
         cell: CellReferenceIndex,
-    ) -> Result<std::collections::HashSet<chrono::NaiveDate>, CalcResult> {
+    ) -> Result<std::collections::HashSet<i64>, CalcResult> {
         let mut holiday_set = std::collections::HashSet::new();
 
         if let Some(arg) = arg_option {
             self.collect_serial_numbers(arg, cell, |serial| match from_excel_date(serial) {
-                Ok(date) => {
-                    holiday_set.insert(date);
+                Ok(_) => {
+                    holiday_set.insert(serial);
                     Ok(())
                 }
                 Err(_) => Err(CalcResult::Error {
@@ -1544,10 +1578,9 @@ impl<'a> Model<'a> {
             Ok(c) => c.floor() as i64,
             Err(s) => return s,
         };
-        let mut date = match self.excel_date(start_serial, cell) {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
+        if let Err(e) = self.excel_date(start_serial, cell) {
+            return e;
+        }
         let mut days = match self.get_number(&args[1], cell) {
             Ok(f) => f as i32,
             Err(s) => return s,
@@ -1570,22 +1603,34 @@ impl<'a> Model<'a> {
             };
         }
 
+        // Walk in serial space so the weekday cycle matches Excel's
+        let mut serial = start_serial;
         while days != 0 {
             if days > 0 {
-                date += chrono::Duration::days(1);
-                if !Self::is_weekend(date.weekday(), &weekend_mask) && !holiday_set.contains(&date)
+                serial += 1;
+                if !Self::is_weekend(excel_weekday_from_serial(serial), &weekend_mask)
+                    && !holiday_set.contains(&serial)
                 {
                     days -= 1;
                 }
             } else {
-                date -= chrono::Duration::days(1);
-                if !Self::is_weekend(date.weekday(), &weekend_mask) && !holiday_set.contains(&date)
+                serial -= 1;
+                if !Self::is_weekend(excel_weekday_from_serial(serial), &weekend_mask)
+                    && !holiday_set.contains(&serial)
                 {
                     days += 1;
                 }
             }
         }
-        let serial = date.num_days_from_ce() - EXCEL_DATE_BASE;
+        if !(MINIMUM_DATE_SERIAL_NUMBER as i64..=MAXIMUM_DATE_SERIAL_NUMBER as i64)
+            .contains(&serial)
+        {
+            return CalcResult::Error {
+                error: Error::NUM,
+                origin: cell,
+                message: DATE_OUT_OF_RANGE_MESSAGE.to_string(),
+            };
+        }
         CalcResult::Number(serial as f64)
     }
 

@@ -69,6 +69,7 @@ mod test_number_to_string;
 mod test_numeric_equality;
 
 mod test_arrays;
+mod test_1900_dates;
 mod test_aggregate_literals;
 mod test_cell_info_n_sheets;
 mod test_combin_combina;

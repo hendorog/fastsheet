@@ -20,7 +20,7 @@ pub(crate) const EXCEL_PRECISION: usize = 15;
 // The 2 days offset is because of Excel 1900 bug
 pub(crate) const EXCEL_DATE_BASE: i32 = 693_594;
 
-// We do not support dates before 1899-12-31.
+// We do not support dates before 1900-01-01 (Excel serial 1).
 pub(crate) const MINIMUM_DATE_SERIAL_NUMBER: i32 = 1;
 
 // Excel can handle dates until the year 9999-12-31
