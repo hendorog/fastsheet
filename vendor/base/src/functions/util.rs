@@ -173,11 +173,9 @@ fn result_is_greater_or_equal_than_number(calc_result: &CalcResult, target: f64)
 fn result_is_not_equal_to_number(calc_result: &CalcResult, target: f64) -> bool {
     match calc_result {
         CalcResult::Number(f) => !numbers_are_equal(*f, target),
-        // Mirror the equality branch: numeric text is compared as a number
-        CalcResult::String(s) => match s.parse::<f64>() {
-            Ok(f) => !numbers_are_equal(f, target),
-            Err(_) => true,
-        },
+        // Excel's "<>n" excludes only NUMBER cells equal to n: text that
+        // parses as n still counts (asymmetric with "=n", which matches it —
+        // verified against Excel-generated COUNTIF fixtures)
         _ => true,
     }
 }

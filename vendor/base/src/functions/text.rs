@@ -1227,11 +1227,17 @@ impl<'a> Model<'a> {
         if args.len() != 1 {
             return CalcResult::new_args_number_error(cell);
         }
-        let text = match self.get_string(&args[0], cell) {
-            Ok(s) => s,
-            Err(error) => match error {
-                CalcResult::Error { error, .. } => error.to_string(),
-                _ => "".to_string(),
+        let text = match self.evaluate_node_in_context(&args[0], cell) {
+            // Unlike the `&` operator, VALUETOTEXT renders numbers as plain
+            // decimal in Excel (VALUETOTEXT(7.123456E-9) is
+            // "0.000000007123456", not "7.123456E-09")
+            CalcResult::Number(v) => format!("{}", to_precision(v, 15)),
+            other => match self.cast_to_string(other, cell) {
+                Ok(s) => s,
+                Err(error) => match error {
+                    CalcResult::Error { error, .. } => error.to_string(),
+                    _ => "".to_string(),
+                },
             },
         };
         CalcResult::String(text)

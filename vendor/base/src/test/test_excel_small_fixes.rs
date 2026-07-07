@@ -102,7 +102,7 @@ fn trim_collapses_only_ascii_spaces() {
 }
 
 #[test]
-fn countif_not_equal_matches_numeric_text() {
+fn countif_numeric_criteria_text_asymmetry() {
     let mut model = new_empty_model();
     model._set("A1", "5");
     model._set("A2", "=\"5\"");
@@ -111,7 +111,9 @@ fn countif_not_equal_matches_numeric_text() {
     model._set("B2", "=COUNTIF(A1:A3,5)");
     model.evaluate();
 
-    // numeric text "5" equals 5 for COUNTIF in Excel, in both branches
-    assert_eq!(model._get_text("B1"), *"1");
+    // Excel (verified via Excel-generated COUNTIF fixtures): "=5" matches
+    // the text "5", but "<>5" excludes only NUMBER cells equal to 5 — the
+    // text "5" still counts as "not equal". Asymmetric, but faithful.
+    assert_eq!(model._get_text("B1"), *"2");
     assert_eq!(model._get_text("B2"), *"2");
 }
