@@ -5,10 +5,15 @@ description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 default-run = "fastsheet"
-# Disable binary auto-discovery: every target is declared explicitly
-# below so a stray `src/bin/*.rs` debug script can never be compiled into
-# a release build / installer. The dev CLIs are gated behind `dev-bins`.
+# Disable target auto-discovery: every target is declared explicitly
+# below so a stray `src/bin/*.rs` / `examples/*.rs` debug script can
+# never be compiled into a release build / installer. The dev CLIs are
+# gated behind `dev-bins` AND live as examples — Tauri's bundler tries
+# to bundle every [[bin]] it finds in the manifest (ignoring
+# required-features, which broke the v0.3.1 NSIS build: "getting size
+# of probe.exe: file not found"), but it ignores examples.
 autobins = false
+autoexamples = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -17,26 +22,26 @@ autobins = false
 # ONLY with this feature, so `cargo build --release` and `tauri build`
 # leave them out of the installer + portable runtime — the GUI app
 # (fastsheet.exe) is the only binary that ships. Use them in dev with
-# e.g. `cargo run --release --features dev-bins --bin probe -- <file>`.
+# e.g. `cargo run --release --features dev-bins --example probe -- <file>`.
 dev-bins = []
 
 [[bin]]
 name = "fastsheet"
 path = "src/main.rs"
 
-[[bin]]
+[[example]]
 name = "probe"
-path = "src/bin/probe.rs"
+path = "examples/probe.rs"
 required-features = ["dev-bins"]
 
-[[bin]]
+[[example]]
 name = "save_probe"
-path = "src/bin/save_probe.rs"
+path = "examples/save_probe.rs"
 required-features = ["dev-bins"]
 
-[[bin]]
+[[example]]
 name = "trace_probe"
-path = "src/bin/trace_probe.rs"
+path = "examples/trace_probe.rs"
 required-features = ["dev-bins"]
 
 [lib]
