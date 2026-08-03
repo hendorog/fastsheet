@@ -32,6 +32,12 @@ When a file is open the title bar shows the filename. A `●` prefix
 means the workbook has unsaved changes. In manual recalculation mode,
 the status bar separately shows how many edits are waiting for F9.
 
+While a slow operation runs (opening a big workbook, saving,
+recalculating, a large `/Copy` or `/Move`), an animated `⏳ WAIT`
+indicator appears at the top-right — the Lotus mode-indicator spot —
+and the mouse pointer becomes an hourglass. It disappears when the
+operation finishes; operations quicker than ~150 ms never show it.
+
 ## The cursor and selection
 
 - **Arrows** — move one cell in any direction.

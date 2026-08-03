@@ -93,6 +93,13 @@
   let currentPath = $state("");
   let workbookDirty = $state(false);
   let bypassCloseConfirm = false;
+  /// Depth counter for long-running backend operations (open, save,
+  /// recalc, batch edits). While > 0 the topbar shows the Lotus-style
+  /// WAIT indicator and the pointer becomes an hourglass. A counter
+  /// (not a flag) so overlapping ops don't clear each other's state.
+  /// Call sites bump it before their try block and decrement in a
+  /// finally so an error can't leave the indicator stuck on.
+  let busyCount = $state(0);
 
   function noteRecalcPending(count: number) {
     if (!autoRecalc && count > 0) pendingRecalcEdits += count;
@@ -794,6 +801,7 @@
       focusGrid();
       return;
     }
+    busyCount++;
     try {
       workbook = await invoke<WorkbookInfo>("open_workbook", { path: p });
       activeSheet = 0;
@@ -819,6 +827,8 @@
       focusGrid();
     } catch (e) {
       statusMsg = `Open failed: ${e}`;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -855,6 +865,7 @@
     // The Rust save_workbook command dispatches on extension: .xls →
     // BIFF8 writer (xls_save.rs), .xlsx → preservation patcher or
     // IronCalc save_to_xlsx fallback.
+    busyCount++;
     try {
       const r = await invoke<SaveResult>("save_workbook", { path });
       currentPath = path;
@@ -862,6 +873,8 @@
       statusMsg = describeSave(r);
     } catch (e) {
       statusMsg = `Save failed: ${e}`;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -911,12 +924,15 @@
   }
 
   async function writeExtractWorkbook(path: string, rows: string[][], label: string) {
+    busyCount++;
     try {
       const r = await invoke<SaveResult>("extract_cells_to_workbook", { path, rows });
       const backup = r.backup_path ? ` · backup: ${r.backup_path}` : "";
       statusMsg = `Xtracted ${label} to ${r.path} · ${r.cells_patched} cell${r.cells_patched === 1 ? "" : "s"} written${backup}`;
     } catch (e) {
       statusMsg = `Xtract failed: ${e}`;
+    } finally {
+      busyCount--;
     }
     focusGrid();
   }
@@ -1129,6 +1145,7 @@
   }
 
   async function backupAndSave(path: string) {
+    busyCount++;
     try {
       const r = await invoke<BackupResult>("backup_and_save", { path });
       currentPath = path;
@@ -1136,6 +1153,8 @@
       statusMsg = `${describeSave(r.save)} · backup: ${r.backup_path}`;
     } catch (e) {
       statusMsg = `Backup failed: ${e}`;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -1466,6 +1485,7 @@
   async function recalcWorkbook() {
     if (!workbook) return;
     statusMsg = "Recalculating…";
+    busyCount++;
     try {
       const ms = await invoke<number>("recalc");
       await refreshViewport();
@@ -1473,6 +1493,8 @@
       statusMsg = `Recalc done in ${ms} ms`;
     } catch (e) {
       statusMsg = `Recalc failed: ${e}`;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -1546,6 +1568,7 @@
   }
 
   async function compareOpenWith(p: string) {
+    busyCount++;
     try {
       const r = await invoke<CompareResult>("compare_open", { path: p });
       compareResult = r;
@@ -1555,6 +1578,8 @@
     } catch (e) {
       statusMsg = `Compare failed: ${e}`;
       compareResult = null;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -2130,6 +2155,7 @@
   /// the user already chose manual mode (/W G R M) — they get to
   /// keep their batched-pending state instead of a forced recalc.
   async function withSuspendedRecalc<T>(fn: () => Promise<T>): Promise<T> {
+    busyCount++;
     const wasAuto = autoRecalc;
     if (wasAuto) {
       try { await invoke("set_auto_recalc", { enabled: false }); } catch {}
@@ -2143,6 +2169,7 @@
           await invoke("recalc");
         } catch {}
       }
+      busyCount--;
     }
   }
 
@@ -5044,7 +5071,7 @@
   });
 </script>
 
-<div class="app">
+<div class="app" class:busy={busyCount > 0}>
   {#if menuOpen}
     <div class="menubar" role="menu">
       <span class="menu-prompt">{breadcrumbText}&gt;</span>
@@ -5112,6 +5139,12 @@
       {:else}
         {selCell?.input ?? ""}
       {/if}
+    </span>
+    <!-- Lotus-style mode indicator: reserved slot so the formula bar
+         doesn't resize when WAIT appears; opacity animation delays the
+         reveal ~150ms so quick operations don't flash it. -->
+    <span class="wait-tag" class:active={busyCount > 0} aria-live="polite">
+      <span class="hourglass" aria-hidden="true">⏳</span>WAIT
     </span>
   </header>
 
@@ -5535,6 +5568,59 @@
     min-height: 1.3rem;
     overflow: hidden;
     white-space: nowrap;
+  }
+  /* Hourglass pointer everywhere while a long operation runs. The
+     :global(*) is needed because child-component elements (grid cells,
+     navigator rows) carry their own cursor styles. */
+  .app.busy,
+  .app.busy :global(*) {
+    cursor: wait;
+  }
+  .wait-tag {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: #b88a00;
+    color: #fff;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    padding: 0.1rem 0.5rem;
+    border-radius: 2px;
+    /* Slot is always laid out (visibility, not conditional render) so
+       the formula bar doesn't jump when WAIT toggles. */
+    visibility: hidden;
+  }
+  .wait-tag.active {
+    visibility: visible;
+    opacity: 0;
+    /* 0s-duration + 150ms delay = appear only if the op outlasts 150ms;
+       animation restarts on every activation because the class toggles. */
+    animation: wait-appear 0s step-end 0.15s forwards;
+  }
+  .hourglass {
+    display: inline-block;
+    font-size: 12px;
+  }
+  .wait-tag.active .hourglass {
+    animation: hourglass-flip 1.5s ease-in-out 0.15s infinite;
+  }
+  @keyframes wait-appear {
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes hourglass-flip {
+    0%,
+    30% {
+      transform: rotate(0deg);
+    }
+    50%,
+    80% {
+      transform: rotate(180deg);
+    }
+    100% {
+      transform: rotate(360deg);
+    }
   }
   .editor {
     width: 100%;
