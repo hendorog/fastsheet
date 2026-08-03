@@ -623,6 +623,38 @@ impl<'a> Model<'a> {
         CalcResult::Number(median)
     }
 
+    // MODE(number1, ...) — the most frequent numeric value. Ties go to
+    // the value whose count is reached first in scan order (Excel
+    // behaviour); no repeated value at all is #N/A. Also answers
+    // MODE.SNGL. Fastsheet addition — missing from upstream 0.7.1.
+    pub(crate) fn fn_mode(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if args.is_empty() {
+            return CalcResult::new_args_number_error(cell);
+        }
+        let mut values: Vec<f64> = Vec::new();
+        if let Err(e) = self.for_each_value(args, cell, |f| values.push(f)) {
+            return e;
+        }
+        let mut best: Option<(f64, usize)> = None;
+        for (i, &v) in values.iter().enumerate() {
+            if values[..i].iter().any(|&p| p == v) {
+                continue; // counted when first seen
+            }
+            let count = values.iter().filter(|&&x| x == v).count();
+            if best.map_or(true, |(_, c)| count > c) {
+                best = Some((v, count));
+            }
+        }
+        match best {
+            Some((v, c)) if c >= 2 => CalcResult::Number(v),
+            _ => CalcResult::Error {
+                error: Error::NA,
+                origin: cell,
+                message: "No mode (no repeated values)".to_string(),
+            },
+        }
+    }
+
     pub(crate) fn fn_harmean(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.is_empty() {
             return CalcResult::new_args_number_error(cell);

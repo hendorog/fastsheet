@@ -138,6 +138,10 @@ MATH = [
     ("=SUMIF(Data!E1:E8,\">4\")", 29, "num", ""),
     ("=SUMIFS(Data!B2:B6,Data!A2:A6,\"Banana\")", 20, "num", ""),
     ("=SUBTOTAL(9,Data!E1:E8)", 39, "num", ""),
+    ("=SUMPRODUCT(Data!B2:B6,Data!C2:C6)", 149.5, "num", ""),
+    ("=SUMPRODUCT(Data!E1:E8)", 39, "num", "single array just sums"),
+    ("=SUMPRODUCT(Data!A2:A6,Data!B2:B6)", 0, "num", "text elements count as 0"),
+    ("=SUMPRODUCT(Data!B2:B6,Data!C2:C5)", "#VALUE!", "err", "dimension mismatch"),
     ("=ROMAN(1990)", "MCMXC", "text", ""),
     ("=ARABIC(\"XIV\")", 14, "num", ""),
     ("=BASE(255,16)", "FF", "text", ""),
@@ -180,6 +184,28 @@ TEXT = [
     # expected is written as a formula producing the text "=1+1" — a plain
     # string starting with "=" would be stored as a formula by openpyxl.
     ("=FORMULATEXT(Data!J1)", '="="&"1+1"', "text", ""),
+    ("=PROPER(\"hello world\")", "Hello World", "text", ""),
+    ("=PROPER(\"2-cent's worth\")", "2-Cent'S Worth", "text", "any non-letter is a word break"),
+    ("=PROPER(Data!H3)", "Mixed Case", "text", ""),
+    ("=CODE(\"A\")", 65, "num", ""),
+    ("=CODE(\"€\")", 128, "num", "Win-1252 C1 range"),
+    ("=CHAR(CODE(\"a\"))", "a", "text", "round-trip"),
+    ("=CODE(\"\")", "#VALUE!", "err", "empty text"),
+    ("=REPLACE(\"abcdef\",2,3,\"XY\")", "aXYef", "text", ""),
+    ("=REPLACE(\"abc\",9,2,\"Z\")", "abcZ", "text", "start past end appends"),
+    ("=REPLACE(\"abc\",1,0,\"Z\")", "Zabc", "text", "zero chars inserts"),
+    ("=REPLACE(\"abc\",0,1,\"Z\")", "#VALUE!", "err", "start below 1"),
+    ("=FIXED(1234.567,1)", "1,234.6", "text", ""),
+    ("=FIXED(1234.567)", "1,234.57", "text", "default 2 decimals"),
+    ("=FIXED(-1234.567,1)", "-1,234.6", "text", ""),
+    ("=FIXED(1234.567,-2)", "1,200", "text", "negative decimals round left"),
+    ("=FIXED(1234.567,1,TRUE)", "1234.6", "text", "no_commas"),
+    ("=NUMBERVALUE(\"1.5\")", 1.5, "num", ""),
+    ("=NUMBERVALUE(\"2.5%\")", 0.025, "num", "trailing percent divides"),
+    ("=NUMBERVALUE(\"3,50\",\",\",\".\")", 3.5, "num", "custom separators"),
+    ("=NUMBERVALUE(\"1,234.5\")", 1234.5, "num", "group separators stripped"),
+    ("=NUMBERVALUE(\"\")", 0, "num", "empty text is zero"),
+    ("=NUMBERVALUE(\"abc\")", "#VALUE!", "err", ""),
 ]
 
 LOGICAL = [
@@ -236,6 +262,15 @@ LOOKUP = [
     ("=TYPE(TRUE)", 4, "num", ""),
     ("=N(TRUE)", 1, "num", ""),
     ("=N(\"a\")", 0, "num", ""),
+    ("=ADDRESS(1,1)", "$A$1", "text", ""),
+    ("=ADDRESS(2,3,2)", "C$2", "text", "row absolute"),
+    ("=ADDRESS(2,3,3)", "$C2", "text", "column absolute"),
+    ("=ADDRESS(2,3,4)", "C2", "text", "relative"),
+    ("=ADDRESS(2,3,1,FALSE)", "R2C3", "text", "R1C1 absolute"),
+    ("=ADDRESS(2,3,4,FALSE)", "R[2]C[3]", "text", "R1C1 relative"),
+    ("=ADDRESS(1,1,1,TRUE,\"Data\")", "Data!$A$1", "text", "sheet prefix"),
+    ("=ADDRESS(1,1,1,TRUE,\"My Sheet\")", "'My Sheet'!$A$1", "text", "quoted sheet"),
+    ("=ADDRESS(1,16385)", "#VALUE!", "err", "beyond last column"),
 ]
 
 DATES = [
@@ -293,6 +328,10 @@ STATS = [
     ("=DEVSQ(1,2,3)", 2, "num", ""),
     ("=MAXIFS(Data!B2:B6,Data!A2:A6,\"<>Banana\")", 15, "num", ""),
     ("=MINIFS(Data!B2:B6,Data!A2:A6,\"<>Banana\")", 5, "num", ""),
+    ("=MODE(1,2,2,3)", 2, "num", ""),
+    ("=MODE(3,3,2,2)", 3, "num", "tie goes to first seen"),
+    ("=MODE(1,2,3)", "#N/A", "err", "no repeats"),
+    ("=MODE(Data!E1:E8)", "#N/A", "err", "all distinct"),
 ]
 
 INFO = [
@@ -375,18 +414,16 @@ ERRORS = [
     ("=NOSUCHFUNCTION(1)", "#NAME?", "err", "unknown function"),
 ]
 
-# Cases that pass in Excel but are known IronCalc 0.7.1 gaps (missing
+# Cases that pass in Excel but are known IronCalc gaps (missing
 # functions). They live on their own sheet so the Summary separates
-# genuine regressions from documented gaps.
+# genuine regressions from documented gaps. SUMPRODUCT / ADDRESS /
+# PROPER / CODE / MODE / REPLACE / NUMBERVALUE / FIXED graduated to
+# their category sheets when fastsheet implemented them (2026-08-03).
 GAPS = [
-    ("=SUMPRODUCT(Data!B2:B6,Data!C2:C6)", 149.5, "num", "no SUMPRODUCT"),
-    ("=ADDRESS(1,1)", "$A$1", "text", "no ADDRESS"),
-    ("=PROPER(\"hello world\")", "Hello World", "text", "no PROPER"),
-    ("=CODE(\"A\")", 65, "num", "no CODE (UNICODE exists)"),
-    ("=MODE(1,2,2,3)", 2, "num", "no MODE"),
-    ("=REPLACE(\"abcdef\",2,3,\"XY\")", "aXYef", "text", "no REPLACE"),
-    ("=NUMBERVALUE(\"1.5\")", 1.5, "num", "no NUMBERVALUE"),
-    ("=FIXED(1234.567,1)", "1,234.6", "text", "no FIXED"),
+    ("=SUM(TRANSPOSE(Data!E1:E8))", 39, "num", "no native TRANSPOSE (MY* only)"),
+    ("=SUM(SEQUENCE(3))", 6, "num", "no SEQUENCE"),
+    ("=LET(x,2,x*3)", 6, "num", "no LET"),
+    ("=TEXTSPLIT(\"a,b\",\",\")", "a", "text", "no TEXTSPLIT (anchor cell)"),
 ]
 
 CATEGORIES = [

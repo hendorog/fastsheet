@@ -1017,6 +1017,17 @@ fn get_function_args_signature(kind: &Function, arg_count: usize) -> Vec<Signatu
         Function::MySortBlank => vec![Signature::Vector; arg_count],
         Function::MyTranspose => vec![Signature::Vector; arg_count],
         Function::MyFilter => vec![Signature::Vector; arg_count],
+        // fastsheet additions — missing-from-upstream Excel built-ins.
+        // SUMPRODUCT and MODE consume whole ranges; the rest take
+        // scalars (required count, optional count).
+        Function::Sumproduct => vec![Signature::Vector; arg_count],
+        Function::Mode => vec![Signature::Vector; arg_count],
+        Function::Address => args_signature_scalars(arg_count, 2, 3),
+        Function::Proper => args_signature_scalars(arg_count, 1, 0),
+        Function::Code => args_signature_scalars(arg_count, 1, 0),
+        Function::Replace => args_signature_scalars(arg_count, 4, 0),
+        Function::Numbervalue => args_signature_scalars(arg_count, 1, 2),
+        Function::Fixed => args_signature_scalars(arg_count, 1, 2),
     }
 }
 
@@ -1377,5 +1388,14 @@ fn static_analysis_on_function(kind: &Function, args: &[Node]) -> StaticResult {
         Function::MySortBlank => StaticResult::Scalar,
         Function::MyTranspose => StaticResult::Scalar,
         Function::MyFilter => StaticResult::Scalar,
+        // fastsheet additions — all return a single value.
+        Function::Sumproduct => StaticResult::Scalar,
+        Function::Address => StaticResult::Scalar,
+        Function::Proper => StaticResult::Scalar,
+        Function::Code => StaticResult::Scalar,
+        Function::Mode => StaticResult::Scalar,
+        Function::Replace => StaticResult::Scalar,
+        Function::Numbervalue => StaticResult::Scalar,
+        Function::Fixed => StaticResult::Scalar,
     }
 }

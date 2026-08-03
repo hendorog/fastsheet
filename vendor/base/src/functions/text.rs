@@ -12,6 +12,16 @@ use super::{
     util::from_wildcard_to_regex,
 };
 
+/// Win-1252 mapping for the C1 control range (0x80..=0x9F), shared by
+/// CHAR and CODE. Five codepoints in this range are undefined in
+/// Win-1252 — Excel's CHAR returns #VALUE! for them.
+const WIN1252_C1: [Option<char>; 32] = [
+    Some('€'), None,      Some('‚'), Some('ƒ'), Some('„'), Some('…'), Some('†'), Some('‡'),
+    Some('ˆ'), Some('‰'), Some('Š'), Some('‹'), Some('Œ'), None,      Some('Ž'), None,
+    None,      Some('\u{2018}'), Some('\u{2019}'), Some('\u{201C}'), Some('\u{201D}'), Some('•'), Some('–'), Some('—'),
+    Some('˜'), Some('™'), Some('š'), Some('›'), Some('œ'), None,      Some('ž'), Some('Ÿ'),
+];
+
 /// Finds the first instance of 'search_for' in text starting at char index start
 fn find(search_for: &str, text: &str, start: usize) -> Option<i32> {
     let ch = text.chars();
@@ -411,15 +421,6 @@ impl<'a> Model<'a> {
                 "CHAR: argument must be in 1..=255".to_string(),
             );
         }
-        // Win-1252 mapping for the C1 control range (0x80..=0x9F). Five
-        // codepoints in this range are undefined in Win-1252 — Excel returns
-        // #VALUE! for them.
-        const WIN1252_C1: [Option<char>; 32] = [
-            Some('€'), None,      Some('‚'), Some('ƒ'), Some('„'), Some('…'), Some('†'), Some('‡'),
-            Some('ˆ'), Some('‰'), Some('Š'), Some('‹'), Some('Œ'), None,      Some('Ž'), None,
-            None,      Some('\u{2018}'), Some('\u{2019}'), Some('\u{201C}'), Some('\u{201D}'), Some('•'), Some('–'), Some('—'),
-            Some('˜'), Some('™'), Some('š'), Some('›'), Some('œ'), None,      Some('ž'), Some('Ÿ'),
-        ];
         let ch = if (0x80..=0x9F).contains(&n) {
             match WIN1252_C1[(n - 0x80) as usize] {
                 Some(c) => c,
@@ -436,6 +437,252 @@ impl<'a> Model<'a> {
             char::from_u32(n as u32).unwrap_or('\u{FFFD}')
         };
         CalcResult::String(ch.to_string())
+    }
+
+    // CODE(text) — Win-1252 code of the first character (inverse of
+    // CHAR). Characters outside the ANSI codepage return 63 ('?'),
+    // matching Excel. Fastsheet addition — missing from upstream 0.7.1.
+    pub(crate) fn fn_code(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if args.len() != 1 {
+            return CalcResult::new_args_number_error(cell);
+        }
+        let s = match self.get_string(&args[0], cell) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let Some(c) = s.chars().next() else {
+            return CalcResult::new_error(Error::VALUE, cell, "CODE of empty text".to_string());
+        };
+        let cp = c as u32;
+        let code = if cp <= 0x7F || (0xA0..=0xFF).contains(&cp) {
+            cp
+        } else if let Some(pos) = WIN1252_C1.iter().position(|&e| e == Some(c)) {
+            0x80 + pos as u32
+        } else {
+            63
+        };
+        CalcResult::Number(code as f64)
+    }
+
+    // PROPER(text) — capitalize every letter that follows a non-letter,
+    // lowercase the rest. Excel counts ANY non-letter as a word break,
+    // so "2-cent's worth" → "2-Cent'S Worth". Fastsheet addition.
+    pub(crate) fn fn_proper(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if args.len() != 1 {
+            return CalcResult::new_args_number_error(cell);
+        }
+        let s = match self.get_string(&args[0], cell) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let mut out = String::with_capacity(s.len());
+        let mut prev_is_letter = false;
+        for c in s.chars() {
+            if c.is_alphabetic() {
+                if prev_is_letter {
+                    out.extend(c.to_lowercase());
+                } else {
+                    out.extend(c.to_uppercase());
+                }
+                prev_is_letter = true;
+            } else {
+                out.push(c);
+                prev_is_letter = false;
+            }
+        }
+        CalcResult::String(out)
+    }
+
+    // REPLACE(old_text, start_num, num_chars, new_text) — positional
+    // replacement by character index (1-based). start past the end
+    // appends; num_chars 0 inserts. Fastsheet addition.
+    pub(crate) fn fn_replace(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if args.len() != 4 {
+            return CalcResult::new_args_number_error(cell);
+        }
+        let old_text = match self.get_string(&args[0], cell) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let start = match self.get_number(&args[1], cell) {
+            Ok(f) => f.trunc() as i64,
+            Err(e) => return e,
+        };
+        let num_chars = match self.get_number(&args[2], cell) {
+            Ok(f) => f.trunc() as i64,
+            Err(e) => return e,
+        };
+        let new_text = match self.get_string(&args[3], cell) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        if start < 1 || num_chars < 0 {
+            return CalcResult::new_error(
+                Error::VALUE,
+                cell,
+                "REPLACE: start_num must be >= 1 and num_chars >= 0".to_string(),
+            );
+        }
+        let chars: Vec<char> = old_text.chars().collect();
+        let head = ((start - 1) as usize).min(chars.len());
+        let tail = head.saturating_add(num_chars as usize).min(chars.len());
+        let mut out: String = chars[..head].iter().collect();
+        out.push_str(&new_text);
+        out.extend(&chars[tail..]);
+        CalcResult::String(out)
+    }
+
+    // FIXED(number, [decimals = 2], [no_commas = FALSE]) — round to a
+    // fixed decimal count and format as text with thousands separators.
+    // Negative decimals round to the left of the decimal point.
+    // Fastsheet addition.
+    pub(crate) fn fn_fixed(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if args.is_empty() || args.len() > 3 {
+            return CalcResult::new_args_number_error(cell);
+        }
+        let number = match self.get_number(&args[0], cell) {
+            Ok(f) => f,
+            Err(e) => return e,
+        };
+        let decimals = if args.len() > 1 {
+            match self.get_number(&args[1], cell) {
+                Ok(f) => f.trunc() as i32,
+                Err(e) => return e,
+            }
+        } else {
+            2
+        };
+        let no_commas = if args.len() > 2 {
+            match self.get_boolean(&args[2], cell) {
+                Ok(b) => b,
+                Err(e) => return e,
+            }
+        } else {
+            false
+        };
+        if !(-127..=127).contains(&decimals) {
+            return CalcResult::new_error(
+                Error::VALUE,
+                cell,
+                "FIXED: decimals out of range".to_string(),
+            );
+        }
+        let pow = 10f64.powi(decimals);
+        let rounded = (number * pow).round() / pow;
+        let places = decimals.max(0) as usize;
+        let body = format!("{:.*}", places, rounded.abs());
+        let (int_part, frac_part) = match body.split_once('.') {
+            Some((i, f)) => (i.to_string(), Some(f.to_string())),
+            None => (body, None),
+        };
+        let int_grouped = if no_commas {
+            int_part
+        } else {
+            let digits: Vec<char> = int_part.chars().collect();
+            let mut grouped = String::new();
+            for (i, c) in digits.iter().enumerate() {
+                if i > 0 && (digits.len() - i) % 3 == 0 {
+                    grouped.push(',');
+                }
+                grouped.push(*c);
+            }
+            grouped
+        };
+        let sign = if rounded < 0.0 { "-" } else { "" };
+        let out = match frac_part {
+            Some(f) => format!("{sign}{int_grouped}.{f}"),
+            None => format!("{sign}{int_grouped}"),
+        };
+        CalcResult::String(out)
+    }
+
+    // NUMBERVALUE(text, [decimal_sep], [group_sep]) — locale-flexible
+    // text-to-number. Whitespace is ignored anywhere, group separators
+    // are only valid before the decimal separator, and trailing '%'
+    // signs each divide by 100. Empty text is 0. Fastsheet addition.
+    pub(crate) fn fn_numbervalue(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if args.is_empty() || args.len() > 3 {
+            return CalcResult::new_args_number_error(cell);
+        }
+        let text = match self.get_string(&args[0], cell) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let sep_arg = |m: &mut Self, idx: usize, default: char| -> Result<char, CalcResult> {
+            if args.len() > idx {
+                let s = match m.get_string(&args[idx], cell) {
+                    Ok(s) => s,
+                    Err(e) => return Err(e),
+                };
+                match s.chars().next() {
+                    Some(c) => Ok(c),
+                    None => Err(CalcResult::new_error(
+                        Error::VALUE,
+                        cell,
+                        "NUMBERVALUE: empty separator".to_string(),
+                    )),
+                }
+            } else {
+                Ok(default)
+            }
+        };
+        let dec = match sep_arg(self, 1, '.') {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        let group = match sep_arg(self, 2, ',') {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        if dec == group {
+            return CalcResult::new_error(
+                Error::VALUE,
+                cell,
+                "NUMBERVALUE: separators must differ".to_string(),
+            );
+        }
+        let mut t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if t.is_empty() {
+            return CalcResult::Number(0.0);
+        }
+        let mut percents = 0u32;
+        while t.ends_with('%') {
+            t.pop();
+            percents += 1;
+        }
+        if t.matches(dec).count() > 1 {
+            return CalcResult::new_error(
+                Error::VALUE,
+                cell,
+                "NUMBERVALUE: more than one decimal separator".to_string(),
+            );
+        }
+        let (int_raw, frac) = match t.split_once(dec) {
+            Some((i, f)) => (i, Some(f)),
+            None => (t.as_str(), None),
+        };
+        if let Some(f) = frac {
+            if f.contains(group) {
+                return CalcResult::new_error(
+                    Error::VALUE,
+                    cell,
+                    "NUMBERVALUE: group separator after decimal".to_string(),
+                );
+            }
+        }
+        let int_clean: String = int_raw.chars().filter(|&c| c != group).collect();
+        let candidate = match frac {
+            Some(f) => format!("{int_clean}.{f}"),
+            None => int_clean,
+        };
+        match candidate.parse::<f64>() {
+            Ok(v) => CalcResult::Number(v / 100f64.powi(percents as i32)),
+            Err(_) => CalcResult::new_error(
+                Error::VALUE,
+                cell,
+                format!("NUMBERVALUE: cannot parse '{text}'"),
+            ),
+        }
     }
 
     pub(crate) fn fn_unicode(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {

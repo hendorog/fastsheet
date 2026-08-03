@@ -731,6 +731,101 @@ impl<'a> Model<'a> {
         ))
     }
 
+    // ADDRESS(row, column, [abs_num = 1], [a1 = TRUE], [sheet_text])
+    // Builds an address string. abs_num: 1 = absolute, 2 = row
+    // absolute, 3 = column absolute, 4 = relative. a1 = FALSE gives
+    // R1C1 text (relative parts bracketed). Sheet names that aren't
+    // plain identifiers get quoted. Fastsheet addition — missing from
+    // upstream 0.7.1.
+    pub(crate) fn fn_address(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if !(2..=5).contains(&args.len()) {
+            return CalcResult::new_args_number_error(cell);
+        }
+        let row = match self.get_number(&args[0], cell) {
+            Ok(f) => f.trunc() as i64,
+            Err(e) => return e,
+        };
+        let column = match self.get_number(&args[1], cell) {
+            Ok(f) => f.trunc() as i64,
+            Err(e) => return e,
+        };
+        let abs_num = if args.len() > 2 {
+            match self.get_number(&args[2], cell) {
+                Ok(f) => f.trunc() as i64,
+                Err(e) => return e,
+            }
+        } else {
+            1
+        };
+        let a1 = if args.len() > 3 {
+            match self.get_boolean(&args[3], cell) {
+                Ok(b) => b,
+                Err(e) => return e,
+            }
+        } else {
+            true
+        };
+        let sheet_text = if args.len() > 4 {
+            match self.get_string(&args[4], cell) {
+                Ok(s) => Some(s),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
+        if row < 1
+            || row > LAST_ROW as i64
+            || column < 1
+            || column > LAST_COLUMN as i64
+            || !(1..=4).contains(&abs_num)
+        {
+            return CalcResult::new_error(
+                Error::VALUE,
+                cell,
+                "ADDRESS: argument out of range".to_string(),
+            );
+        }
+        let cell_part = if a1 {
+            let col_letters = match crate::expressions::utils::number_to_column(column as i32) {
+                Some(s) => s,
+                None => {
+                    return CalcResult::new_error(
+                        Error::VALUE,
+                        cell,
+                        "ADDRESS: invalid column".to_string(),
+                    )
+                }
+            };
+            match abs_num {
+                1 => format!("${col_letters}${row}"),
+                2 => format!("{col_letters}${row}"),
+                3 => format!("${col_letters}{row}"),
+                _ => format!("{col_letters}{row}"),
+            }
+        } else {
+            match abs_num {
+                1 => format!("R{row}C{column}"),
+                2 => format!("R{row}C[{column}]"),
+                3 => format!("R[{row}]C{column}"),
+                _ => format!("R[{row}]C[{column}]"),
+            }
+        };
+        let prefix = match sheet_text {
+            None => String::new(),
+            Some(name) => {
+                let plain = !name.is_empty()
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    && !name.chars().next().is_some_and(|c| c.is_ascii_digit());
+                if plain {
+                    format!("{name}!")
+                } else {
+                    format!("'{}'!", name.replace('\'', "''"))
+                }
+            }
+        };
+        CalcResult::String(format!("{prefix}{cell_part}"))
+    }
+
     // INDIRECT(ref_text, [a1])
     // Returns the reference specified by 'ref_text'
     pub(crate) fn fn_indirect(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
