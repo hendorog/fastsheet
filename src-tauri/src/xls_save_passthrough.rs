@@ -87,6 +87,10 @@ const OWNED_PER_SHEET: &[u16] = &[
     0x023E, // WINDOW2
     0x0041, // PANE
     0x001D, // SELECTION
+    // Merged ranges — the writer re-emits MERGECELLS from the model's
+    // merge list (populated on load, mutated by set_sheet_merges), so
+    // the source record would be stale after a /Move or /Range Merge.
+    0x00E5, // MERGECELLS
 ];
 
 // Globals records the writer owns. Anything else in the source

@@ -31,6 +31,7 @@ const R_BOUNDSHEET8: u16 = 0x0085;
 const R_DIMENSIONS: u16 = 0x0200;
 const R_WINDOW2: u16 = 0x023E;
 const R_PANE: u16 = 0x0041;
+const R_MERGECELLS: u16 = 0x00E5;
 const R_CONTINUE: u16 = 0x003C;
 const R_CODEPAGE: u16 = 0x0042;
 const R_DSF: u16 = 0x0161;
@@ -421,6 +422,61 @@ fn build_pane(frozen_rows: i32, frozen_columns: i32) -> Vec<u8> {
     body
 }
 
+/// Parse a plain A1 range like "C3:D3" (no sheet, no $) into 1-based
+/// (row1, col1, row2, col2). Merge-list entries are stored in exactly
+/// this shape by both load paths.
+fn parse_merge_range(range: &str) -> Option<(u16, u16, u16, u16)> {
+    fn parse_cell(s: &str) -> Option<(u16, u16)> {
+        let mut col: u32 = 0;
+        let mut row: u32 = 0;
+        let mut in_digits = false;
+        for c in s.trim().trim_start_matches('$').chars() {
+            if c == '$' {
+                continue;
+            }
+            if c.is_ascii_alphabetic() && !in_digits {
+                col = col * 26 + (c.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+            } else if c.is_ascii_digit() {
+                in_digits = true;
+                row = row * 10 + (c as u32 - '0' as u32);
+            } else {
+                return None;
+            }
+        }
+        if col == 0 || row == 0 || col > 0x4000 || row > 0x10000 {
+            return None;
+        }
+        Some((row as u16, col as u16))
+    }
+    let (a, b) = match range.split_once(':') {
+        Some((a, b)) => (a, b),
+        None => (range, range),
+    };
+    let (r1, c1) = parse_cell(a)?;
+    let (r2, c2) = parse_cell(b)?;
+    Some((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)))
+}
+
+/// MERGECELLS — [MS-XLS] 2.4.168. cmcs (u16) then REF8 per range:
+/// rwFirst / rwLast / colFirst / colLast, all u16 and 0-based. At most
+/// 1026 REF8s fit a record; callers chunk. Ranges that don't parse or
+/// exceed BIFF's 65 536 rows are skipped.
+fn build_mergecells(ranges: &[&str]) -> Vec<u8> {
+    let refs: Vec<(u16, u16, u16, u16)> = ranges
+        .iter()
+        .filter_map(|r| parse_merge_range(r))
+        .collect();
+    let mut body = Vec::with_capacity(2 + refs.len() * 8);
+    body.put_u16(refs.len() as u16);
+    for (r1, c1, r2, c2) in refs {
+        body.put_u16(r1 - 1);
+        body.put_u16(r2 - 1);
+        body.put_u16(c1 - 1);
+        body.put_u16(c2 - 1);
+    }
+    body
+}
+
 /// BOUNDSHEET8 — [MS-XLS] 2.4.28. lbPlyPos (u32, file-offset of the
 /// sheet's BOF — patched in after the substream is emitted), grbit (u16,
 /// hidden/very-hidden flags), then a ShortXLUnicodeString of the name.
@@ -806,29 +862,12 @@ fn build_font_placeholder() -> Vec<u8> {
     body
 }
 
-/// IronCalc's DEFAULT_NUM_FMTS table — replicated here so we can
-/// resolve format-codes for num_fmt_ids that IronCalc treats as
-/// implicit built-ins (and therefore aren't pushed to
-/// `model.styles.num_fmts`). The upstream constant in
-/// `vendor/base/src/number_format.rs` is private. Format strings
-/// are copied verbatim — they intentionally differ from BIFF8's
-/// built-in table (e.g. IronCalc index 28 = "mm:ss" vs BIFF 28).
-const IRONCALC_DEFAULT_NUM_FMTS: &[&str] = &[
-    "general", "0", "0.00", "#,##0", "#,##0.00",
-    "$#,##0; \\ - $#,##0", "$#,##0; [Red] \\ - $#,##0",
-    "$#,##0.00; \\ - $#,##0.00", "$#,##0.00; [Red] \\ - $#,##0.00",
-    "0%", "0.00%", "0.00E + 00", "#?/?", "#?? / ??",
-    "mm-dd-yy", "d-mmm-yy", "d-mmm", "mmm-yy",
-    "h:mm AM / PM", "h:mm:ss AM / PM", "h:mm", "h:mm:ss",
-    "m / d / yy h:mm", "#,##0;()#,##0)", "#,##0; [Red]()#,##0)",
-    "#,##0.00;()#,##0.00)", "#,##0.00; [Red]()#,##0.00)",
-    "_()$\u{201D}*#,##0.00 _); _()$\u{201D}* \\()#,##0.00\\); _()$\u{201D}* - ?? _); _()@_)",
-    "mm:ss", "[h]:mm:ss", "mmss .0", "##0.0E + 0", "@",
-    "[$ -404] e / m / d ", "m / d / yy", "[$ -404] e / m / d",
-    "[$ -404] e / / d", "[$ -404] e / m / d",
-    "t0", "t0.00", "t#,##0", "t#,##0.00", "t0%",
-    "t0.00 %", "t#?/?",
-];
+/// IronCalc's built-in number-format table, shared from the vendored
+/// crate (made `pub` by the fastsheet patch that also fixed its
+/// mangled entries) so id resolution here can never drift from what
+/// the model itself resolves.
+const IRONCALC_DEFAULT_NUM_FMTS: &[&str] =
+    ironcalc::base::number_format::DEFAULT_NUM_FMTS;
 
 /// Look up the format-code string for an IronCalc num_fmt_id. Mirrors
 /// `ironcalc::base::number_format::get_num_fmt`: registered entries in
@@ -916,6 +955,7 @@ fn fill_pattern_to_biff(pattern: &str) -> u16 {
 }
 
 /// Build a BIFF XF record body (20 bytes) from the resolved attributes.
+#[allow(clippy::too_many_arguments)]
 fn build_xf_record(
     ifnt: u16,
     ifmt: u16,
@@ -928,6 +968,7 @@ fn build_xf_record(
     border_right: u8,
     border_top: u8,
     border_bottom: u8,
+    border_icvs: (u16, u16, u16, u16),
     fill_pattern: u16,
     fill_fg_icv: u16,
     fill_bg_icv: u16,
@@ -958,10 +999,13 @@ fn build_xf_record(
         | ((border_top as u16 & 0x0F) << 8)
         | ((border_bottom as u16 & 0x0F) << 12);
     body.put_u16(border_styles_u16);
-    body.put_u16(0); // border colors: icvLeft + icvRight (skipped for now)
+    let (icv_left, icv_right, icv_top, icv_bottom) = border_icvs;
+    body.put_u16((icv_left & 0x7F) | ((icv_right & 0x7F) << 7));
     // u32 at offset 14: icvTop bits 0-6, icvBottom 7-13, icvDiag 14-20,
     // dgDiag 21-24, fHasXFExt 25, fls (fill pattern) 26-31.
-    let fill_pattern_bits = ((fill_pattern as u32) & 0x3F) << 26;
+    let fill_pattern_bits = ((fill_pattern as u32) & 0x3F) << 26
+        | (icv_top as u32 & 0x7F)
+        | ((icv_bottom as u32 & 0x7F) << 7);
     body.put_u32(fill_pattern_bits);
     // u16 at offset 18: icvFore + icvBack.
     let pattern_colors = (fill_fg_icv & 0x7F) | ((fill_bg_icv & 0x7F) << 7);
@@ -1070,10 +1114,10 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
     // cell XF per model cell_xf at indices 16+.
     let mut xfs: Vec<Vec<u8>> = Vec::with_capacity(15 + 1 + styles.cell_xfs.len());
     for _ in 0..15 {
-        xfs.push(build_xf_record(0, 0, true, 0xFFF, 0, 2, false, 0, 0, 0, 0, 0, 0, 0));
+        xfs.push(build_xf_record(0, 0, true, 0xFFF, 0, 2, false, 0, 0, 0, 0, (0, 0, 0, 0), 0, 0, 0));
     }
     let default_cell_xf_idx = 15u16;
-    xfs.push(build_xf_record(0, 0, false, 0, 0, 2, false, 0, 0, 0, 0, 0, 0, 0));
+    xfs.push(build_xf_record(0, 0, false, 0, 0, 2, false, 0, 0, 0, 0, (0, 0, 0, 0), 0, 0, 0));
 
     let mut cell_xf_index: Vec<u16> = Vec::with_capacity(styles.cell_xfs.len());
     for cxf in &styles.cell_xfs {
@@ -1096,16 +1140,28 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
             } else { (0, 0, 0) }
         } else { (0, 0, 0) };
 
-        // Resolve borders.
-        let (bl, br, bt, bb) = if cxf.border_id >= 0 {
+        // Resolve borders — style code + color icv per edge. Explicit
+        // colors go through the palette; edges without one use icv 64
+        // ("auto", renders black).
+        let (bl, br, bt, bb, icv_l, icv_r, icv_t, icv_b) = if cxf.border_id >= 0 {
             if let Some(bd) = styles.borders.get(cxf.border_id as usize) {
-                let l = bd.left.as_ref().map(|b| border_style_to_biff(&b.style)).unwrap_or(0);
-                let r = bd.right.as_ref().map(|b| border_style_to_biff(&b.style)).unwrap_or(0);
-                let t = bd.top.as_ref().map(|b| border_style_to_biff(&b.style)).unwrap_or(0);
-                let bot = bd.bottom.as_ref().map(|b| border_style_to_biff(&b.style)).unwrap_or(0);
-                (l, r, t, bot)
-            } else { (0, 0, 0, 0) }
-        } else { (0, 0, 0, 0) };
+                let mut edge = |item: &Option<ironcalc::base::types::BorderItem>| match item {
+                    Some(b) => (
+                        border_style_to_biff(&b.style),
+                        match b.color.as_deref() {
+                            Some(hex) => palette_assign(&mut palette, Some(hex)),
+                            None => 64,
+                        },
+                    ),
+                    None => (0u8, 0u16),
+                };
+                let (l, il) = edge(&bd.left);
+                let (r, ir) = edge(&bd.right);
+                let (t, it) = edge(&bd.top);
+                let (bot, ib) = edge(&bd.bottom);
+                (l, r, t, bot, il, ir, it, ib)
+            } else { (0, 0, 0, 0, 0, 0, 0, 0) }
+        } else { (0, 0, 0, 0, 0, 0, 0, 0) };
 
         // Resolve alignment.
         let (h_align, v_align, wrap) = if let Some(al) = &cxf.alignment {
@@ -1124,6 +1180,7 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
             ifnt, ifmt, false, default_cell_xf_idx,
             h_align, v_align, wrap,
             bl, br, bt, bb,
+            (icv_l, icv_r, icv_t, icv_b),
             fill_pattern, fill_fg_icv, fill_bg_icv,
         ));
         cell_xf_index.push((xfs.len() - 1) as u16);
@@ -2996,11 +3053,19 @@ fn build_workbook_stream(
 
         emit_sheet_cells(&mut w, ws, i as u32, &sst_table, &sst_idx, parsed, &xti, &defined_names, &extern_names, &style_tables, preserved_rgce);
 
-        // post_cells_pre_win2 zone: MERGECELLS, CONDFMT/CF, HLINK,
-        // DVAL/DV, PHONETICINFO, FEAT, etc. — these land between
-        // the cell table and WINDOW2 per spec.
+        // post_cells_pre_win2 zone: CONDFMT/CF, HLINK, DVAL/DV,
+        // PHONETICINFO, FEAT, etc. — these land between the cell
+        // table and WINDOW2 per spec. MERGECELLS is filtered out of
+        // the passthrough (writer-owned) and re-emitted from the
+        // model's merge list below so merge edits survive a save.
         for rec in &zones.post_cells_pre_win2 {
             w.write_record(rec.opcode, &rec.data);
+        }
+        if !ws.merge_cells.is_empty() {
+            let ranges: Vec<&str> = ws.merge_cells.iter().map(|s| s.as_str()).collect();
+            for chunk in ranges.chunks(1026) {
+                w.write_record(R_MERGECELLS, &build_mergecells(chunk));
+            }
         }
 
         w.write_record(R_WINDOW2, &build_window2(ws.frozen_rows, ws.frozen_columns));

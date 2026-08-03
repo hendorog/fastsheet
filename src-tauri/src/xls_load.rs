@@ -693,6 +693,10 @@ pub fn load_xls(
             border_right: xf.border_right,
             border_top: xf.border_top,
             border_bottom: xf.border_bottom,
+            icv_left: xf.border_icv_left,
+            icv_right: xf.border_icv_right,
+            icv_top: xf.border_icv_top,
+            icv_bottom: xf.border_icv_bottom,
         };
         let effective_align = ResolvedAlign {
             h_align: xf.h_align,
@@ -781,23 +785,55 @@ pub fn load_xls(
                 style.alignment = Some(a);
             }
         }
-        // Borders — only flag presence; xlsx path renders any
-        // Some(BorderItem) as a thin black border.
-        let border_item = || BorderItem {
-            style: BorderStyle::Thin,
-            color: Some("#000000".to_string()),
+        // Borders — map the BIFF dg* style code back to the IronCalc
+        // BorderStyle (inverse of xls_save::border_style_to_biff) and
+        // the edge's icv to a palette color. Codes with no BorderStyle
+        // variant (3 dashed, 7 hair, 9 dashDot, 11 dashDotDot) fall
+        // back to Thin, matching the xlsx reader's fallback; icv 64
+        // ("auto") and anything outside the palette render black.
+        let border_item = |code: u16, icv: u16| BorderItem {
+            style: match code {
+                2 => BorderStyle::Medium,
+                4 => BorderStyle::Dotted,
+                5 => BorderStyle::Thick,
+                6 => BorderStyle::Double,
+                8 => BorderStyle::MediumDashed,
+                10 => BorderStyle::MediumDashDot,
+                12 => BorderStyle::MediumDashDotDot,
+                13 => BorderStyle::SlantDashDot,
+                _ => BorderStyle::Thin,
+            },
+            color: Some(
+                shape
+                    .palette
+                    .get(&icv)
+                    .cloned()
+                    .unwrap_or_else(|| "#000000".to_string()),
+            ),
         };
         if effective_border.border_left != 0 && style.border.left.is_none() {
-            style.border.left = Some(border_item());
+            style.border.left = Some(border_item(
+                effective_border.border_left as u16,
+                effective_border.icv_left,
+            ));
         }
         if effective_border.border_right != 0 && style.border.right.is_none() {
-            style.border.right = Some(border_item());
+            style.border.right = Some(border_item(
+                effective_border.border_right as u16,
+                effective_border.icv_right,
+            ));
         }
         if effective_border.border_top != 0 && style.border.top.is_none() {
-            style.border.top = Some(border_item());
+            style.border.top = Some(border_item(
+                effective_border.border_top as u16,
+                effective_border.icv_top,
+            ));
         }
         if effective_border.border_bottom != 0 && style.border.bottom.is_none() {
-            style.border.bottom = Some(border_item());
+            style.border.bottom = Some(border_item(
+                effective_border.border_bottom as u16,
+                effective_border.icv_bottom,
+            ));
         }
         // Numfmt — folded into the same Style write so the cached index
         // captures both styling and number format.
@@ -990,7 +1026,16 @@ fn resolve_xf_fill(
 }
 
 #[derive(Default, Clone, Copy)]
-struct ResolvedBorder { border_left: u8, border_right: u8, border_top: u8, border_bottom: u8 }
+struct ResolvedBorder {
+    border_left: u8,
+    border_right: u8,
+    border_top: u8,
+    border_bottom: u8,
+    icv_left: u16,
+    icv_right: u16,
+    icv_top: u16,
+    icv_bottom: u16,
+}
 
 #[allow(dead_code)]
 fn resolve_xf_border(
@@ -1009,6 +1054,10 @@ fn resolve_xf_border(
                 border_right: xf.border_right,
                 border_top: xf.border_top,
                 border_bottom: xf.border_bottom,
+                icv_left: xf.border_icv_left,
+                icv_right: xf.border_icv_right,
+                icv_top: xf.border_icv_top,
+                icv_bottom: xf.border_icv_bottom,
             };
         }
         if xf.ixf_parent == cur { break; }
@@ -1020,6 +1069,10 @@ fn resolve_xf_border(
             border_right: xf.border_right,
             border_top: xf.border_top,
             border_bottom: xf.border_bottom,
+            icv_left: xf.border_icv_left,
+            icv_right: xf.border_icv_right,
+            icv_top: xf.border_icv_top,
+            icv_bottom: xf.border_icv_bottom,
         })
         .unwrap_or_default()
 }

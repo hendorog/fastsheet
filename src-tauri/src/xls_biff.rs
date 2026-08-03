@@ -246,6 +246,11 @@ pub struct XfEntry {
     pub border_right: u8,
     pub border_top: u8,
     pub border_bottom: u8,
+    /// Border color palette indices per edge (icv; 64 = auto/black).
+    pub border_icv_left: u16,
+    pub border_icv_right: u16,
+    pub border_icv_top: u16,
+    pub border_icv_bottom: u16,
 }
 
 // BIFF record types we care about.
@@ -494,13 +499,20 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                 let cell_options = u16::from_le_bytes([data[4], data[5]]);
                 let is_style = (cell_options & 0x0004) != 0;
                 let ixf_parent = (cell_options >> 4) & 0x0FFF;
+                // fAtr* live at bits 2-7 of byte 9 per [MS-XLS] 2.4.353
+                // (bits 0-1 are reserved). These masks were shifted two
+                // bits low for a long time, which read the reserved bits
+                // as fAtrNum/fAtrFnt — so atr_fnt never registered and
+                // font resolution always walked to the parent style XF,
+                // dropping name/size that a cell XF legitimately owned
+                // (found by the style gauntlet's xls round-trip).
                 let atr = data[9];
-                let atr_num = (atr & 0x01) != 0;
-                let atr_fnt = (atr & 0x02) != 0;
-                let atr_alc = (atr & 0x04) != 0;
-                let atr_bdr = (atr & 0x08) != 0;
-                let atr_pat = (atr & 0x10) != 0;
-                let atr_prot = (atr & 0x20) != 0;
+                let atr_num = (atr & 0x04) != 0;
+                let atr_fnt = (atr & 0x08) != 0;
+                let atr_alc = (atr & 0x10) != 0;
+                let atr_bdr = (atr & 0x20) != 0;
+                let atr_pat = (atr & 0x40) != 0;
+                let atr_prot = (atr & 0x80) != 0;
                 // alignment byte 6: bits 0-2 h-align, bit 3 wrap,
                 // bits 4-6 v-align, bit 7 justLast
                 let align = data[6];
@@ -513,6 +525,15 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                 let border_right = ((border_styles >> 4) & 0x000F) as u8;
                 let border_top = ((border_styles >> 8) & 0x000F) as u8;
                 let border_bottom = ((border_styles >> 12) & 0x000F) as u8;
+                // bytes 12-13 (u16): icvLeft bits 0-6, icvRight 7-13.
+                let border_colors = u16::from_le_bytes([data[12], data[13]]);
+                let border_icv_left = border_colors & 0x007F;
+                let border_icv_right = (border_colors >> 7) & 0x007F;
+                // icvTop / icvBottom live in bits 0-6 / 7-13 of the u32
+                // at offset 14 (the same u32 whose top bits carry fls).
+                let tb = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
+                let border_icv_top = (tb & 0x7F) as u16;
+                let border_icv_bottom = ((tb >> 7) & 0x7F) as u16;
                 // Fill encoding (cross-referenced against Apache POI's
                 // HSSF ExtendedFormatRecord):
                 //   bytes 14..18 (u32):
@@ -551,6 +572,10 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                     border_right,
                     border_top,
                     border_bottom,
+                    border_icv_left,
+                    border_icv_right,
+                    border_icv_top,
+                    border_icv_bottom,
                 });
             }
             R_FONT if data.len() >= 16 => {
