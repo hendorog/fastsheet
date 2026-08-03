@@ -19,16 +19,22 @@ fn get_border(node: Node, name: &str) -> Result<Option<BorderItem>, XlsxError> {
         .collect::<Vec<Node>>();
     if border_nodes.len() == 1 {
         let border = border_nodes[0];
+        // OOXML style tokens are camelCase ("mediumDashed"); the
+        // upstream match used lowercase for the multi-word tokens (so
+        // they never matched) and omitted "dotted" entirely — both
+        // collapsed to Thin. Fastsheet vendor patch. Tokens with no
+        // BorderStyle variant (dashed, hair, dashDot, dashDotDot)
+        // still fall back to Thin.
         style = match border.attribute("style") {
             Some("thin") => BorderStyle::Thin,
             Some("medium") => BorderStyle::Medium,
             Some("thick") => BorderStyle::Thick,
             Some("double") => BorderStyle::Double,
-            Some("slantdashdot") => BorderStyle::SlantDashDot,
-            Some("mediumdashed") => BorderStyle::MediumDashed,
-            Some("mediumdashdot") => BorderStyle::MediumDashDot,
-            Some("mediumdashdotdot") => BorderStyle::MediumDashDotDot,
-            // TODO: Should we fail in this case or set the border to None?
+            Some("dotted") => BorderStyle::Dotted,
+            Some("slantDashDot") => BorderStyle::SlantDashDot,
+            Some("mediumDashed") => BorderStyle::MediumDashed,
+            Some("mediumDashDot") => BorderStyle::MediumDashDot,
+            Some("mediumDashDotDot") => BorderStyle::MediumDashDotDot,
             Some(_) => BorderStyle::Thin,
             None => {
                 return Ok(None);
