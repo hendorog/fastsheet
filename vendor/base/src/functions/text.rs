@@ -343,7 +343,16 @@ impl<'a> Model<'a> {
                     }
                 }
             };
-            return CalcResult::String(s.trim().to_owned());
+            // Excel TRIM collapses interior runs of spaces (0x20 only) to a
+            // single space as well as stripping the ends; other whitespace
+            // (tabs, NBSP) passes through untouched. Fastsheet vendor patch —
+            // upstream only stripped the ends.
+            let collapsed = s
+                .split(' ')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            return CalcResult::String(collapsed);
         }
         CalcResult::new_args_number_error(cell)
     }
@@ -1111,7 +1120,14 @@ impl<'a> Model<'a> {
                                 CalcResult::Number(value) => {
                                     values.push(format!("{value}"));
                                 }
-                                CalcResult::String(value) => values.push(value),
+                                CalcResult::String(value) => {
+                                    // ignore_empty skips empty TEXT too, not
+                                    // just empty cells (Excel semantics;
+                                    // fastsheet vendor patch).
+                                    if !(ignore_empty && value.is_empty()) {
+                                        values.push(value)
+                                    }
+                                }
                                 CalcResult::Boolean(value) => {
                                     if value {
                                         values.push("TRUE".to_string())
@@ -1138,7 +1154,13 @@ impl<'a> Model<'a> {
                     }
                 }
                 error @ CalcResult::Error { .. } => return error,
-                CalcResult::String(value) => values.push(value),
+                CalcResult::String(value) => {
+                    // ignore_empty skips empty TEXT arguments too (Excel
+                    // semantics; fastsheet vendor patch).
+                    if !(ignore_empty && value.is_empty()) {
+                        values.push(value)
+                    }
+                }
                 CalcResult::Boolean(value) => {
                     if value {
                         values.push("TRUE".to_string())

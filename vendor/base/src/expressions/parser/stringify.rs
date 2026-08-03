@@ -558,46 +558,57 @@ fn stringify(
                 language
             )
         ),
+        // A comparison operand of `&` binds looser than `&`, so it needs
+        // parentheses on either side or the re-parse changes the tree.
+        // (Fastsheet vendor patch.)
         OpConcatenateKind { left, right } => format!(
             "{}&{}",
-            stringify(
-                left,
-                context,
-                displace_data,
-                export_to_excel,
-                locale,
-                language
-            ),
-            stringify(
-                right,
-                context,
-                displace_data,
-                export_to_excel,
-                locale,
-                language
-            )
+            if matches!(**left, CompareKind { .. }) {
+                format!(
+                    "({})",
+                    stringify(
+                        left,
+                        context,
+                        displace_data,
+                        export_to_excel,
+                        locale,
+                        language
+                    )
+                )
+            } else {
+                stringify(
+                    left,
+                    context,
+                    displace_data,
+                    export_to_excel,
+                    locale,
+                    language,
+                )
+            },
+            if matches!(**right, CompareKind { .. }) {
+                format!(
+                    "({})",
+                    stringify(
+                        right,
+                        context,
+                        displace_data,
+                        export_to_excel,
+                        locale,
+                        language
+                    )
+                )
+            } else {
+                stringify(
+                    right,
+                    context,
+                    displace_data,
+                    export_to_excel,
+                    locale,
+                    language,
+                )
+            }
         ),
-        CompareKind { kind, left, right } => format!(
-            "{}{}{}",
-            stringify(
-                left,
-                context,
-                displace_data,
-                export_to_excel,
-                locale,
-                language
-            ),
-            kind,
-            stringify(
-                right,
-                context,
-                displace_data,
-                export_to_excel,
-                locale,
-                language
-            )
-        ),
-        OpSumKind { kind, left, right } => {
+        CompareKind { kind, left, right } => {
             let left_str = stringify(
                 left,
                 context,
@@ -606,6 +617,63 @@ fn stringify(
                 locale,
                 language,
             );
+            // Comparisons are left-associative, so a nested comparison on
+            // the RIGHT needs parentheses: `(1=1)=(2=2)` would otherwise
+            // re-stringify as `1=1=2=2`, which re-parses as `((1=1)=2)=2`
+            // — a different tree with a different value. Formulas are
+            // normalised through this stringifier on load, so a missing
+            // paren silently changes results. (Fastsheet vendor patch.)
+            let right_str = if matches!(**right, CompareKind { .. }) {
+                format!(
+                    "({})",
+                    stringify(
+                        right,
+                        context,
+                        displace_data,
+                        export_to_excel,
+                        locale,
+                        language
+                    )
+                )
+            } else {
+                stringify(
+                    right,
+                    context,
+                    displace_data,
+                    export_to_excel,
+                    locale,
+                    language,
+                )
+            };
+            format!("{left_str}{kind}{right_str}")
+        }
+        OpSumKind { kind, left, right } => {
+            // A comparison on the LEFT binds looser than +/- , so it needs
+            // parentheses: `(1=1)+(2=2)` would otherwise re-stringify as
+            // `1=1+(2=2)` and re-parse as `1=(1+(2=2))`. (Fastsheet
+            // vendor patch — the right side already handled this.)
+            let left_str = if matches!(**left, CompareKind { .. }) {
+                format!(
+                    "({})",
+                    stringify(
+                        left,
+                        context,
+                        displace_data,
+                        export_to_excel,
+                        locale,
+                        language
+                    )
+                )
+            } else {
+                stringify(
+                    left,
+                    context,
+                    displace_data,
+                    export_to_excel,
+                    locale,
+                    language,
+                )
+            };
             // if kind is minus then we need parentheses in the right side if they are OpSumKind or CompareKind
             let right_str = if (matches!(kind, OpSum::Minus) && matches!(**right, OpSumKind { .. }))
                 | matches!(**right, CompareKind { .. })

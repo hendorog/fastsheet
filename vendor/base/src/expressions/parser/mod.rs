@@ -439,11 +439,11 @@ impl<'a> Parser<'a> {
 
     fn parse_power(&mut self) -> Node {
         let mut next_token = self.lexer.peek_token();
-        let mut sign = 1;
+        let mut minus_count: u32 = 0;
         while let TokenType::Addition(op) = next_token {
             self.lexer.advance_token();
             if op == token::OpSum::Minus {
-                sign = -sign;
+                minus_count += 1;
             }
             next_token = self.lexer.peek_token();
         }
@@ -452,7 +452,20 @@ impl<'a> Parser<'a> {
         if let Node::ParseErrorKind { .. } = t {
             return t;
         }
-        if sign == -1 {
+        // An even run of unary minuses must NOT simply cancel out:
+        // `--x` is Excel's idiomatic coerce-to-number (0-(0-x)), so a
+        // text or boolean operand still has to pass through negation
+        // twice. Numeric literals keep the old cancellation. Two wraps
+        // are enough for any even count (further pairs are identity).
+        // (Fastsheet vendor patch — upstream folded the run to a sign.)
+        let wraps = match (minus_count % 2, minus_count, &t) {
+            (_, 0, _) => 0,
+            (0, _, Node::NumberKind(_)) => 0,
+            (0, _, _) => 2,
+            (1, _, _) => 1,
+            _ => unreachable!(),
+        };
+        for _ in 0..wraps {
             t = Node::UnaryKind {
                 kind: token::OpUnary::Minus,
                 right: Box::new(t),
