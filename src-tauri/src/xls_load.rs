@@ -593,14 +593,18 @@ pub fn load_xls(
     // Numfmt application is folded into the same pass — the previous
     // separate loop was paying the same get/set cost a second time.
     //
-    // IronCalc's formatter rejects some BIFF format strings (conditional
-    // `[Red]`, locale prefixes, custom text literals) and turns the cell
-    // into `#ERROR!`. Heuristic-gate to "safe" strings: digit-grouping,
-    // decimals, percent, currency, and date tokens. Force-apply
-    // everything via FASTSHEET_XLS_APPLY_NUMFMT=all for diagnostics.
-    let force_all_numfmt = std::env::var("FASTSHEET_XLS_APPLY_NUMFMT")
-        .map(|v| v == "all")
-        .unwrap_or(false);
+    // IronCalc's formatter rejects a subset of valid BIFF format strings
+    // (locale-prefixed dates like `[$-409]d-mmm-yy`, currency codes like
+    // `[$USD-409]`, `mm:ss.0`) and would render such cells as `#VALUE!`.
+    // Instead of guessing by character class, trial-render each unique
+    // format string through the formatter once (numfmt_renders_cleanly)
+    // and apply it only when the formatter accepts it. Escape hatches:
+    // FASTSHEET_XLS_APPLY_NUMFMT=all force-applies everything
+    // (diagnostics), =off disables numfmt application entirely.
+    let numfmt_mode = std::env::var("FASTSHEET_XLS_APPLY_NUMFMT").unwrap_or_default();
+    let force_all_numfmt = numfmt_mode == "all";
+    let numfmt_off = numfmt_mode == "off";
+    let mut numfmt_ok_cache: HashMap<u16, bool> = HashMap::new();
     let mut style_cache: HashMap<u16, i32> = HashMap::new();
     for (&(sheet, row, col), &ixfe) in &shape.cell_xfs {
         let xf = match shape.xfs.get(ixfe as usize) {
@@ -609,12 +613,21 @@ pub fn load_xls(
         };
 
         // Resolve the numfmt to apply for this XF, if any.
-        let numfmt_override: Option<&str> = shape
-            .formats
-            .get(&xf.fmt_idx)
-            .map(|s| s.as_str())
-            .filter(|s| !s.is_empty() && *s != "General")
-            .filter(|s| force_all_numfmt || is_safe_numfmt(s));
+        let numfmt_override: Option<&str> = if numfmt_off {
+            None
+        } else {
+            shape
+                .formats
+                .get(&xf.fmt_idx)
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty() && *s != "General")
+                .filter(|s| {
+                    force_all_numfmt
+                        || *numfmt_ok_cache
+                            .entry(xf.fmt_idx)
+                            .or_insert_with(|| numfmt_renders_cleanly(s))
+                })
+        };
 
         // Fast path: cell hasn't been styled yet, and we already built
         // the merged Style for this ixfe. Just write the cached index.
@@ -1667,33 +1680,34 @@ fn quote_sheet_refs(formula: &str, names: &[String]) -> String {
     result
 }
 
-/// Conservative filter for number-format strings we're willing to apply
-/// by default. IronCalc's formatter blows up on a subset of valid BIFF
-/// formats (conditional sections, bracketed color/locale, text-literal
-/// patterns). These heuristic-exclude the patterns that tripped probe.
-/// Anything not matching here can still be force-applied by setting
-/// `FASTSHEET_XLS_APPLY_NUMFMT=all`.
-fn is_safe_numfmt(s: &str) -> bool {
-    // Reject bracketed sections ([Red], [>0], [$-409], [h], etc.) —
-    // these are the common source of parse errors.
-    if s.contains('[') {
+/// Trial-render `fmt` through IronCalc's formatter over a spread of
+/// sample values; the format qualifies for default application only if
+/// every render succeeds. "Invalid date value" errors are tolerated —
+/// they mean the sample landed outside the format's value domain (a
+/// negative serial against `m/d/yyyy`), not that the format is
+/// unsupported; real date cells carry valid serials, and Excel itself
+/// shows `#####` for negative dates. The error strings matched here are
+/// defined in the VENDORED formatter (vendor/base/src/formatter/
+/// format.rs), so the coupling can't drift under an upstream upgrade
+/// without the unit tests below catching it.
+fn numfmt_renders_cleanly(fmt: &str) -> bool {
+    use ironcalc::base::formatter::format::format_number;
+    use ironcalc::base::locale::get_locale;
+    let Ok(locale) = get_locale("en") else {
         return false;
-    }
-    // Reject text-literal markers (`@` meaning "original text") — these
-    // tend to collide with IronCalc's own text handling.
-    if s.contains('@') {
-        return false;
-    }
-    // Reject padding markers (`_`) — these produce space padding in
-    // Excel but IronCalc doesn't always honor them.
-    if s.contains('_') {
-        return false;
-    }
-    // Reject text in quotes — rare but trips formatter on some files.
-    if s.contains('"') {
-        return false;
-    }
-    true
+    };
+    // Positive/negative/zero pick different format sections; 0.42 and a
+    // 2023 date serial exercise the decimal and y/m/d token paths.
+    const SAMPLES: [f64; 5] = [1234.5678, -1234.5678, 0.0, 0.42, 44927.75];
+    SAMPLES.into_iter().all(|v| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match format_number(v, fmt, locale).error {
+                None => true,
+                Some(e) => e.starts_with("Invalid date value"),
+            }
+        }))
+        .unwrap_or(false)
+    })
 }
 
 /// Quick heuristic for "is this format string a date/time format?" — the
@@ -1757,5 +1771,51 @@ fn format_number(f: f64) -> String {
         format!("{}", f as i64)
     } else {
         format!("{}", f)
+    }
+}
+
+#[cfg(test)]
+mod numfmt_tests {
+    use super::numfmt_renders_cleanly;
+
+    // These pin the empirical behaviour of the vendored formatter. If an
+    // IronCalc upgrade changes what parses, these fail and the applied-
+    // by-default format set shifts — which is exactly what we want to
+    // notice.
+    #[test]
+    fn accepts_common_real_world_formats() {
+        for fmt in [
+            "#,##0.00",
+            "0.00%",
+            "$#,##0.00",
+            "\"$\"#,##0.00",
+            "#,##0.00;[Red](#,##0.00)",
+            "_-* #,##0.00_-;-* #,##0.00_-;_-* \"-\"??_-;_-@_-",
+            "_(\"$\"* #,##0.00_);_(\"$\"* \\(#,##0.00\\);_(\"$\"* \"-\"??_);_(@_)",
+            "m/d/yyyy",
+            "d-mmm-yy",
+            "yyyy-mm-dd",
+            "h:mm:ss",
+            "h:mm AM/PM",
+            "[h]:mm:ss",
+            "0.00E+00",
+            "# ?/?",
+            "[>=1000]#,##0;0",
+            "#,##0\\ \"units\"",
+        ] {
+            assert!(numfmt_renders_cleanly(fmt), "expected accept: {fmt}");
+        }
+    }
+
+    #[test]
+    fn rejects_formats_ironcalc_cannot_parse() {
+        for fmt in [
+            "[$-409]d-mmm-yy",
+            "[$-409]h:mm:ss AM/PM",
+            "[$USD-409]#,##0.00",
+            "mm:ss.0",
+        ] {
+            assert!(!numfmt_renders_cleanly(fmt), "expected reject: {fmt}");
+        }
     }
 }
