@@ -679,7 +679,59 @@ impl<'a> Model<'a> {
         }
     }
 
-    // INDIRECT(ref_tex)
+    /// Parse an R1C1-style reference ("R2C1", "R[1]C[-2]", "RC", "RC5",
+    /// "Sheet2!R2C3", "R2C1:R4C2") relative to `base` (the cell holding
+    /// the formula). Returns the range corners, or None when the text
+    /// isn't valid R1C1 or falls outside sheet bounds. Fastsheet vendor
+    /// addition for two-arg INDIRECT — upstream 0.7.1 returned #N/IMPL!
+    /// for every two-arg call.
+    fn parse_r1c1_reference(
+        &mut self,
+        text: &str,
+        base: CellReferenceIndex,
+    ) -> Option<(CellReferenceIndex, CellReferenceIndex)> {
+        let text = text.trim();
+        let (sheet, rest) = match text.rsplit_once('!') {
+            Some((sheet_name, rest)) => (
+                self.get_sheet_index_by_name(sheet_name.trim().trim_matches('\''))?,
+                rest,
+            ),
+            None => (base.sheet, text),
+        };
+        let parse_cell = |part: &str| -> Option<(i32, i32)> {
+            let mut s = part.trim();
+            let row = parse_r1c1_axis(&mut s, 'r', base.row)?;
+            let column = parse_r1c1_axis(&mut s, 'c', base.column)?;
+            if !s.is_empty() {
+                return None;
+            }
+            if !(1..=LAST_ROW).contains(&row) || !(1..=LAST_COLUMN).contains(&column) {
+                return None;
+            }
+            Some((row, column))
+        };
+        let (first, second) = match rest.split_once(':') {
+            Some((l, r)) => (parse_cell(l)?, parse_cell(r)?),
+            None => {
+                let c = parse_cell(rest)?;
+                (c, c)
+            }
+        };
+        Some((
+            CellReferenceIndex {
+                sheet,
+                row: first.0.min(second.0),
+                column: first.1.min(second.1),
+            },
+            CellReferenceIndex {
+                sheet,
+                row: first.0.max(second.0),
+                column: first.1.max(second.1),
+            },
+        ))
+    }
+
+    // INDIRECT(ref_text, [a1])
     // Returns the reference specified by 'ref_text'
     pub(crate) fn fn_indirect(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.len() > 2 || args.is_empty() {
@@ -689,11 +741,23 @@ impl<'a> Model<'a> {
         match value {
             Ok(s) => {
                 if args.len() == 2 {
-                    return CalcResult::Error {
-                        error: Error::NIMPL,
-                        origin: cell,
-                        message: "Not implemented".to_string(),
+                    // Excel: a1 omitted or TRUE → A1-style (fall through
+                    // to the parse below); FALSE → R1C1-style, resolved
+                    // relative to the cell holding the INDIRECT call.
+                    let a1_mode = match self.get_boolean(&args[1], cell) {
+                        Ok(b) => b,
+                        Err(e) => return e,
                     };
+                    if !a1_mode {
+                        return match self.parse_r1c1_reference(&s, cell) {
+                            Some((left, right)) => CalcResult::Range { left, right },
+                            None => CalcResult::Error {
+                                error: Error::REF,
+                                origin: cell,
+                                message: format!("Invalid R1C1 reference: '{s}'"),
+                            },
+                        };
+                    }
                 }
 
                 let parsed_reference = ParsedReference::parse_reference_formula(
@@ -901,4 +965,30 @@ impl<'a> Model<'a> {
             }
         }
     }
+}
+
+/// Consume one R1C1 axis ("R", "R7", "R[-2]") from the front of `s`.
+/// `letter` is 'r' or 'c' (matched case-insensitively); `base` anchors
+/// the bare ("R" alone = same row) and bracketed-relative forms.
+/// Advances `s` past the consumed axis. Companion to
+/// `parse_r1c1_reference` above (fastsheet vendor addition).
+fn parse_r1c1_axis(s: &mut &str, letter: char, base: i32) -> Option<i32> {
+    let first = s.chars().next()?;
+    if first.to_ascii_lowercase() != letter {
+        return None;
+    }
+    *s = &s[1..];
+    if let Some(rest) = s.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let n: i32 = rest[..end].parse().ok()?;
+        *s = &rest[end + 1..];
+        return Some(base + n);
+    }
+    let digit_count = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return Some(base);
+    }
+    let n: i32 = s[..digit_count].parse().ok()?;
+    *s = &s[digit_count..];
+    Some(n)
 }

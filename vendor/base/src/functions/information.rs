@@ -304,6 +304,18 @@ impl<'a> Model<'a> {
                 }
             }
             arg => {
+                // A reference argument (SHEET(Data!A1), SHEET(A1:B2))
+                // answers with the sheet the reference points at.
+                // Evaluate with reference semantics first — get_string
+                // below would collapse the reference to its cell VALUE
+                // and then look for a sheet by that name (→ #N/A).
+                // Fastsheet vendor patch; upstream 0.7.1 only handled
+                // the sheet-name-as-text form.
+                if let CalcResult::Range { left, .. } =
+                    self.evaluate_node_with_reference(arg, cell)
+                {
+                    return CalcResult::Number(left.sheet as f64 + 1.0);
+                }
                 // Now it should be the name of a sheet
                 let sheet_name = match self.get_string(arg, cell) {
                     Ok(s) => s,
