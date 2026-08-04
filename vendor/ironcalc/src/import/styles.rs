@@ -96,6 +96,7 @@ pub(super) fn load_styles<R: Read + std::io::Seek>(
         // In IronCalc convert double underline to simple
         // This in excel is u with a value of "double"
         let mut u = false;
+        let mut u_double = false;
         let mut b = false;
         let mut i = false;
         let mut strike = false;
@@ -117,6 +118,13 @@ pub(super) fn load_styles<R: Read + std::io::Seek>(
                 }
                 "u" => {
                     u = true;
+                    // val="double" / "doubleAccounting" → double underline
+                    // (fastsheet vendor patch; upstream collapsed to single).
+                    if let Some(val) = feature.attribute("val") {
+                        if val.starts_with("double") {
+                            u_double = true;
+                        }
+                    }
                 }
                 "b" => {
                     b = true;
@@ -155,6 +163,7 @@ pub(super) fn load_styles<R: Read + std::io::Seek>(
         fonts.push(Font {
             strike,
             u,
+            u_double,
             b,
             i,
             sz,

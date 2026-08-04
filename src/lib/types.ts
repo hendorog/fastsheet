@@ -2,18 +2,20 @@ export type CellStyleView = {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
+  underline_double?: boolean;
   strike?: boolean;
   size_pt?: number;
   family?: string;
   color?: string;
   bg?: string;
-  align_h?: "left" | "center" | "right" | "justify";
+  align_h?: "left" | "center" | "right" | "justify" | "fill";
   align_v?: "top" | "middle" | "bottom";
   wrap?: boolean;
-  border_top?: boolean;
-  border_bottom?: boolean;
-  border_left?: boolean;
-  border_right?: boolean;
+  /** Ready-made CSS border shorthand (e.g. "2px dashed #FF0000"). */
+  border_top?: string;
+  border_bottom?: string;
+  border_left?: string;
+  border_right?: string;
 };
 
 export type CellView = {
@@ -22,6 +24,8 @@ export type CellView = {
   text: string;
   input: string;
   is_formula: boolean;
+  /** Value class for General alignment: "n" number, "b" bool, "e" error. */
+  kind?: "n" | "b" | "e";
   style?: CellStyleView;
 };
 

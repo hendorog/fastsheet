@@ -389,6 +389,12 @@ pub struct Font {
     #[serde(default = "default_as_false")]
     #[serde(skip_serializing_if = "is_false")]
     pub u: bool, // seems that Excel supports a bit more - double underline / account underline etc.
+    /// Double underline (Excel u val="double"). Always set together
+    /// with `u` so code that only knows the single-bit flag still
+    /// renders an underline. Fastsheet vendor addition.
+    #[serde(default = "default_as_false")]
+    #[serde(skip_serializing_if = "is_false")]
+    pub u_double: bool,
     #[serde(default = "default_as_false")]
     #[serde(skip_serializing_if = "is_false")]
     pub b: bool,
@@ -412,6 +418,7 @@ impl Default for Font {
         Font {
             strike: false,
             u: false,
+            u_double: false,
             b: false,
             i: false,
             sz: 13,

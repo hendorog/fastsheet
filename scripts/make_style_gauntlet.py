@@ -97,7 +97,7 @@ combos = [
     ("bold", {"b": True}, Font(bold=True)),
     ("italic", {"i": True}, Font(italic=True)),
     ("underline", {"u": True}, Font(underline="single")),
-    ("double underline (collapses to single-bit u)", {"u": True},
+    ("double underline", {"u": True, "u_double": True},
      Font(underline="double")),
     ("strikethrough", {"strike": True}, Font(strike=True)),
     ("bold italic", {"b": True, "i": True}, Font(bold=True, italic=True)),

@@ -842,7 +842,7 @@ fn build_font_record(
     body.put_u16(palette_assign(palette, font.color.as_deref()));
     body.put_u16(if font.b { 700 } else { 400 });
     body.put_u16(0); // sss (super/subscript)
-    body.put_u8(if font.u { 1 } else { 0 }); // uls
+    body.put_u8(if font.u_double { 2 } else if font.u { 1 } else { 0 }); // uls
     body.put_u8(font.family.max(0).min(255) as u8); // bFamily
     body.put_u8(0); // bCharSet
     body.put_u8(0); // reserved

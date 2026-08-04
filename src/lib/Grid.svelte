@@ -778,12 +778,16 @@
     {@const colLeft = isFrozenCol ? frozenColLefts[colIdx] : null}
     {@const merge = mergeMap.anchors.get(cellKey)}
     {@const right = cells.get(`${rowIdx}:${colIdx + 1}`)}
+    {@const below = cells.get(`${rowIdx + 1}:${colIdx}`)}
     {@const clipRight = !!right?.text}
+    {@const isFill = cell?.style?.align_h === "fill"}
     <td
       class="cell"
       class:frozen-row={isFrozenRow}
       class:frozen-col={isFrozenCol}
       class:frozen-corner={isFrozenRow && isFrozenCol}
+      class:freeze-edge-row={rowIdx === frozenRows}
+      class:freeze-edge-col={colIdx === frozenCols}
       class:page-break-row={pageBreakRows.has(rowIdx)}
       class:page-break-col={pageBreakCols.has(colIdx)}
       class:merged={merge != null}
@@ -793,16 +797,21 @@
       data-c={colIdx}
       style={(isFrozenRow ? `top:${rowTop}px;` : "") +
         (isFrozenCol ? `left:${colLeft}px;` : "") +
-        cellTdStyle(cell)}
+        cellTdStyle(cell, below, right)}
     >
       {#if cell?.text || cell?.style?.bg}
         <div
           class="cell-content"
           class:wrap={cell.style?.wrap}
           class:clip-right={clipRight}
+          class:fill-repeat={isFill}
           style={cellContentStyle(cell)}
         >
-          {cell?.text ?? ""}
+          {isFill && cell?.text
+            ? cell.text.repeat(
+                Math.min(200, Math.ceil(600 / (7 * cell.text.length)) + 1),
+              )
+            : (cell?.text ?? "")}
         </div>
       {/if}
     </td>
@@ -821,6 +830,7 @@
     <th
       class="rowhdr"
       class:frozen-row={isFrozenRow}
+      class:freeze-edge-row={rowIdx === frozenRows}
       class:active-hdr={selRow === rowIdx}
       style={isFrozenRow ? `top:${rowTop}px;` : ""}
     >
@@ -871,13 +881,14 @@
     </colgroup>
     <thead>
       <tr>
-        <th class="rowhdr"></th>
+        <th class="rowhdr corner-hdr"></th>
         <!-- Frozen col headers — sticky like their data cells. -->
         {#each Array(frozenCols) as _, fi (fi)}
           {@const i = fi + 1}
           <th
             class="colhdr frozen-col"
             class:active-hdr={selCol === i}
+            class:freeze-edge-col={i === frozenCols}
             style={`left:${frozenColLefts[i]}px`}
           >
             {colLetter(i)}
@@ -898,6 +909,7 @@
           <th
             class="colhdr"
             class:active-hdr={selCol === i}
+            class:freeze-edge-col={i === frozenCols}
           >
             {colLetter(i)}
             <span
@@ -1039,15 +1051,44 @@
   }
   /* No min-width on headers — colgroup widths are authoritative under
      table-layout:fixed. min-width here would silently force cols wider. */
+  /* Sticky layering (low → high): frozen-col td (4) < rowhdr /
+     frozen-row td (5) < frozen corners + rowhdr-in-frozen-row (6) <
+     colhdr (7) < colhdr-in-frozen-col + top-left corner (8). Column
+     headers must beat frozen-row cells or scrolling down paints the
+     frozen rows OVER the header strip. */
   .rowhdr {
     position: sticky;
     left: 0;
-    z-index: 3;
+    z-index: 5;
   }
   .colhdr {
     position: sticky;
     top: 0;
-    z-index: 2;
+    z-index: 7;
+  }
+  /* Frozen column headers stick on BOTH axes. */
+  th.colhdr.frozen-col {
+    left: 0;
+    z-index: 8;
+  }
+  /* Top-left corner header (above row numbers) sticks on both axes and
+     tops everything. */
+  th.corner-hdr {
+    top: 0;
+    z-index: 8;
+  }
+  /* With border-collapse, borders belong to the table's shared border
+     grid and DON'T travel with sticky cells — scrolled content shows
+     through 1px seams where the border "stayed behind". Paint sticky
+     cells' grid lines as inset box-shadows instead: shadows are part
+     of the element and move with it. */
+  .rowhdr,
+  .colhdr {
+    border: none;
+    box-shadow:
+      inset -1px 0 0 #c0c0c0,
+      inset 0 -1px 0 #c0c0c0;
+    background-clip: padding-box;
   }
   .cell {
     border: 1px solid #e0e0e0;
@@ -1118,6 +1159,49 @@
     z-index: 6;
     background: #f3f3f3;
   }
+  /* Same sticky-border problem as the headers: frozen cells' collapse
+     borders stay behind while the cell sticks. Inset shadows stand in
+     for the grid lines. */
+  td.frozen-row,
+  td.frozen-col {
+    border: none;
+    box-shadow:
+      inset -1px 0 0 #e0e0e0,
+      inset 0 -1px 0 #e0e0e0;
+  }
+  /* Freeze separator lines — Excel draws a solid line under the last
+     frozen row / right of the last frozen column. Drawn as absolutely-
+     positioned pseudo-elements: inset box-shadows vanish under
+     .cell-content backgrounds, and Chromium doesn't paint OUTER
+     box-shadows on collapsed-table cells at all. Every freeze-edge
+     cell is sticky (= positioned), so the pseudo anchors to it, rides
+     along, and its stacking context paints the line over scrolled
+     content. ::before carries the row line, ::after the column line,
+     so a corner cell can have both. */
+  td.freeze-edge-row::before,
+  th.freeze-edge-row::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: -1px;
+    bottom: -2px;
+    height: 2px;
+    background: #999999;
+    z-index: 1;
+    pointer-events: none;
+  }
+  td.freeze-edge-col::after,
+  th.freeze-edge-col::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: -1px;
+    right: -2px;
+    width: 2px;
+    background: #999999;
+    z-index: 1;
+    pointer-events: none;
+  }
   /* Hidden rows fully collapse — adjacent rows flush. Visibility is
      surfaced through /Worksheet/Row/Display in the menu. */
   tr.hidden-row {
@@ -1181,6 +1265,11 @@
      glyphs. Keyed on `right.text` only (NOT `right.style?.bg`) — a
      bg-only neighbour does not block spill. */
   .cell-content.clip-right {
+    overflow: hidden;
+  }
+  /* halign "fill": Grid repeats the text to overfill the column; clip
+     at the cell edge — Excel's fill alignment never spills. */
+  .cell-content.fill-repeat {
     overflow: hidden;
   }
   /* Inner positioning context for the overlay layer. The table sits

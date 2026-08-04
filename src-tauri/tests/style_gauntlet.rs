@@ -111,6 +111,7 @@ fn check(
             ("b", style.font.b),
             ("i", style.font.i),
             ("u", style.font.u),
+            ("u_double", style.font.u_double),
             ("strike", style.font.strike),
         ] {
             if let Some(expected) = font.get(key).and_then(|v| v.as_bool()) {

@@ -38,6 +38,9 @@ pub(crate) struct CellStyleView {
     italic: bool,
     #[serde(skip_serializing_if = "is_false_b")]
     underline: bool,
+    /// Double underline — rendered as text-decoration-style: double.
+    #[serde(skip_serializing_if = "is_false_b")]
+    underline_double: bool,
     #[serde(skip_serializing_if = "is_false_b")]
     strike: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,16 +59,37 @@ pub(crate) struct CellStyleView {
     align_v: Option<&'static str>,
     #[serde(skip_serializing_if = "is_false_b")]
     wrap: bool,
-    /// Border presence flags — one bit per side. Frontend renders thin
-    /// black borders on whichever sides are set.
-    #[serde(skip_serializing_if = "is_false_b")]
-    border_top: bool,
-    #[serde(skip_serializing_if = "is_false_b")]
-    border_bottom: bool,
-    #[serde(skip_serializing_if = "is_false_b")]
-    border_left: bool,
-    #[serde(skip_serializing_if = "is_false_b")]
-    border_right: bool,
+    /// Ready-made CSS border shorthand per side (e.g. "1px solid
+    /// #000000", "3px double #FF0000") — None when the side has no
+    /// border. The frontend applies each value verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    border_top: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    border_bottom: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    border_left: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    border_right: Option<String>,
+}
+
+/// CSS approximation of an IronCalc border item. Widths follow Excel's
+/// visual weight (thin 1px, medium 2px, thick/double 3px); dash/dot
+/// variants map onto the closest CSS border-style.
+fn border_css(item: &ironcalc::base::types::BorderItem) -> String {
+    use ironcalc::base::types::BorderStyle as B;
+    let (width, style) = match item.style {
+        B::Thin => ("1px", "solid"),
+        B::Medium => ("2px", "solid"),
+        B::Thick => ("3px", "solid"),
+        B::Double => ("3px", "double"),
+        B::Dotted => ("1px", "dotted"),
+        B::MediumDashed => ("2px", "dashed"),
+        B::MediumDashDot => ("2px", "dashed"),
+        B::MediumDashDotDot => ("2px", "dotted"),
+        B::SlantDashDot => ("2px", "dashed"),
+    };
+    let color = item.color.as_deref().unwrap_or("#000000");
+    format!("{width} {style} {color}")
 }
 
 fn is_false_b(b: &bool) -> bool {
@@ -81,6 +105,11 @@ pub(crate) struct CellView {
     /// Original input — formula like "=SUM(A1:A5)" or the raw entered value.
     input: String,
     is_formula: bool,
+    /// Value class for Excel "General" alignment: "n" number (right),
+    /// "b" boolean (center), "e" error (center). Absent for text —
+    /// the frontend's default left alignment applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     style: Option<CellStyleView>,
 }
@@ -98,6 +127,7 @@ fn build_style_view(
     if f.b { sv.bold = true; any = true; }
     if f.i { sv.italic = true; any = true; }
     if f.u { sv.underline = true; any = true; }
+    if f.u_double { sv.underline_double = true; any = true; }
     if f.strike { sv.strike = true; any = true; }
     // Only emit if it deviates from the workbook's default font size.
     // For xls loaded via load_xls we overwrote fonts[0].sz with the
@@ -136,8 +166,11 @@ fn build_style_view(
             HorizontalAlignment::CenterContinuous => Some("center"),
             HorizontalAlignment::Right => Some("right"),
             HorizontalAlignment::Justify => Some("justify"),
-            HorizontalAlignment::Fill => Some("left"),
-            HorizontalAlignment::Distributed => Some("justify"),
+            // "fill" repeats content to fill the cell — the frontend
+            // implements the repetition and clipping.
+            HorizontalAlignment::Fill => Some("fill"),
+            // Excel renders distributed single-line content centered.
+            HorizontalAlignment::Distributed => Some("center"),
             HorizontalAlignment::General => None,
         };
         if h.is_some() { sv.align_h = h; any = true; }
@@ -154,10 +187,10 @@ fn build_style_view(
         }
         if a.wrap_text { sv.wrap = true; any = true; }
     }
-    if s.border.top.is_some() { sv.border_top = true; any = true; }
-    if s.border.bottom.is_some() { sv.border_bottom = true; any = true; }
-    if s.border.left.is_some() { sv.border_left = true; any = true; }
-    if s.border.right.is_some() { sv.border_right = true; any = true; }
+    if let Some(b) = &s.border.top { sv.border_top = Some(border_css(b)); any = true; }
+    if let Some(b) = &s.border.bottom { sv.border_bottom = Some(border_css(b)); any = true; }
+    if let Some(b) = &s.border.left { sv.border_left = Some(border_css(b)); any = true; }
+    if let Some(b) = &s.border.right { sv.border_right = Some(border_css(b)); any = true; }
     if any { Some(sv) } else { None }
 }
 
@@ -228,12 +261,19 @@ pub(crate) fn get_cells(
             if text.is_empty() && input.is_empty() && style.is_none() {
                 continue;
             }
+            let kind = match model.get_cell_type(sheet, row as i32, col as i32) {
+                Ok(ironcalc::base::types::CellType::Number) => Some("n"),
+                Ok(ironcalc::base::types::CellType::LogicalValue) => Some("b"),
+                Ok(ironcalc::base::types::CellType::ErrorValue) => Some("e"),
+                _ => None,
+            };
             out.push(CellView {
                 row,
                 col,
                 text,
                 input,
                 is_formula,
+                kind,
                 style,
             });
         }

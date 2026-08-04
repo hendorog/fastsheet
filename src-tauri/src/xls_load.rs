@@ -670,6 +670,7 @@ pub fn load_xls(
                 bold: c.bold,
                 italic: c.italic,
                 underline: c.underline,
+                underline_double: c.underline_double,
                 strike: c.strike,
                 color_idx: c.color_idx,
                 size_pt: resolved_font.size_pt,
@@ -741,6 +742,7 @@ pub fn load_xls(
         if font.bold { style.font.b = true; }
         if font.italic { style.font.i = true; }
         if font.underline { style.font.u = true; }
+        if font.underline_double { style.font.u_double = true; }
         if font.strike { style.font.strike = true; }
         if font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64 {
             if let Some(hex) = shape.palette.get(&font.color_idx) {
