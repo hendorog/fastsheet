@@ -501,6 +501,9 @@
     for (const r of rowLru.keys()) {
       if (evict.size >= dropCount) break;
       if (r >= protectLo && r <= protectHi) continue;
+      // Frozen rows are always on screen (sticky) but sit outside the
+      // visible band Grid reports — never evict them.
+      if (r <= frozenRows) continue;
       evict.add(r);
     }
     if (evict.size === 0) return;
@@ -673,10 +676,16 @@
     loadedRows = new Set();
     rowLru = new Map();
     await loadSheetLayout();
-    loadedColStart = Math.max(1, colBandStart);
+    // Grid's visible band deliberately starts after the frozen rows /
+    // cols (they render separately, sticky), so the band-driven fetch
+    // below would never load their data — include them explicitly.
+    loadedColStart = frozenCols > 0 ? 1 : Math.max(1, colBandStart);
     loadedColEnd = Math.min(viewportCols, colBandEnd > 0 ? colBandEnd : 60);
     const r1 = Math.max(1, bandStart);
     const r2 = Math.min(viewportRows, bandEnd > 0 ? bandEnd : 60);
+    if (frozenRows > 0) {
+      await ensureRowsLoaded(1, Math.min(frozenRows, viewportRows));
+    }
     await ensureRowsLoaded(r1, r2);
   }
 
@@ -689,6 +698,11 @@
     bandLoadRaf = requestAnimationFrame(async () => {
       bandLoadRaf = null;
       if (!workbook) return;
+      // Frozen rows sit outside the reported band — keep them loaded
+      // (no-op when already present; guards against eviction races).
+      if (frozenRows > 0) {
+        await ensureRowsLoaded(1, Math.min(frozenRows, viewportRows));
+      }
       const r1 = Math.max(1, bandStart);
       const r2 = Math.min(viewportRows, bandEnd);
       await ensureRowsLoaded(r1, r2);
