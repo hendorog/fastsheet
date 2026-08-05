@@ -119,3 +119,37 @@ fn offset_moves_and_resizes() {
         ("=OFFSET(A1,1048576,0)", "#REF!"),    // beyond the last row
     ]);
 }
+
+#[test]
+fn lookup_blank_value_semantics() {
+    // Vendor patch (found via PricerPRU 2026-08): a blank lookup cell
+    // behaves as the number 0, and blank cells in the lookup vector
+    // never match it. Without the patch VLOOKUP/HLOOKUP "matched"
+    // blank-to-blank and returned data from a blank-keyed row/column
+    // instead of #N/A. Model layout: D1 blank, D2:D4 = [Leech, 7, 0].
+    let mut m = test_model();
+    m.set_user_input(0, 2, 4, "Leech".to_string()).unwrap();
+    m.set_user_input(0, 3, 4, "7".to_string()).unwrap();
+    m.set_user_input(0, 4, 4, "0".to_string()).unwrap();
+    let cases = [
+        // Z9 is blank; D1 (blank) must NOT match → but D4 holds an
+        // actual 0, which a blank lookup (coerced to 0) DOES match.
+        ("=VLOOKUP(Z9,D1:E4,1,FALSE)", "0"),
+        // Blank lookup against a vector with no zeros → #N/A.
+        ("=VLOOKUP(Z9,D1:E2,1,FALSE)", "#N/A"),
+        ("=HLOOKUP(Z9,A1:B2,2,FALSE)", "#N/A"),
+        // Non-blank lookups are unaffected.
+        ("=VLOOKUP(\"Leech\",D1:E4,1,FALSE)", "Leech"),
+        ("=VLOOKUP(7,D1:E4,1,FALSE)", "7"),
+    ];
+    let mut failures = vec![];
+    for (formula, expected) in cases {
+        m.set_user_input(0, 5, 5, formula.to_string()).unwrap();
+        m.evaluate();
+        let got = m.get_formatted_cell_value(0, 5, 5).unwrap_or_default();
+        if got != expected {
+            failures.push(format!("{formula}: expected {expected:?}, got {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

@@ -301,6 +301,16 @@ impl<'a> Model<'a> {
         if lookup_value.is_error() {
             return lookup_value;
         }
+        // fastsheet patch (Excel semantics): a blank lookup cell behaves
+        // as the number 0, and blank cells in the lookup vector never
+        // match it — without this, blank-to-blank "matches" returned the
+        // first blank-keyed column instead of #N/A.
+        let lookup_was_blank = matches!(lookup_value, CalcResult::EmptyCell);
+        let lookup_value = if lookup_was_blank {
+            CalcResult::Number(0.0)
+        } else {
+            lookup_value
+        };
         let row_index = match self.get_number(&args[2], cell) {
             Ok(v) => v.floor() as i32,
             Err(s) => return s,
@@ -367,6 +377,9 @@ impl<'a> Model<'a> {
                             row: left.row,
                             column: left.column + l,
                         });
+                        if lookup_was_blank && matches!(value, CalcResult::EmptyCell) {
+                            continue;
+                        }
                         if result_matches(&value) {
                             return self.evaluate_cell(CellReferenceIndex {
                                 sheet: left.sheet,
@@ -408,6 +421,14 @@ impl<'a> Model<'a> {
         if lookup_value.is_error() {
             return lookup_value;
         }
+        // fastsheet patch (Excel semantics): see fn_hlookup — blank
+        // lookup behaves as 0, blank vector cells never match it.
+        let lookup_was_blank = matches!(lookup_value, CalcResult::EmptyCell);
+        let lookup_value = if lookup_was_blank {
+            CalcResult::Number(0.0)
+        } else {
+            lookup_value
+        };
         let column_index = match self.get_number(&args[2], cell) {
             Ok(v) => v.floor() as i32,
             Err(s) => return s,
@@ -474,6 +495,9 @@ impl<'a> Model<'a> {
                             row: left.row + l,
                             column: left.column,
                         });
+                        if lookup_was_blank && matches!(value, CalcResult::EmptyCell) {
+                            continue;
+                        }
                         if result_matches(&value) {
                             return self.evaluate_cell(CellReferenceIndex {
                                 sheet: left.sheet,
