@@ -144,6 +144,7 @@
   // selection but the form seeds from the active cell.
   let formatModalOpen = $state(false);
   let formatModalCell = $state({ row: 1, col: 1, r1: 1, c1: 1, r2: 1, c2: 1 });
+  let formatModalTab = $state<"number" | "font" | "border" | "fill" | "alignment">("number");
 
   /// Generic color picker overlay. Replaces the old hex-only prompt
   /// for /R F B and /R F X. The handlers (onSelect / onClear) are set
@@ -2923,7 +2924,7 @@
     focusGrid();
   }
 
-  function openFormatCellsModal() {
+  function openFormatCellsModal(tab: "number" | "font" | "border" | "fill" | "alignment" = "number") {
     if (!workbook) {
       statusMsg = "Open or create a workbook first.";
       return;
@@ -2933,6 +2934,7 @@
     const c1 = Math.min(selCol, rangeEndCol);
     const c2 = Math.max(selCol, rangeEndCol);
     formatModalCell = { row: selRow, col: selCol, r1, c1, r2, c2 };
+    formatModalTab = tab;
     formatModalOpen = true;
   }
 
@@ -4535,6 +4537,7 @@
     searchRange: openFindReplace,
     alignRange,
     attrRange,
+    attrFont: () => openFormatCellsModal("font"),
     setFillColor,
     setTextColor,
     rangeValue,
@@ -5217,6 +5220,7 @@
       rangeC1={formatModalCell.c1}
       rangeR2={formatModalCell.r2}
       rangeC2={formatModalCell.c2}
+      initialTab={formatModalTab}
       onClose={() => {
         formatModalOpen = false;
         focusGrid();

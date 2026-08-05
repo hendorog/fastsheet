@@ -57,6 +57,10 @@ export type MenuCallbacks = {
   // Mirrors Lotus 1-2-3 Wysiwyg's `:Format` menu and the Excel Ctrl-key
   // shortcuts (B / I / U / 5).
   attrRange: (kind: "bold" | "italic" | "underline" | "strike" | "wrap" | "reset") => void | Promise<void>;
+  // Range/Attribute/Font — opens the Format Cells dialog on its Font
+  // tab (shows the cell's resolved font name + size; no dedicated
+  // font UI yet).
+  attrFont: () => void | Promise<void>;
   // Range/Format/Color — fill / text color (prompted hex).
   setFillColor: () => void | Promise<void>;
   setTextColor: () => void | Promise<void>;
@@ -302,6 +306,7 @@ export function buildMenu(cb: MenuCallbacks): MenuItem[] {
             { letter: "U", label: "Underline", description: "Toggle underline (Ctrl+U)", action: () => cb.attrRange("underline") },
             { letter: "S", label: "Strike", description: "Toggle strike-through (Ctrl+5)", action: () => cb.attrRange("strike") },
             { letter: "W", label: "Wrap", description: "Toggle word-wrap (lets long text wrap onto multiple lines, growing the row)", action: () => cb.attrRange("wrap") },
+            { letter: "F", label: "Font", description: "Show the cell's font name + size (Format Cells dialog, Font tab)", action: cb.attrFont },
             { letter: "R", label: "Reset", description: "Clear bold / italic / underline / strike / text colour", action: () => cb.attrRange("reset") },
           ],
         },
