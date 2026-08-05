@@ -41,7 +41,7 @@ use crate::util::col_letter_i;
 use crate::xlsx_load::strip_trailing_anchor;
 use crate::xls_biff::{
     decode_array_formula as fastsheet_lib_decode_array,
-    scan_xls_shape,
+    scan_xls_shape, ExtColor, XlsShape,
 };
 use crate::xls_preserve::{extract as extract_preserved, PreservedXlsData};
 
@@ -643,41 +643,18 @@ pub fn load_xls(
 
         // Slow path: build the merged Style for this XF, register it,
         // and cache the resulting index for subsequent cells with the
-        // same ixfe. Resolve the effective font_idx via XF inheritance.
-        // If this cell XF has fAtrFnt=0 it doesn't override the parent
-        // style XF's font — many real-world templates use that pattern
-        // for "bordered but otherwise default" cells. Tiered rule:
-        //   1. cell.font_idx == 0 → use workbook default font directly,
-        //      ignore the parent style chain. Dominant case for cost-
-        //      summary numeric cells whose style XFs walk to a font
-        //      that was used for borders/fills only.
-        //   2. cell.font_idx > 0 → bold/italic/underline/strike/color
-        //      from cell font, size+face from parent style font (so
-        //      cells with stale Arial 14 pointers don't visually
-        //      balloon next to 11pt neighbours).
-        //   3. Style XFs themselves keep their resolved font as-is.
+        // same ixfe. Font per spec XF inheritance: the cell XF's own
+        // font when fAtrFnt is set (or it has no parent), else the
+        // parent style XF's font. The fonts Vec is ifnt-aligned (the
+        // scanner occupies the phantom slot 4), so indexing is exact.
+        // The old "empirical tiered rule" (attrs from the cell font,
+        // face/size from the parent) was fitted while the font table
+        // was off by one for ifnt >= 5 — the "stale Arial 14 pointers"
+        // it compensated for were the misindexed fonts themselves.
         let resolved_font_idx = resolve_xf_font(&shape.xfs, ixfe);
-        let resolved_font = match shape.fonts.get(resolved_font_idx as usize) {
+        let font = match shape.fonts.get(resolved_font_idx as usize) {
             Some(f) => f.clone(),
             None => continue,
-        };
-        let workbook_default = shape.fonts.get(0).cloned().unwrap_or_else(|| resolved_font.clone());
-        let cell_font = shape.fonts.get(xf.font_idx as usize).cloned();
-        let font = if !xf.is_style && xf.font_idx == 0 {
-            workbook_default.clone()
-        } else if let (false, Some(c)) = (xf.is_style, cell_font) {
-            crate::xls_biff::FontEntry {
-                bold: c.bold,
-                italic: c.italic,
-                underline: c.underline,
-                underline_double: c.underline_double,
-                strike: c.strike,
-                color_idx: c.color_idx,
-                size_pt: resolved_font.size_pt,
-                name: resolved_font.name.clone(),
-            }
-        } else {
-            resolved_font.clone()
         };
         let font = &font;
         // Fills, borders, and alignment read from the XF directly —
@@ -704,9 +681,14 @@ pub fn load_xls(
             v_align: xf.v_align,
             wrap: xf.wrap,
         };
+        // XFEXT full-color overrides (rgb / theme+tint) trump the icv
+        // approximations stored in the XF itself — modern Excel writes
+        // the true colors there and only a nearest-palette icv for
+        // legacy readers.
+        let ext = shape.xfext.get(&ixfe).copied().unwrap_or_default();
         let has_fill = effective_fill.fill_pattern == 1
-            && effective_fill.fill_fg != 64
-            && effective_fill.fill_fg != 65;
+            && (ext.fill_fg.is_some()
+                || (effective_fill.fill_fg != 64 && effective_fill.fill_fg != 65));
         let has_border = effective_border.border_left != 0
             || effective_border.border_right != 0
             || effective_border.border_top != 0
@@ -721,7 +703,13 @@ pub fn load_xls(
             || (font.size_pt > 0 && font.size_pt != default_font_size)
             || (font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64)
             || (!font.name.is_empty() && font.name != default_font_name);
-        if !has_fill && !has_border && !has_align && !has_nondefault_font && numfmt_override.is_none() {
+        if !has_fill
+            && !has_border
+            && !has_align
+            && !has_nondefault_font
+            && ext.font_color.is_none()
+            && numfmt_override.is_none()
+        {
             continue;
         }
         let Ok(mut style) = model.get_style_for_cell(sheet, row, col) else { continue };
@@ -744,7 +732,11 @@ pub fn load_xls(
         if font.underline { style.font.u = true; }
         if font.underline_double { style.font.u_double = true; }
         if font.strike { style.font.strike = true; }
-        if font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64 {
+        if let Some(hex) = ext.font_color.and_then(|c| resolve_ext_color(c, &shape)) {
+            if hex != "#000000" {
+                style.font.color = Some(hex);
+            }
+        } else if font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64 {
             if let Some(hex) = shape.palette.get(&font.color_idx) {
                 style.font.color = Some(hex.clone());
             }
@@ -753,9 +745,13 @@ pub fn load_xls(
         // 64 ("system window") and 65 ("system bg") mean "use theme /
         // none" — skip those.
         if has_fill {
-            if let Some(hex) = shape.palette.get(&effective_fill.fill_fg) {
+            let hex = ext
+                .fill_fg
+                .and_then(|c| resolve_ext_color(c, &shape))
+                .or_else(|| shape.palette.get(&effective_fill.fill_fg).cloned());
+            if let Some(hex) = hex {
                 style.fill.pattern_type = "solid".to_string();
-                style.fill.fg_color = Some(hex.clone());
+                style.fill.fg_color = Some(hex);
                 style.fill.bg_color = None;
             }
         }
@@ -793,7 +789,7 @@ pub fn load_xls(
         // variant (3 dashed, 7 hair, 9 dashDot, 11 dashDotDot) fall
         // back to Thin, matching the xlsx reader's fallback; icv 64
         // ("auto") and anything outside the palette render black.
-        let border_item = |code: u16, icv: u16| BorderItem {
+        let border_item = |code: u16, icv: u16, ext_color: Option<ExtColor>| BorderItem {
             style: match code {
                 2 => BorderStyle::Medium,
                 4 => BorderStyle::Dotted,
@@ -806,10 +802,9 @@ pub fn load_xls(
                 _ => BorderStyle::Thin,
             },
             color: Some(
-                shape
-                    .palette
-                    .get(&icv)
-                    .cloned()
+                ext_color
+                    .and_then(|c| resolve_ext_color(c, &shape))
+                    .or_else(|| shape.palette.get(&icv).cloned())
                     .unwrap_or_else(|| "#000000".to_string()),
             ),
         };
@@ -817,24 +812,28 @@ pub fn load_xls(
             style.border.left = Some(border_item(
                 effective_border.border_left as u16,
                 effective_border.icv_left,
+                ext.border_left,
             ));
         }
         if effective_border.border_right != 0 && style.border.right.is_none() {
             style.border.right = Some(border_item(
                 effective_border.border_right as u16,
                 effective_border.icv_right,
+                ext.border_right,
             ));
         }
         if effective_border.border_top != 0 && style.border.top.is_none() {
             style.border.top = Some(border_item(
                 effective_border.border_top as u16,
                 effective_border.icv_top,
+                ext.border_top,
             ));
         }
         if effective_border.border_bottom != 0 && style.border.bottom.is_none() {
             style.border.bottom = Some(border_item(
                 effective_border.border_bottom as u16,
                 effective_border.icv_bottom,
+                ext.border_bottom,
             ));
         }
         // Numfmt — folded into the same Style write so the cached index
@@ -989,6 +988,113 @@ fn resolve_xf_font(
         cur = xf.ixf_parent;
     }
     xfs.get(cur as usize).map(|x| x.font_idx).unwrap_or(0)
+}
+
+/// Default Office theme (2013+) clrScheme in file order: dk1, lt1,
+/// dk2, lt2, accent1..6, hlink, folHlink. Used when the workbook has
+/// no THEME payload of its own.
+const DEFAULT_THEME_COLORS: [&str; 12] = [
+    "#000000", "#FFFFFF", "#44546A", "#E7E6E6", "#4472C4", "#ED7D31",
+    "#A5A5A5", "#FFC000", "#5B9BD5", "#70AD47", "#0563C1", "#954F72",
+];
+
+/// Resolve an XFEXT FullColorExt to "#RRGGBB", applying the tint.
+/// Theme indices use the xlsx numbering (0=lt1, 1=dk1, 2=lt2, 3=dk2,
+/// 4..9=accent1-6) — pairwise-swapped vs the clrScheme file order.
+fn resolve_ext_color(c: ExtColor, shape: &XlsShape) -> Option<String> {
+    let (hex, tint) = match c {
+        ExtColor::Rgb(rgb, t) => {
+            (format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]), t)
+        }
+        ExtColor::Icv(icv, t) => (shape.palette.get(&icv)?.clone(), t),
+        ExtColor::Theme(idx, t) => {
+            let file_idx: usize = match idx {
+                0 => 1,
+                1 => 0,
+                2 => 3,
+                3 => 2,
+                4..=11 => idx as usize,
+                _ => return None,
+            };
+            let hex = shape
+                .theme_colors
+                .as_ref()
+                .and_then(|v| v.get(file_idx).cloned())
+                .unwrap_or_else(|| DEFAULT_THEME_COLORS[file_idx].to_string());
+            (hex, t)
+        }
+    };
+    if tint == 0 {
+        return Some(hex);
+    }
+    Some(apply_tint(&hex, f64::from(tint) / 32767.0))
+}
+
+/// Apply an OOXML tint/shade to a hex color: positive tint raises HSL
+/// luminance toward white (L' = L·(1−t) + t), negative lowers it
+/// toward black (L' = L·(1+t)) — the same transform xlsx theme tints
+/// use, so .xls and .xlsx render tinted theme colors identically.
+fn apply_tint(hex: &str, tint: f64) -> String {
+    let Some([r, g, b]) = crate::xls_save::parse_hex_color(hex) else {
+        return hex.to_string();
+    };
+    let (h, s, l) = rgb_to_hsl(r, g, b);
+    let l = if tint < 0.0 {
+        l * (1.0 + tint)
+    } else {
+        l * (1.0 - tint) + tint
+    };
+    let (r, g, b) = hsl_to_rgb(h, s, l.clamp(0.0, 1.0));
+    format!("#{:02X}{:02X}{:02X}", r, g, b)
+}
+
+fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
+    let r = f64::from(r) / 255.0;
+    let g = f64::from(g) / 255.0;
+    let b = f64::from(b) / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < f64::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if (max - r).abs() < f64::EPSILON {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if (max - g).abs() < f64::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    (h, s, l)
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    let to_byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    if s <= 0.0 {
+        let v = to_byte(l);
+        return (v, v, v);
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hue = |mut t: f64| {
+        t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    (
+        to_byte(hue(h + 1.0 / 3.0)),
+        to_byte(hue(h)),
+        to_byte(hue(h - 1.0 / 3.0)),
+    )
 }
 
 #[derive(Default, Clone, Copy)]

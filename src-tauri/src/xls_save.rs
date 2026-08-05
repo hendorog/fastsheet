@@ -662,11 +662,10 @@ fn build_wsbool() -> Vec<u8> {
 // cell_xf, and store the mapping (ironcalc index → biff index) so
 // `emit_sheet_cells` can translate `cell.s` correctly.
 //
-// FONT-index-4 skip: real Excel emits N+1 FONT records (index 4 being
-// a placeholder) and XF.ifnt skips 4 — values are in {0,1,2,3,5,...}.
-// We follow the same convention so files we write open in Excel.
-// Our own reader does direct indexing, but the unused placeholder at
-// index 4 doesn't hurt it.
+// FONT-index-4 skip: XF.ifnt values skip 4 ({0,1,2,3,5,...}) but the
+// stream contains NO placeholder record — record k carries ifnt k for
+// k < 4 and ifnt k+1 from the fifth record on ([MS-XLS] 2.4.122).
+// Our reader mirrors this by inserting a phantom Vec entry at index 4.
 // ---------------------------------------------------------------------------
 
 const PALETTE_LAST_USER_INDEX: u16 = 63;
@@ -759,7 +758,7 @@ fn model_font_to_biff_ifnt(model_idx: u32) -> u16 {
 
 /// Parse a `#RRGGBB` (or `#AARRGGBB`) hex color string. Returns None
 /// for malformed input or `None` (no color set).
-fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
+pub(crate) fn parse_hex_color(s: &str) -> Option<[u8; 3]> {
     let s = s.trim_start_matches('#');
     let bytes = match s.len() {
         6 => s,
@@ -1055,11 +1054,19 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
             None => fonts.push(default_font_record.clone()),
         }
     }
-    // File slot 4: placeholder (never referenced by any XF.ifnt).
-    fonts.push(build_font_placeholder());
-    // File slots 5+: model fonts 4+.
+    // File slots 4+: model fonts 4+, emitted directly — there is NO
+    // placeholder record in the stream. Per [MS-XLS] 2.4.122 the ifnt
+    // numbering simply skips 4: stream record k has ifnt k for k < 4
+    // and ifnt k+1 from the fifth record on (model_font_to_biff_ifnt
+    // applies the same shift). Emitting a physical placeholder here
+    // made Excel resolve every font from ifnt 5 up one record early.
     for f in styles.fonts.iter().skip(4) {
         fonts.push(build_font_record(f, &mut palette));
+    }
+    // BIFF8 readers expect at least 5 FONT records; pad with a
+    // placeholder (never referenced — it would be ifnt 5).
+    if fonts.len() < 5 {
+        fonts.push(build_font_placeholder());
     }
 
     // ---- FORMAT records + IronCalc-id → BIFF-ifmt mapping ----
