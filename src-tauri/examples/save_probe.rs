@@ -71,12 +71,33 @@ fn main() {
 
     let out = std::env::temp_dir().join("save_probe_out.xls");
     println!("=== save_xls → {}", out.display());
-    let preserved = fastsheet_lib::xls_preserve::extract(&std::fs::read(&path).expect("read"));
+    let mut preserved = fastsheet_lib::xls_preserve::extract(&std::fs::read(&path).expect("read"));
+    // Bisection support: FASTSHEET_PROBE_STRIP selectively drops
+    // preservation layers so an external validator (Excel, POI) can
+    // localize which passthrough content a reader is objecting to.
+    //   substreams   — no record passthrough at all (VBA/props kept)
+    //   globals-only — keep only the globals substream passthrough
+    //   entries      — drop VBA/property streams (records kept)
+    //   all          — greenfield write, nothing preserved
+    match std::env::var("FASTSHEET_PROBE_STRIP").as_deref() {
+        Ok("substreams") => preserved.workbook_substreams.clear(),
+        Ok("globals-only") => preserved.workbook_substreams.retain(|s| s.bof_dt == 0x0005),
+        Ok("entries") => preserved.entries.clear(),
+        Ok("all") => {
+            preserved.workbook_substreams.clear();
+            preserved.entries.clear();
+        }
+        _ => {}
+    }
     if !preserved.workbook_substreams.is_empty() {
         println!("  preserved {} substreams from source workbook stream", preserved.workbook_substreams.len());
     }
     let bytes = fastsheet_lib::xls_save::build_xls_bytes_with_options(&model, None, Some(&prgce), Some(&preserved));
-    fastsheet_lib::xls_save::write_xls_bytes_with_preserved(&out, &bytes, None).expect("save_xls");
+    // Pass the preserved bundle on the write too, like the app's save
+    // path does — this is what carries VBA storages and the OLE
+    // property streams (CompObj / SummaryInformation) into the output.
+    fastsheet_lib::xls_save::write_xls_bytes_with_preserved(&out, &bytes, Some(&preserved))
+        .expect("save_xls");
     let bytes = std::fs::read(&out).expect("read back");
     println!("  wrote {} bytes", bytes.len());
 

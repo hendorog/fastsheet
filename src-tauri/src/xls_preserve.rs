@@ -1,6 +1,7 @@
 //! Capture-and-replay for .xls structured-storage subtrees that the
-//! greenfield BIFF writer doesn't model — currently just VBA / macro
-//! storages.
+//! greenfield BIFF writer doesn't model — VBA / macro storages plus
+//! the top-level OLE property streams (CompObj, SummaryInformation,
+//! DocumentSummaryInformation).
 //!
 //! Why this works without offset arithmetic: VBA lives in its own
 //! storage tree (`/_VBA_PROJECT_CUR`, optionally `/VBA`, `/Macros`,
@@ -99,6 +100,18 @@ const VBA_STORAGE_ROOTS: &[&str] = &[
     "/Macros",
 ];
 
+/// Top-level OLE property streams preserved verbatim. These are
+/// self-contained (no references into the workbook stream):
+/// SummaryInformation / DocumentSummaryInformation carry document
+/// metadata (author, title, company, custom properties); CompObj
+/// identifies the document class for OLE embedding. Dropping them
+/// loses metadata and shell integration (2026-08-14 report, Issue 3).
+const PROPERTY_STREAMS: &[&str] = &[
+    "/\u{1}CompObj",
+    "/\u{5}SummaryInformation",
+    "/\u{5}DocumentSummaryInformation",
+];
+
 /// Walk the source CFB for VBA-related storage subtrees and capture
 /// every storage + stream within them. Returns an empty bundle if the
 /// file isn't a valid CFB or has no VBA storages — never errors,
@@ -162,6 +175,23 @@ pub fn extract(bytes: &[u8]) -> PreservedXlsData {
                     data: Some(data),
                 });
             }
+        }
+    }
+    for path in PROPERTY_STREAMS {
+        if !cfb.exists(path) || cfb.is_storage(path) {
+            continue;
+        }
+        let mut data = Vec::new();
+        let ok = cfb
+            .open_stream(path)
+            .and_then(|mut s| s.read_to_end(&mut data).map(|_| ()))
+            .is_ok();
+        if ok {
+            entries.push(PreservedEntry {
+                path: PathBuf::from(path),
+                is_storage: false,
+                data: Some(data),
+            });
         }
     }
     PreservedXlsData { entries, workbook_substreams }

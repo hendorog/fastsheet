@@ -1727,28 +1727,35 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 /// Given formula text and an index pointing at the first char after
-/// `User(`, try to identify an `_xlfn.FOO` first argument. Returns
+/// `User(`, try to identify the function-name head. Returns
 /// (bare_function_name, resume_index) on success. resume_index points
 /// at the first character of the remaining args, with the leading
 /// comma already consumed — or at the position just past the close of
-/// the User() call if _xlfn.FOO has no args.
+/// the User() call if the head has no args.
+///
+/// The head is any identifier (dots allowed — defined names can
+/// contain them, and future functions like `_xlfn.CEILING.MATH` need
+/// them); `_xlfn.` and the nested `_xlfn._xlws.` prefixes are
+/// stripped. Accepting a bare identifier is per [MS-XLS]: PtgFuncVar
+/// with iftab=255 ("User") means the FIRST ARGUMENT is the function,
+/// so `User(MYUNIQUE, …)` — how a PtgName-routed VBA-UDF call
+/// renders — collapses to `MYUNIQUE(…)`.
 fn parse_xlfn_head(formula: &str, start: usize) -> Option<(String, usize)> {
     let bytes = formula.as_bytes();
-    // Expect `_xlfn.`
-    let prefix = "_xlfn.";
-    if !formula[start..].starts_with(prefix) {
-        return None;
-    }
-    let name_start = start + prefix.len();
-    // Read identifier chars for the function name.
-    let mut j = name_start;
-    while j < bytes.len() && is_ident_name_char(bytes[j]) {
+    let mut j = start;
+    while j < bytes.len() && (is_ident_name_char(bytes[j]) || bytes[j] == b'.') {
         j += 1;
     }
-    if j == name_start {
+    if j == start {
         return None;
     }
-    let fn_name = formula[name_start..j].to_string();
+    let mut head = &formula[start..j];
+    head = head.strip_prefix("_xlfn.").unwrap_or(head);
+    head = head.strip_prefix("_xlws.").unwrap_or(head);
+    if head.is_empty() {
+        return None;
+    }
+    let fn_name = head.to_string();
     // Three shapes to handle:
     //   User(_xlfn.FOO,<args>)           ← most common
     //   User(_xlfn.FOO(<args>))          ← also seen

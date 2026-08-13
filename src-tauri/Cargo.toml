@@ -44,6 +44,11 @@ name = "trace_probe"
 path = "examples/trace_probe.rs"
 required-features = ["dev-bins"]
 
+[[example]]
+name = "biff_surgery"
+path = "examples/biff_surgery.rs"
+required-features = ["dev-bins"]
+
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.

@@ -31,6 +31,7 @@ const R_BOUNDSHEET8: u16 = 0x0085;
 const R_DIMENSIONS: u16 = 0x0200;
 const R_WINDOW2: u16 = 0x023E;
 const R_PANE: u16 = 0x0041;
+const R_SELECTION: u16 = 0x001D;
 const R_MERGECELLS: u16 = 0x00E5;
 const R_CONTINUE: u16 = 0x003C;
 const R_CODEPAGE: u16 = 0x0042;
@@ -66,6 +67,7 @@ const R_GRIDSET: u16 = 0x0082;
 const R_GUTS: u16 = 0x0080;
 const R_DEFAULTROWHEIGHT: u16 = 0x0225;
 const R_WSBOOL: u16 = 0x0081;
+const R_DEFCOLWIDTH: u16 = 0x0055;
 const R_BLANK: u16 = 0x0201;
 const R_NUMBER: u16 = 0x0203;
 const R_LABELSST: u16 = 0x00FD;
@@ -380,11 +382,18 @@ fn build_dimensions(rw_mic: u32, rw_mac: u32, col_mic: u16, col_mac: u16) -> Vec
 /// fFrozenNoSplit (bit 8, 0x0100) — Excel pairs the two; without
 /// fFrozenNoSplit the sheet renders as a draggable split instead of
 /// frozen titles even with PANE present.
-fn build_window2(frozen_rows: i32, frozen_columns: i32) -> Vec<u8> {
+fn build_window2(frozen_rows: i32, frozen_columns: i32, is_active: bool) -> Vec<u8> {
     let mut body = Vec::with_capacity(18);
     // Base: fDspGrid=1, fDspRwCol=1, fDspZeros=1, fDefaultHdr=1,
-    //       fDspGuts=1, fSelected=1, fPaged=1.
-    let mut grbit: u16 = 0x06B6;
+    //       fDspGuts=1.
+    let mut grbit: u16 = 0x00B6;
+    // fSelected (0x0200) + fPaged (0x0400) mark the ACTIVE sheet
+    // only. Setting them on every sheet (the old behavior) made
+    // Excel open the workbook with all sheets selected — "Group"
+    // mode in the title bar, where an edit hits every sheet at once.
+    if is_active {
+        grbit |= 0x0600;
+    }
     if frozen_rows > 0 || frozen_columns > 0 {
         grbit |= 0x0008; // fFrozen
         grbit |= 0x0100; // fFrozenNoSplit
@@ -409,16 +418,79 @@ fn build_window2(frozen_rows: i32, frozen_columns: i32) -> Vec<u8> {
 ///             only rows are frozen, no vertical split exists so the
 ///             data area is the lower-left pane (pnnAct=2). Otherwise
 ///             the data area is the lower-right (pnnAct=0).
+/// ifnt field of chart records that reference the globals FONT table:
+/// FONTX (0x1026, body = a single u16 ifnt) and FBI (0x1060, ifnt at
+/// body offset 8). [MS-XLS] 2.4.126 / 2.4.111.
+fn zone_record_ifnt(opcode: u16, data: &[u8]) -> Option<u16> {
+    match opcode {
+        0x1026 if data.len() >= 2 => Some(u16::from_le_bytes([data[0], data[1]])),
+        0x1060 if data.len() >= 10 => Some(u16::from_le_bytes([data[8], data[9]])),
+        _ => None,
+    }
+}
+
+/// Emit a passthrough record, rewriting chart font references through
+/// the source→ours ifnt remap built in build_workbook_stream.
+fn write_zone_record(
+    w: &mut BiffWriter,
+    rec: &crate::xls_preserve::RawRecord,
+    font_remap: &HashMap<u16, u16>,
+) {
+    if let Some(ifnt) = zone_record_ifnt(rec.opcode, &rec.data) {
+        if let Some(&new_ifnt) = font_remap.get(&ifnt) {
+            let mut d = rec.data.clone();
+            let off = if rec.opcode == 0x1026 { 0 } else { 8 };
+            d[off..off + 2].copy_from_slice(&new_ifnt.to_le_bytes());
+            w.write_record(rec.opcode, &d);
+            return;
+        }
+    }
+    w.write_record(rec.opcode, &rec.data);
+}
+
+/// Panes needing a SELECTION record, in Excel's emission order:
+/// top-left (3) first, then top-right (1) / bottom-left (2) as the
+/// freeze axes require, with the data-area pane last (matching
+/// PANE.pnnAcc so the active selection lands in the scrollable area).
+fn selection_panes(frozen_rows: i32, frozen_columns: i32) -> Vec<u8> {
+    match (frozen_rows > 0, frozen_columns > 0) {
+        (false, false) => vec![3],
+        (true, false) => vec![3, 2],
+        (false, true) => vec![3, 1],
+        (true, true) => vec![3, 1, 2, 0],
+    }
+}
+
+/// SELECTION — [MS-XLS] 2.4.248. pnn(1) + rwAct(2) + colAct(2) +
+/// irefAct(2) + cref(2) + one RefU (rwFirst u16, rwLast u16,
+/// colFirst u8, colLast u8): a default A1 selection in the pane.
+fn build_selection(pnn: u8) -> Vec<u8> {
+    let mut body = Vec::with_capacity(15);
+    body.put_u8(pnn);
+    body.put_u16(0); // rwAct
+    body.put_u16(0); // colAct
+    body.put_u16(0); // irefAct
+    body.put_u16(1); // cref
+    body.put_u16(0); // rwFirst
+    body.put_u16(0); // rwLast
+    body.put_u8(0);  // colFirst
+    body.put_u8(0);  // colLast
+    body
+}
+
 fn build_pane(frozen_rows: i32, frozen_columns: i32) -> Vec<u8> {
     let cols = frozen_columns.max(0).min(u16::MAX as i32) as u16;
     let rows = frozen_rows.max(0).min(u16::MAX as i32) as u16;
-    let pnn_act: u8 = if cols == 0 { 2 } else { 0 };
-    let mut body = Vec::with_capacity(9);
+    // pnnAcc is a 2-byte field — the record must be exactly 10 bytes.
+    // A 1-byte emit here produced files Apache POI rejects outright
+    // ("Not enough data (1) to read requested (2) bytes" in PaneRecord).
+    let pnn_acc: u16 = if cols == 0 { 2 } else { 0 };
+    let mut body = Vec::with_capacity(10);
     body.put_u16(cols);  // x
     body.put_u16(rows);  // y
     body.put_u16(rows);  // rwTop
     body.put_u16(cols);  // colLeft
-    body.put_u8(pnn_act);
+    body.put_u16(pnn_acc);
     body
 }
 
@@ -1533,6 +1605,11 @@ struct XtiTable {
     entries: Vec<(u16, u16)>,
     /// sheet_idx → ixti for single-sheet refs (the common case).
     single_sheet_lookup: std::collections::HashMap<u32, u16>,
+    /// ixti of the add-in supbook entry (iSupBook=1, itabs=0xFFFE),
+    /// allocated once when the workbook calls any ATP function.
+    /// PtgNameX must reference this entry — POI resolves the ptg
+    /// through EXTERNSHEET → SUPBOOK and NPEs on a dangling ixti.
+    addin_entry: Option<u16>,
 }
 
 impl XtiTable {
@@ -1547,6 +1624,15 @@ impl XtiTable {
     }
     fn lookup_single(&self, sheet_idx: u32) -> Option<u16> {
         self.single_sheet_lookup.get(&sheet_idx).copied()
+    }
+    fn addin_ixti(&mut self) -> u16 {
+        if let Some(i) = self.addin_entry {
+            return i;
+        }
+        let i = self.entries.len() as u16;
+        self.entries.push((0xFFFE, 0xFFFE));
+        self.addin_entry = Some(i);
+        i
     }
 }
 
@@ -1700,25 +1786,45 @@ fn build_defined_name_table(
     table
 }
 
-/// EXTERNNAME (Add-in / Analysis ToolPak / _xlfn function name) table.
+/// Routing table for function names with no BIFF8 iftab. Two routes,
+/// mirroring what Excel itself writes ([MS-XLS] + observed output —
+/// 2026-08-14 corruption report):
 ///
-/// Functions whose name doesn't appear in the BIFF FTAB (the MY* UDFs
-/// from the vendored IronCalc patch — MyUnique, MySort, MySortBlank,
-/// MyTranspose, MyFilter — plus post-2007 functions like IFNA, IFS,
-/// SWITCH, XOR, TEXTJOIN, XLOOKUP, CONCAT) get routed via PtgNameX
-/// pointing at an EXTERNNAME record. The encoder emits PtgFuncVar
-/// with iftab=255 ("User"); calamine renders `User([PtgNameX], args…)`,
-/// xls_load's patch_ptg_name_x rewrites `[PtgNameX]` → `_xlfn.<name>`,
-/// and unwrap_user_xlfn strips the `User(_xlfn.<name>, …)` wrapper to
-/// produce `<name>(…)`. IronCalc's parser then maps that to the
-/// matching Function variant.
+///  - **Add-in route** (genuine Analysis ToolPak functions — CONVERT,
+///    MROUND, …): PtgNameX pointing at an EXTERNNAME record, wrapped
+///    in PtgFuncVar(iftab=255 "User"). On reload calamine renders
+///    `User([PtgNameX], args…)`; xls_load's patch_ptg_name_x rewrites
+///    `[PtgNameX]` → `_xlfn.<name>` and unwrap_user_xlfn collapses the
+///    wrapper to `<name>(…)`.
+///  - **NAME route** (everything else): a hidden internal NAME record
+///    referenced by PtgName, wrapped in the same PtgFuncVar(255).
+///    Post-2003 builtins get the `_xlfn.<name>` future-function form
+///    (Excel maps it back to the modern builtin); other names (the MY*
+///    UDFs, genuine VBA UDFs) emit under their own name with
+///    fFunc|fProc set, which binds to a same-workbook VBA function
+///    when the VBA project is present. Routing these through
+///    EXTERNNAME instead pointed Excel at a nonexistent add-in:
+///    `#NAME?` on every affected cell even with the VBA intact.
 #[derive(Default)]
 struct ExternNameTable {
-    /// Names in registration order — PtgNameX nameindex is 1-based
-    /// into this list.
+    /// Add-in-route names in registration order — PtgNameX nameindex
+    /// is 1-based into this list.
     names: Vec<String>,
     /// lowercase_name → 1-based nameindex.
     lookup: std::collections::HashMap<String, u16>,
+    /// NAME-route entries: (name as emitted in the Lbl record —
+    /// `_xlfn.CONCAT` / `MYUNIQUE` — , is_xlfn). Emitted as Lbl
+    /// records directly after the model's defined names.
+    name_fns: Vec<(String, bool)>,
+    /// canonical lowercase function name → 0-based index into name_fns.
+    name_fn_lookup: std::collections::HashMap<String, usize>,
+    /// Count of model defined names. Lbl records for name_fns follow
+    /// them, so PtgName ilbl = ilbl_base + index + 1 (1-based).
+    ilbl_base: u16,
+    /// EXTERNSHEET xti index of the add-in supbook entry — the ixti
+    /// PtgNameX must carry. Set by build_workbook_stream when `names`
+    /// is non-empty.
+    addin_ixti: u16,
 }
 
 impl ExternNameTable {
@@ -1735,24 +1841,44 @@ impl ExternNameTable {
     fn get(&self, name: &str) -> Option<u16> {
         self.lookup.get(&name.to_lowercase()).copied()
     }
+    fn add_name_fn(&mut self, name: &str) {
+        let key = name.to_lowercase();
+        if self.name_fn_lookup.contains_key(&key) {
+            return;
+        }
+        let (emitted, is_xlfn) = match xlfn_route_for_name(name) {
+            Some(x) => (x, true),
+            None => (name.to_string(), false),
+        };
+        self.name_fn_lookup.insert(key, self.name_fns.len());
+        self.name_fns.push((emitted, is_xlfn));
+    }
+    fn name_fn_ilbl(&self, name: &str) -> Option<u16> {
+        let idx = *self.name_fn_lookup.get(&name.to_lowercase())?;
+        Some(self.ilbl_base + idx as u16 + 1)
+    }
 }
 
-/// Walk every parsed formula in the workbook (including each defined
-/// name's parsed Node tree, populated separately) and register an
-/// EXTERNNAME entry for every function whose name isn't in the
-/// BIFF FTAB. Names like "MYUNIQUE" appear once in the table even
-/// if used by hundreds of cells — PtgNameX nameindex points to the
-/// shared entry.
+/// Walk every parsed formula in the workbook and register each
+/// function whose name isn't in the BIFF FTAB: ATP functions on the
+/// add-in route, everything else on the NAME route. Names like
+/// "MYUNIQUE" appear once in the table even if used by hundreds of
+/// cells.
 fn build_extern_name_table(model: &ironcalc::base::Model) -> ExternNameTable {
     use ironcalc::base::expressions::parser::Node;
     let lang = ironcalc::base::language::get_default_language();
     let mut table = ExternNameTable::default();
+    table.ilbl_base = model.workbook.defined_names.len() as u16;
     fn walk(node: &Node, lang: &ironcalc::base::language::Language, table: &mut ExternNameTable) {
         match node {
             Node::FunctionKind { kind, args } => {
                 let name = kind.to_localized_name(lang);
                 if ftab_iftab_for_name(&name).is_none() {
-                    table.lookup_or_add(&name);
+                    if is_atp_function(&name) {
+                        table.lookup_or_add(&name);
+                    } else {
+                        table.add_name_fn(&name);
+                    }
                 }
                 for a in args {
                     walk(a, lang, table);
@@ -1792,7 +1918,7 @@ fn build_externname_record(name: &str) -> Vec<u8> {
     let cch = chars.len().min(255) as u8;
     let mut body = Vec::with_capacity(8 + chars.len() * 2 + 4);
     body.put_u16(0x0000); // options
-    body.put_u16(0x0001); // one — BIFF8 marker for built-in/add-in
+    body.put_u16(0x0000); // reserved — Excel writes zeros here, not 1
     body.put_u16(0x0000); // itab
     body.put_u8(cch);
     body.put_u8(if high_byte { 0x01 } else { 0x00 });
@@ -1805,6 +1931,38 @@ fn build_externname_record(name: &str) -> Vec<u8> {
     body.put_u16(0x0002); // cce
     body.put_u8(0x1C);    // PtgErr
     body.put_u8(0x17);    // #VALUE!
+    body
+}
+
+/// Build the body of one function-name Lbl (NAME) record, matching
+/// Excel's own encoding byte-for-byte (dumped from an Excel-authored
+/// file, 2026-08-14):
+///  - future function (`_xlfn.*`): flags 0x038B (fHidden|fFunc|fProc,
+///    fGrp=14 "User Defined"), rgce = PtgErr #NAME? (0x1C 0x1D)
+///  - VBA UDF / other: flags 0x000E (fFunc|fOB|fProc), empty rgce
+fn build_fn_lbl_record(name: &str, is_xlfn: bool) -> Vec<u8> {
+    let chars: Vec<u16> = name.encode_utf16().collect();
+    let high_byte = chars.iter().any(|&c| c > 0xFF);
+    let cch = chars.len().min(255) as u8;
+    let rgce: &[u8] = if is_xlfn { &[0x1C, 0x1D] } else { &[] };
+    let mut body = Vec::with_capacity(14 + chars.len() * 2 + rgce.len());
+    body.put_u16(if is_xlfn { 0x038B } else { 0x000E }); // grbit
+    body.put_u8(0);  // chKey
+    body.put_u8(cch);
+    body.put_u16(rgce.len() as u16); // cce
+    body.put_u16(0); // ixals (must be 0 in BIFF8)
+    body.put_u16(0); // itab — global scope
+    body.put_u8(0); // cchCustMenu
+    body.put_u8(0); // cchDescription
+    body.put_u8(0); // cchHelpTopic
+    body.put_u8(0); // cchStatusText
+    body.put_u8(if high_byte { 0x01 } else { 0x00 });
+    if high_byte {
+        for c in chars.iter().take(cch as usize) { body.put_u16(*c); }
+    } else {
+        for c in chars.iter().take(cch as usize) { body.put_u8(*c as u8); }
+    }
+    body.extend_from_slice(rgce);
     body
 }
 
@@ -2167,15 +2325,31 @@ fn emit_function_call_named(
         rgce.put_u16(iftab);
         return Ok(());
     }
-    // EXTERNNAME / _xlfn route. PtgNameX appears as the first arg
-    // (the "function name"); calamine's PtgFuncVar with iftab=255
-    // ("User") renders the call as `User([PtgNameX], arg1, ...)`.
-    // xls_load.rs's patch_ptg_name_x + unwrap_user_xlfn collapse
-    // that back to `<name>(arg1, ...)` on reload.
-    let nameindex = extern_names.get(func_name).ok_or(())?;
     if args.len().saturating_add(1) > 255 { return Err(()); }
+    // NAME route: future functions (_xlfn.*) and VBA UDFs reference an
+    // internal NAME record via PtgName; the Lbl records are emitted
+    // right after the model's defined names, so ilbl continues their
+    // numbering. Same PtgFuncVar(255) wrapper as the add-in route.
+    if let Some(ilbl) = extern_names.name_fn_ilbl(func_name) {
+        rgce.put_u8(0x23); // PtgName (reference class)
+        rgce.put_u16(ilbl);
+        rgce.put_u16(0);   // reserved (calamine reads ilbl as u32 LE)
+        for arg in args {
+            encode_node(rgce, arg, sheet_idx, anchor, xti, defined_names, extern_names)?;
+        }
+        rgce.put_u8(0x22); // PtgFuncVar
+        rgce.put_u8((args.len() + 1) as u8); // argc = args + 1 for the name
+        rgce.put_u16(0xFF); // iftab = 255 ("User": first arg is the fn)
+        return Ok(());
+    }
+    // Add-in route (genuine ATP functions). PtgNameX appears as the
+    // first arg (the "function name"); calamine's PtgFuncVar with
+    // iftab=255 ("User") renders the call as `User([PtgNameX], arg1,
+    // ...)`. xls_load.rs's patch_ptg_name_x + unwrap_user_xlfn
+    // collapse that back to `<name>(arg1, ...)` on reload.
+    let nameindex = extern_names.get(func_name).ok_or(())?;
     rgce.put_u8(0x39);    // PtgNameX (reference class)
-    rgce.put_u16(0);      // ixti — no separate Add-in supbook in this writer
+    rgce.put_u16(extern_names.addin_ixti); // xti entry of the add-in supbook
     rgce.put_u16(nameindex);
     rgce.put_u16(0);      // reserved
     for arg in args {
@@ -2250,22 +2424,24 @@ fn emit_ptg_area3d(
 }
 
 /// Map a BIFF function name to its FTAB iftab index. Names are
-/// uppercased ASCII (Excel's canonical form). Indices match the
-/// authoritative FTAB used by calamine (the read pipeline) — see
-/// `calamine-0.26.1/src/utils.rs::FTAB`. xls_biff.rs's reader has
-/// some wrong entries in the 270..485 range; that's a separate
-/// cleanup. For the writer, calamine is the read-back consumer so
-/// we align with its table — otherwise iftab=365 (which the spec
-/// doesn't actually call IFERROR; calamine reads it as VARPA)
-/// would silently translate IFERROR formulas into VARPA on round-
-/// trip. Reported by user GUI test on a real-world template.
+/// uppercased ASCII (Excel's canonical form). The table is the
+/// complete calamine FTAB (`calamine-0.26.1/src/utils.rs::FTAB`,
+/// whose indices match [MS-XLS] 2.5.198.17) capped at index 368
+/// (BAHTTEXT) — the last function Excel 2003 knows. This cap is
+/// load-bearing three ways:
 ///
-/// Functions added after Excel 2007 (XLOOKUP, TEXTJOIN, IFNA, IFS,
-/// SWITCH, etc.) don't have FTAB entries and would need PtgNameX +
-/// ExternName routing through `_xlfn.<name>` — deferred to a future
-/// commit. IFERROR is at FTAB[481] per calamine, even though it's
-/// post-2007; some files use the _xlfn route too, which we don't
-/// emit yet.
+///  1. Completeness: the previous hand-curated ~120-name subset sent
+///     genuine builtins (SMALL, LARGE, …) down the add-in EXTERNNAME
+///     route, which Excel renders as `#NAME?` calls to a nonexistent
+///     add-in (2026-08-14 corruption report, Issue 2).
+///  2. The 384..=476 range is the Analysis ToolPak set — Excel never
+///     writes those as iftabs in .xls; it uses add-in EXTERNNAME
+///     references. See `is_atp_function`.
+///  3. The 480..=484 tail (IFERROR, COUNTIFS, SUMIFS, AVERAGEIF,
+///     AVERAGEIFS) are Excel-2007 functions that Excel encodes as
+///     `_xlfn.*` future-function NAMEs in BIFF8, not iftabs. Emitting
+///     iftab 480+ round-trips through calamine but is not portable —
+///     route them via the _xlfn path instead (`xlfn_route_for_name`).
 fn ftab_iftab_for_name(name: &str) -> Option<u16> {
     Some(match name {
         "COUNT" => 0,
@@ -2279,6 +2455,10 @@ fn ftab_iftab_for_name(name: &str) -> Option<u16> {
         "ROW" => 8,
         "COLUMN" => 9,
         "NA" => 10,
+        "NPV" => 11,
+        "STDEV" => 12,
+        "DOLLAR" => 13,
+        "FIXED" => 14,
         "SIN" => 15,
         "COS" => 16,
         "TAN" => 17,
@@ -2304,7 +2484,29 @@ fn ftab_iftab_for_name(name: &str) -> Option<u16> {
         "OR" => 37,
         "NOT" => 38,
         "MOD" => 39,
+        "DCOUNT" => 40,
+        "DSUM" => 41,
+        "DAVERAGE" => 42,
+        "DMIN" => 43,
+        "DMAX" => 44,
+        "DSTDEV" => 45,
+        "VAR" => 46,
+        "DVAR" => 47,
         "TEXT" => 48,
+        "LINEST" => 49,
+        "TREND" => 50,
+        "LOGEST" => 51,
+        "GROWTH" => 52,
+        "GOTO" => 53,
+        "HALT" => 54,
+        "RETURN" => 55,
+        "PV" => 56,
+        "FV" => 57,
+        "NPER" => 58,
+        "PMT" => 59,
+        "RATE" => 60,
+        "MIRR" => 61,
+        "IRR" => 62,
         "RAND" => 63,
         "MATCH" => 64,
         "DATE" => 65,
@@ -2321,16 +2523,38 @@ fn ftab_iftab_for_name(name: &str) -> Option<u16> {
         "ROWS" => 76,
         "COLUMNS" => 77,
         "OFFSET" => 78,
+        "ABSREF" => 79,
+        "RELREF" => 80,
+        "ARGUMENT" => 81,
         "SEARCH" => 82,
+        "TRANSPOSE" => 83,
+        "ERROR" => 84,
+        "STEP" => 85,
         "TYPE" => 86,
+        "ECHO" => 87,
+        "SET.NAME" => 88,
+        "CALLER" => 89,
+        "DEREF" => 90,
+        "WINDOWS" => 91,
+        "SERIES" => 92,
+        "DOCUMENTS" => 93,
+        "ACTIVE.CELL" => 94,
+        "SELECTION" => 95,
+        "RESULT" => 96,
         "ATAN2" => 97,
         "ASIN" => 98,
         "ACOS" => 99,
         "CHOOSE" => 100,
         "HLOOKUP" => 101,
         "VLOOKUP" => 102,
+        "LINKS" => 103,
+        "INPUT" => 104,
         "ISREF" => 105,
+        "GET.FORMULA" => 106,
+        "GET.NAME" => 107,
+        "SET.VALUE" => 108,
         "LOG" => 109,
+        "EXEC" => 110,
         "CHAR" => 111,
         "LOWER" => 112,
         "UPPER" => 113,
@@ -2342,6 +2566,8 @@ fn ftab_iftab_for_name(name: &str) -> Option<u16> {
         "REPLACE" => 119,
         "SUBSTITUTE" => 120,
         "CODE" => 121,
+        "NAMES" => 122,
+        "DIRECTORY" => 123,
         "FIND" => 124,
         "CELL" => 125,
         "ISERR" => 126,
@@ -2350,19 +2576,97 @@ fn ftab_iftab_for_name(name: &str) -> Option<u16> {
         "ISBLANK" => 129,
         "T" => 130,
         "N" => 131,
+        "FOPEN" => 132,
+        "FCLOSE" => 133,
+        "FSIZE" => 134,
+        "FREADLN" => 135,
+        "FREAD" => 136,
+        "FWRITELN" => 137,
+        "FWRITE" => 138,
+        "FPOS" => 139,
         "DATEVALUE" => 140,
         "TIMEVALUE" => 141,
+        "SLN" => 142,
+        "SYD" => 143,
+        "DDB" => 144,
+        "GET.DEF" => 145,
+        "REFTEXT" => 146,
+        "TEXTREF" => 147,
         "INDIRECT" => 148,
+        "REGISTER" => 149,
+        "CALL" => 150,
+        "ADD.BAR" => 151,
+        "ADD.MENU" => 152,
+        "ADD.COMMAND" => 153,
+        "ENABLE.COMMAND" => 154,
+        "CHECK.COMMAND" => 155,
+        "RENAME.COMMAND" => 156,
+        "SHOW.BAR" => 157,
+        "DELETE.MENU" => 158,
+        "DELETE.COMMAND" => 159,
+        "GET.CHART.ITEM" => 160,
+        "DIALOG.BOX" => 161,
+        "CLEAN" => 162,
+        "MDETERM" => 163,
+        "MINVERSE" => 164,
+        "MMULT" => 165,
+        "FILES" => 166,
+        "IPMT" => 167,
+        "PPMT" => 168,
         "COUNTA" => 169,
+        "CANCEL.KEY" => 170,
+        "FOR" => 171,
+        "WHILE" => 172,
+        "BREAK" => 173,
+        "NEXT" => 174,
+        "INITIATE" => 175,
+        "REQUEST" => 176,
+        "POKE" => 177,
+        "EXECUTE" => 178,
+        "TERMINATE" => 179,
+        "RESTART" => 180,
+        "HELP" => 181,
+        "GET.BAR" => 182,
+        "PRODUCT" => 183,
         "FACT" => 184,
+        "GET.CELL" => 185,
+        "GET.WORKSPACE" => 186,
+        "GET.WINDOW" => 187,
+        "GET.DOCUMENT" => 188,
+        "DPRODUCT" => 189,
         "ISNONTEXT" => 190,
+        "GET.NOTE" => 191,
+        "NOTE" => 192,
         "STDEVP" => 193,
         "VARP" => 194,
+        "DSTDEVP" => 195,
+        "DVARP" => 196,
         "TRUNC" => 197,
+        "ISLOGICAL" => 198,
+        "DCOUNTA" => 199,
+        "DELETE.BAR" => 200,
+        "UNREGISTER" => 201,
+        "USDOLLAR" => 204,
+        "FINDB" => 205,
+        "SEARCHB" => 206,
+        "REPLACEB" => 207,
+        "LEFTB" => 208,
+        "RIGHTB" => 209,
+        "MIDB" => 210,
+        "LENB" => 211,
         "ROUNDUP" => 212,
         "ROUNDDOWN" => 213,
+        "ASC" => 214,
+        "DBCS" => 215,
         "RANK" => 216,
+        "ADDRESS" => 219,
+        "DAYS360" => 220,
         "TODAY" => 221,
+        "VDB" => 222,
+        "ELSE" => 223,
+        "ELSE.IF" => 224,
+        "END.IF" => 225,
+        "FOR.CELL" => 226,
         "MEDIAN" => 227,
         "SUMPRODUCT" => 228,
         "SINH" => 229,
@@ -2371,38 +2675,272 @@ fn ftab_iftab_for_name(name: &str) -> Option<u16> {
         "ASINH" => 232,
         "ACOSH" => 233,
         "ATANH" => 234,
+        "DGET" => 235,
+        "CREATE.OBJECT" => 236,
+        "VOLATILE" => 237,
+        "LAST.ERROR" => 238,
+        "CUSTOM.UNDO" => 239,
+        "CUSTOM.REPEAT" => 240,
+        "FORMULA.CONVERT" => 241,
+        "GET.LINK.INFO" => 242,
+        "TEXT.BOX" => 243,
         "INFO" => 244,
+        "GROUP" => 245,
+        "GET.OBJECT" => 246,
+        "DB" => 247,
+        "PAUSE" => 248,
+        "RESUME" => 251,
+        "FREQUENCY" => 252,
+        "ADD.TOOLBAR" => 253,
+        "DELETE.TOOLBAR" => 254,
+        "RESET.TOOLBAR" => 256,
+        "EVALUATE" => 257,
+        "GET.TOOLBAR" => 258,
+        "GET.TOOL" => 259,
+        "SPELLING.CHECK" => 260,
         "ERROR.TYPE" => 261,
+        "APP.TITLE" => 262,
+        "WINDOW.TITLE" => 263,
+        "SAVE.TOOLBAR" => 264,
+        "ENABLE.TOOL" => 265,
+        "PRESS.TOOL" => 266,
+        "REGISTER.ID" => 267,
+        "GET.WORKBOOK" => 268,
+        "AVEDEV" => 269,
+        "BETADIST" => 270,
         "GAMMALN" => 271,
+        "BETAINV" => 272,
+        "BINOMDIST" => 273,
+        "CHIDIST" => 274,
+        "CHIINV" => 275,
+        "COMBIN" => 276,
+        "CONFIDENCE" => 277,
+        "CRITBINOM" => 278,
         "EVEN" => 279,
+        "EXPONDIST" => 280,
+        "FDIST" => 281,
+        "FINV" => 282,
+        "FISHER" => 283,
+        "FISHERINV" => 284,
         "FLOOR" => 285,
+        "GAMMADIST" => 286,
+        "GAMMAINV" => 287,
         "CEILING" => 288,
+        "HYPGEOMDIST" => 289,
+        "LOGNORMDIST" => 290,
+        "LOGINV" => 291,
+        "NEGBINOMDIST" => 292,
+        "NORMDIST" => 293,
+        "NORMSDIST" => 294,
+        "NORMINV" => 295,
+        "NORMSINV" => 296,
+        "STANDARDIZE" => 297,
         "ODD" => 298,
+        "PERMUT" => 299,
+        "POISSON" => 300,
+        "TDIST" => 301,
+        "WEIBULL" => 302,
+        "SUMXMY2" => 303,
+        "SUMX2MY2" => 304,
+        "SUMX2PY2" => 305,
+        "CHITEST" => 306,
+        "CORREL" => 307,
+        "COVAR" => 308,
+        "FORECAST" => 309,
+        "FTEST" => 310,
+        "INTERCEPT" => 311,
+        "PEARSON" => 312,
+        "RSQ" => 313,
+        "STEYX" => 314,
+        "SLOPE" => 315,
+        "TTEST" => 316,
+        "PROB" => 317,
+        "DEVSQ" => 318,
+        "GEOMEAN" => 319,
+        "HARMEAN" => 320,
+        "SUMSQ" => 321,
+        "KURT" => 322,
+        "SKEW" => 323,
+        "ZTEST" => 324,
+        "LARGE" => 325,
+        "SMALL" => 326,
+        "QUARTILE" => 327,
+        "PERCENTILE" => 328,
+        "PERCENTRANK" => 329,
+        "MODE" => 330,
+        "TRIMMEAN" => 331,
+        "TINV" => 332,
+        "MOVIE.COMMAND" => 334,
+        "GET.MOVIE" => 335,
         "CONCATENATE" => 336,
         "POWER" => 337,
+        "PIVOT.ADD.DATA" => 338,
+        "GET.PIVOT.TABLE" => 339,
+        "GET.PIVOT.FIELD" => 340,
+        "GET.PIVOT.ITEM" => 341,
         "RADIANS" => 342,
         "DEGREES" => 343,
         "SUBTOTAL" => 344,
         "SUMIF" => 345,
         "COUNTIF" => 346,
         "COUNTBLANK" => 347,
+        "SCENARIO.GET" => 348,
+        "OPTIONS.LISTS.GET" => 349,
+        "ISPMT" => 350,
+        "DATEDIF" => 351,
+        "DATESTRING" => 352,
+        "NUMBERSTRING" => 353,
+        "ROMAN" => 354,
+        "OPEN.DIALOG" => 355,
+        "SAVE.DIALOG" => 356,
+        "VIEW.GET" => 357,
+        "GETPIVOTDATA" => 358,
         "HYPERLINK" => 359,
+        "PHONETIC" => 360,
         "AVERAGEA" => 361,
         "MAXA" => 362,
         "MINA" => 363,
+        "STDEVPA" => 364,
         "VARPA" => 365,
+        "STDEVA" => 366,
         "VARA" => 367,
-        // Note: there's a commented-out FTAB entry at calamine
-        // utils.rs:545 ("SHEETJS"), so every index ≥ 469 is off-by-1
-        // from a naive "line - 76" count. These indices are
-        // calamine-validated.
-        "IFERROR" => 480,
-        "COUNTIFS" => 481,
-        "SUMIFS" => 482,
-        "AVERAGEIF" => 483,
-        "AVERAGEIFS" => 484,
+        "BAHTTEXT" => 368,
         _ => return None,
     })
+}
+
+/// Classic Analysis ToolPak function set — calamine FTAB indices
+/// 384..=476. In BIFF8 Excel encodes calls to these as add-in
+/// EXTERNNAME references (PtgNameX), never as iftab builtins;
+/// Excel 2003 has no iftab for them and POI follows Excel.
+fn is_atp_function(name: &str) -> bool {
+    matches!(name,
+        "HEX2BIN" | "HEX2DEC" | "HEX2OCT" | "DEC2BIN" | "DEC2HEX" | "DEC2OCT" |
+        "OCT2BIN" | "OCT2HEX" | "OCT2DEC" | "BIN2DEC" | "BIN2OCT" | "BIN2HEX" |
+        "IMSUB" | "IMDIV" | "IMPOWER" | "IMABS" | "IMSQRT" | "IMLN" |
+        "IMLOG2" | "IMLOG10" | "IMSIN" | "IMCOS" | "IMEXP" | "IMARGUMENT" |
+        "IMCONJUGATE" | "IMAGINARY" | "IMREAL" | "COMPLEX" | "IMSUM" | "IMPRODUCT" |
+        "SERIESSUM" | "FACTDOUBLE" | "SQRTPI" | "QUOTIENT" | "DELTA" | "GESTEP" |
+        "ISEVEN" | "ISODD" | "MROUND" | "ERF" | "ERFC" | "BESSELJ" |
+        "BESSELK" | "BESSELY" | "BESSELI" | "XIRR" | "XNPV" | "PRICEMAT" |
+        "YIELDMAT" | "INTRATE" | "RECEIVED" | "DISC" | "PRICEDISC" | "YIELDDISC" |
+        "TBILLEQ" | "TBILLPRICE" | "TBILLYIELD" | "PRICE" | "YIELD" | "DOLLARDE" |
+        "DOLLARFR" | "NOMINAL" | "EFFECT" | "CUMPRINC" | "CUMIPMT" | "EDATE" |
+        "EOMONTH" | "YEARFRAC" | "COUPDAYBS" | "COUPDAYS" | "COUPDAYSNC" | "COUPNCD" |
+        "COUPNUM" | "COUPPCD" | "DURATION" | "MDURATION" | "ODDLPRICE" | "ODDLYIELD" |
+        "ODDFPRICE" | "ODDFYIELD" | "RANDBETWEEN" | "WEEKNUM" | "AMORDEGRC" | "AMORLINC" |
+        "CONVERT" | "ACCRINT" | "ACCRINTM" | "WORKDAY" | "NETWORKDAYS" | "GCD" |
+        "MULTINOMIAL" | "LCM" | "FVSCHEDULE")
+}
+
+/// Functions added to Excel after 2003 with no BIFF8 iftab. Excel
+/// encodes calls to these in .xls as future functions: a hidden NAME
+/// record `_xlfn.<name>` referenced by PtgName, wrapped in
+/// PtgFuncVar(iftab=255). Excel maps `_xlfn.*` back to the modern
+/// builtin on open and displays the call normally. Returns the full
+/// name to emit in the NAME record (the worksheet-scope dynamic-array
+/// functions take an extra `_xlws.` segment, per Excel's own output).
+fn xlfn_route_for_name(name: &str) -> Option<String> {
+    match name {
+        // Dynamic-array worksheet functions: _xlfn._xlws. prefix.
+        "SORT" | "FILTER" => return Some(format!("_xlfn._xlws.{name}")),
+        // Excel 2007
+        "IFERROR" | "COUNTIFS" | "SUMIFS" | "AVERAGEIF" | "AVERAGEIFS"
+        // Excel 2010 dotted statistics + misc
+        | "STDEV.P" | "STDEV.S" | "VAR.P" | "VAR.S" | "MODE.SNGL" | "MODE.MULT"
+        | "PERCENTILE.INC" | "PERCENTILE.EXC" | "QUARTILE.INC" | "QUARTILE.EXC"
+        | "RANK.EQ" | "RANK.AVG" | "NORM.DIST" | "NORM.INV" | "NORM.S.DIST"
+        | "NORM.S.INV" | "LOGNORM.DIST" | "LOGNORM.INV" | "T.DIST" | "T.DIST.2T"
+        | "T.DIST.RT" | "T.INV" | "T.INV.2T" | "T.TEST" | "F.DIST" | "F.DIST.RT"
+        | "F.INV" | "F.INV.RT" | "F.TEST" | "CHISQ.DIST" | "CHISQ.DIST.RT"
+        | "CHISQ.INV" | "CHISQ.INV.RT" | "CHISQ.TEST" | "BINOM.DIST" | "BINOM.INV"
+        | "POISSON.DIST" | "EXPON.DIST" | "GAMMA.DIST" | "GAMMA.INV"
+        | "GAMMALN.PRECISE" | "BETA.DIST" | "BETA.INV" | "HYPGEOM.DIST"
+        | "NEGBINOM.DIST" | "WEIBULL.DIST" | "Z.TEST" | "CONFIDENCE.NORM"
+        | "CONFIDENCE.T" | "COVARIANCE.P" | "COVARIANCE.S" | "AGGREGATE"
+        | "NETWORKDAYS.INTL" | "WORKDAY.INTL" | "CEILING.PRECISE" | "FLOOR.PRECISE"
+        | "ISO.CEILING" | "ERF.PRECISE" | "ERFC.PRECISE"
+        // Excel 2013
+        | "IFNA" | "SHEET" | "SHEETS" | "FORMULATEXT" | "ISFORMULA" | "ISOWEEKNUM"
+        | "DAYS" | "BITAND" | "BITOR" | "BITXOR" | "BITLSHIFT" | "BITRSHIFT"
+        | "ARABIC" | "BASE" | "DECIMAL" | "COMBINA" | "PERMUTATIONA" | "GAMMA"
+        | "GAUSS" | "PHI" | "SKEW.P" | "FLOOR.MATH" | "CEILING.MATH" | "ACOT"
+        | "ACOTH" | "COT" | "COTH" | "CSC" | "CSCH" | "SEC" | "SECH" | "RRI"
+        | "PDURATION" | "UNICHAR" | "UNICODE" | "NUMBERVALUE" | "BINOM.DIST.RANGE"
+        | "FORECAST.LINEAR"
+        // Excel 2016+
+        | "IFS" | "SWITCH" | "XOR" | "CONCAT" | "TEXTJOIN" | "MAXIFS" | "MINIFS"
+        // Excel 2019 / 365
+        | "XLOOKUP" | "XMATCH" | "SEQUENCE" | "RANDARRAY" | "UNIQUE" | "SORTBY"
+        | "LET" | "LAMBDA" | "MAP" | "REDUCE" | "SCAN" | "BYROW" | "BYCOL"
+        | "MAKEARRAY" | "ISOMITTED" | "TEXTBEFORE" | "TEXTAFTER" | "TEXTSPLIT"
+        | "TOROW" | "TOCOL" | "VSTACK" | "HSTACK" | "TAKE" | "DROP"
+        | "CHOOSEROWS" | "CHOOSECOLS" | "WRAPROWS" | "WRAPCOLS" | "EXPAND"
+        | "VALUETOTEXT" | "ARRAYTOTEXT" => Some(format!("_xlfn.{name}")),
+        _ => None,
+    }
+}
+
+/// Walk a preserved rgce and decide whether it can be replayed
+/// verbatim into a rebuilt workbook stream. Any ptg that indexes a
+/// workbook-global table (PtgName → NAME ilbl, PtgNameX → EXTERNSHEET
+/// ixti + EXTERNNAME, PtgRef3d / PtgArea3d / PtgRefErr3d /
+/// PtgAreaErr3d → EXTERNSHEET ixti) makes it non-replayable — the
+/// writer renumbers those tables. Unknown ptgs and ptgs with trailing
+/// extra data (PtgArray, PtgMemArea) also return false; the caller
+/// then falls back to the cached-value placeholder, which was the
+/// behavior for all preserved cells before verbatim replay existed.
+fn rgce_is_self_contained(rgce: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < rgce.len() {
+        let ptg = rgce[i];
+        let size = match ptg {
+            // Table-referencing ptgs — not replayable.
+            0x23 | 0x43 | 0x63 => return false, // PtgName
+            0x39 | 0x59 | 0x79 => return false, // PtgNameX
+            0x3A | 0x5A | 0x7A => return false, // PtgRef3d
+            0x3B | 0x5B | 0x7B => return false, // PtgArea3d
+            0x3C | 0x5C | 0x7C => return false, // PtgRefErr3d
+            0x3D | 0x5D | 0x7D => return false, // PtgAreaErr3d
+            // Binary / unary operators, paren, missing arg.
+            0x03..=0x16 => 1,
+            // PtgStr: cch + grbit + chars.
+            0x17 => {
+                if i + 3 > rgce.len() { return false; }
+                let cch = rgce[i + 1] as usize;
+                let wide = rgce[i + 2] & 1 == 1;
+                3 + cch * if wide { 2 } else { 1 }
+            }
+            // PtgAttr: sub-type in byte 1; AttrChoose carries a jump
+            // table of (nc+1) u16 offsets.
+            0x19 => {
+                if i + 4 > rgce.len() { return false; }
+                if rgce[i + 1] & 0x04 != 0 {
+                    let nc = u16::from_le_bytes([rgce[i + 2], rgce[i + 3]]) as usize;
+                    4 + 2 * (nc + 1)
+                } else {
+                    4
+                }
+            }
+            0x1C | 0x1D => 2,          // PtgErr, PtgBool
+            0x1E => 3,                 // PtgInt
+            0x1F => 9,                 // PtgNum
+            0x21 | 0x41 | 0x61 => 3,   // PtgFunc
+            0x22 | 0x42 | 0x62 => 4,   // PtgFuncVar
+            0x24 | 0x44 | 0x64 => 5,   // PtgRef
+            0x25 | 0x45 | 0x65 => 9,   // PtgArea
+            0x29 | 0x49 | 0x69 => 3,   // PtgMemFunc
+            0x2A | 0x4A | 0x6A => 5,   // PtgRefErr
+            0x2B | 0x4B | 0x6B => 9,   // PtgAreaErr
+            0x2C | 0x4C | 0x6C => 5,   // PtgRefN
+            0x2D | 0x4D | 0x6D => 9,   // PtgAreaN
+            // PtgExp/PtgTbl (shared-formula anchors), PtgArray and
+            // PtgMemArea (trailing extra data), anything unknown.
+            _ => return false,
+        };
+        i += size;
+    }
+    i == rgce.len()
 }
 
 /// Try to encode the parsed formula at index `f`; on any failure (no
@@ -2553,11 +3091,50 @@ fn emit_sheet_cells(
     preserved_rgce: Option<&HashMap<(u32, i32, i32), Vec<u8>>>,
 ) {
     use ironcalc::base::types::Cell;
-    // Collect rows in sorted order.
-    let mut rows: Vec<&i32> = ws.sheet_data.keys().collect();
-    rows.sort();
-    for row in rows {
-        let cols_map = &ws.sheet_data[row];
+    // The cell table is organized in row blocks of up to 32 rows:
+    // the block's ROW records, then the block's cell records
+    // ([MS-XLS] 2.1.7.20.2). Excel expects a ROW record for EVERY
+    // populated row — emitting only the custom-height rows (the old
+    // behavior) made Excel show "File error: data may have been
+    // lost" on open (2026-08-14 report follow-up). Height-only Row
+    // entries with no cells are included too.
+    let mut row_union: std::collections::BTreeSet<i32> = ws.sheet_data.keys().copied().collect();
+    let row_props: HashMap<i32, &ironcalc::base::types::Row> =
+        ws.rows.iter().map(|r| (r.r, r)).collect();
+    row_union.extend(row_props.keys().copied());
+    let all_rows: Vec<i32> = row_union.into_iter().collect();
+    for block in all_rows.chunks(32) {
+        for row in block {
+            // Per-row column bounds (colMic inclusive, colMac
+            // exclusive, 0-based) from the row's own cells.
+            let (col_mic, col_mac) = match ws.sheet_data.get(row) {
+                Some(cols) if !cols.is_empty() => {
+                    let min = cols.keys().min().copied().unwrap_or(1);
+                    let max = cols.keys().max().copied().unwrap_or(1);
+                    (((min - 1).max(0) as u16), (max.max(0) as u16))
+                }
+                _ => (0u16, 0u16),
+            };
+            match row_props.get(row) {
+                Some(r) => w.write_record(R_ROW, &build_row_record(r, col_mic, col_mac)),
+                None => {
+                    // Default-height row: custom_height=false so Excel
+                    // recomputes from the font; 12.75pt matches the
+                    // DEFAULTROWHEIGHT record (255 twips).
+                    let default_row = ironcalc::base::types::Row {
+                        r: *row,
+                        height: 12.75,
+                        custom_format: false,
+                        custom_height: false,
+                        s: 0,
+                        hidden: false,
+                    };
+                    w.write_record(R_ROW, &build_row_record(&default_row, col_mic, col_mac));
+                }
+            }
+        }
+        for row in block {
+            let Some(cols_map) = ws.sheet_data.get(row) else { continue };
         let mut cols: Vec<&i32> = cols_map.keys().collect();
         cols.sort();
         for col in cols {
@@ -2685,9 +3262,17 @@ fn emit_sheet_cells(
                     // couldn't parse), emit those bytes verbatim. The
                     // synthesized placeholder otherwise reloads as
                     // #VALUE! instead of the source's #ERROR!.
+                    // Verbatim replay is only valid when the rgce is
+                    // self-contained: PtgName / PtgNameX / Ptg*3d
+                    // indices point into the SOURCE file's NAME /
+                    // EXTERNSHEET tables, which this writer rebuilds
+                    // with different numbering — replaying those made
+                    // POI throw IndexOutOfBounds on the dangling ixti
+                    // (2026-08-14 report follow-up).
                     let key = (sheet_idx, *row, *col);
                     let rgce = preserved_rgce
                         .and_then(|m| m.get(&key))
+                        .filter(|r| rgce_is_self_contained(r))
                         .cloned()
                         .unwrap_or_else(|| {
                             encode_or_placeholder(parsed_formulas, *f, sheet_idx, anchor, xti, defined_names, extern_names, &cached, None)
@@ -2695,6 +3280,7 @@ fn emit_sheet_cells(
                     w.write_record(R_FORMULA, &build_formula(rw, cl, ixfe, &cached, &rgce));
                 }
             }
+        }
         }
     }
 }
@@ -2799,6 +3385,21 @@ fn build_workbook_stream(
         .collect();
 
     // ----- Globals substream -----
+    // Passthrough records from the source globals, grouped by the
+    // writer-owned record they preceded in the source. Flushed at the
+    // matching emission points below so Office File Validation sees
+    // them in grammar-valid positions; whatever anchor the writer
+    // never reaches drains right before EOF.
+    let mut globals_zones = globals_substream
+        .map(pt::globals_passthrough_zones)
+        .unwrap_or_else(pt::GlobalsZones::empty);
+    macro_rules! flush_zone {
+        ($w:expr, $anchor:expr) => {
+            for rec in globals_zones.take($anchor) {
+                $w.write_record(rec.opcode, &rec.data);
+            }
+        };
+    }
     w.write_record(R_BOF, &build_bof(DT_GLOBALS));
     w.write_record(R_INTERFACEHDR, &build_interfacehdr());
     w.write_record(R_MMS, &build_mms());
@@ -2806,20 +3407,97 @@ fn build_workbook_stream(
     w.write_record(R_WRITEACCESS, &build_writeaccess());
     w.write_record(R_CODEPAGE, &build_codepage());
     w.write_record(R_DSF, &build_dsf());
+    // The early positional block (EXCEL9FILE, TABID, OBPROJ,
+    // CODENAME, FNGROUPCOUNT, workbook protection) sits between DSF
+    // and WINDOW1 in Excel-authored files.
+    flush_zone!(w, R_WINDOW1);
     w.write_record(R_REFRESHALL, &build_refreshall());
     w.write_record(R_BOOKBOOL, &build_bookbool());
 
     // Build the model-driven style tables once; emit FONT, FORMAT,
     // XF, PALETTE records from them. The same StyleTables drives
     // emit_sheet_cells's per-cell ixfe lookup later in the function.
-    let style_tables = build_style_tables(model);
+    let mut style_tables = build_style_tables(model);
 
+    // Per-sheet passthrough zones, computed up front (rather than in
+    // the sheet loop) because embedded chart streams reference the
+    // globals FONT table by ifnt: FONTX / FBI records carry indices
+    // into the SOURCE font table, which this writer rebuilds smaller.
+    // Dangling ifnts made Office File Validation reject every saved
+    // workbook with an embedded chart (2026-08-14 report follow-up).
+    // Carry each referenced source FONT into our table and remap the
+    // ifnt bytes at emission (`write_zone_record`).
+    let pt_suppress_names: Vec<String> = std::env::var("FASTSHEET_XLS_NO_PT_SHEETS")
+        .map(|v| v.split(',').map(|s| s.trim().to_lowercase()).collect())
+        .unwrap_or_default();
+    let all_zones: Vec<pt::SheetZones> = sheet_names
+        .iter()
+        .map(|name| {
+            let suppressed = pt_suppress_names.iter().any(|s| s == &name.to_lowercase());
+            lookup_sheet_substream(name)
+                .filter(|_| !suppressed)
+                .map(pt::split_sheet_zones)
+                .unwrap_or_else(pt::SheetZones::empty)
+        })
+        .collect();
+    let extra_substreams = preserved
+        .map(|p| pt::extract_extra_substreams(&p.workbook_substreams))
+        .unwrap_or_default();
+    let source_fonts: Vec<&crate::xls_preserve::RawRecord> = globals_substream
+        .map(|g| g.records.iter().filter(|r| r.opcode == R_FONT).collect())
+        .unwrap_or_default();
+    let mut wanted_ifnts: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    {
+        let mut scan = |recs: &[&crate::xls_preserve::RawRecord]| {
+            for rec in recs {
+                if let Some(ifnt) = zone_record_ifnt(rec.opcode, &rec.data) {
+                    wanted_ifnts.insert(ifnt);
+                }
+            }
+        };
+        for z in &all_zones {
+            scan(&z.pre_dim);
+            scan(&z.post_cells_pre_win2);
+            scan(&z.post_win2_pre_selection);
+            scan(&z.post_win2);
+        }
+        for extra in &extra_substreams {
+            for rec in extra.records {
+                if let Some(ifnt) = zone_record_ifnt(rec.opcode, &rec.data) {
+                    wanted_ifnts.insert(ifnt);
+                }
+            }
+        }
+    }
+    let mut font_remap: HashMap<u16, u16> = HashMap::new();
+    for &ifnt in &wanted_ifnts {
+        // ifnt ↔ stream index: BIFF skips ifnt 4 with no placeholder
+        // record, so stream record k carries ifnt k for k<4 and k+1
+        // from the fifth record on.
+        let src_idx = if ifnt < 4 { ifnt } else { ifnt - 1 } as usize;
+        let Some(body) = source_fonts.get(src_idx) else { continue };
+        let our_idx = match style_tables.fonts.iter().position(|f| f == &body.data) {
+            Some(i) => i,
+            None => {
+                style_tables.fonts.push(body.data.clone());
+                style_tables.fonts.len() - 1
+            }
+        };
+        let our_ifnt = if our_idx < 4 { our_idx } else { our_idx + 1 } as u16;
+        if our_ifnt != ifnt {
+            font_remap.insert(ifnt, our_ifnt);
+        }
+    }
+
+    flush_zone!(w, R_FONT);
     for body in &style_tables.fonts {
         w.write_record(R_FONT, body);
     }
+    flush_zone!(w, R_FORMAT);
     for body in &style_tables.formats {
         w.write_record(R_FORMAT, body);
     }
+    flush_zone!(w, R_XF);
     for body in &style_tables.xfs {
         w.write_record(R_XF, body);
     }
@@ -2827,6 +3505,7 @@ fn build_workbook_stream(
     // STYLE records — register the 6 standard built-in styles. The
     // first 6 of the 15 style XFs we emitted serve as their backing
     // XF entries.
+    flush_zone!(w, R_STYLE);
     w.write_record(R_STYLE, &build_style_builtin(0, 0, 0xFF));   // Normal
     w.write_record(R_STYLE, &build_style_builtin(1, 3, 0xFF));   // Comma
     w.write_record(R_STYLE, &build_style_builtin(2, 6, 0xFF));   // Comma [0]
@@ -2841,6 +3520,7 @@ fn build_workbook_stream(
     // then we overlay our custom slots on top. Without this seeding,
     // every font referencing red=10, blue=12, etc. via default icvs
     // would render as black (the previous "unused slot" filler).
+    flush_zone!(w, 0x0092 /* PALETTE */);
     if !style_tables.palette.is_empty() {
         let mut body = Vec::with_capacity(2 + 56 * 4);
         body.put_u16(56);
@@ -2867,10 +3547,15 @@ fn build_workbook_stream(
         w.write_record(R_PALETTE_LOCAL, &body);
     }
 
+    flush_zone!(w, R_USESELFS);
     w.write_record(R_USESELFS, &build_useselfs_yes());
+    flush_zone!(w, R_HIDEOBJ);
     w.write_record(R_HIDEOBJ, &build_hideobj_show_all());
+    flush_zone!(w, R_DATEMODE);
     w.write_record(R_DATEMODE, &build_datemode_1900());
+    flush_zone!(w, R_PRECISION);
     w.write_record(R_PRECISION, &build_precision_full());
+    flush_zone!(w, R_BACKUP);
     w.write_record(R_BACKUP, &build_backup_off());
     // WINDOW1 — required globals record per [MS-XLS] 2.4.346. Missing
     // it triggered Excel's "file format or extension is not valid" /
@@ -2883,6 +3568,7 @@ fn build_workbook_stream(
 
     // BOUNDSHEET8 — one per sheet. Track each lbPlyPos byte offset so
     // we can patch in the real sheet-BOF byte position later.
+    flush_zone!(w, R_BOUNDSHEET8);
     let mut boundsheet_patch_offsets: Vec<usize> = Vec::with_capacity(sheet_names.len());
     for name in &sheet_names {
         let (body, field_offset) = build_boundsheet8(name);
@@ -2891,14 +3577,10 @@ fn build_workbook_stream(
         boundsheet_patch_offsets.push(header_offset + 4 + field_offset);
     }
 
-    // Chart / macro sheets from the source. IronCalc has no
-    // representation for non-worksheet substreams, so we collect the
-    // raw record stream + BOUNDSHEET8 metadata and append both. Tab
-    // order shifts (charts move to the end) — acceptable cost for
-    // preservation.
-    let extra_substreams = preserved
-        .map(|p| crate::xls_save_passthrough::extract_extra_substreams(&p.workbook_substreams))
-        .unwrap_or_default();
+    // Chart / macro sheets from the source (extra_substreams was
+    // computed with the zones above so its font references joined the
+    // ifnt remap). Tab order shifts (charts move to the end) —
+    // acceptable cost for preservation.
     let mut extra_patch_offsets: Vec<usize> = Vec::with_capacity(extra_substreams.len());
     for extra in &extra_substreams {
         let (body, field_offset) = build_boundsheet8_full(&extra.name, extra.hs_state, extra.dt);
@@ -2907,6 +3589,7 @@ fn build_workbook_stream(
         extra_patch_offsets.push(header_offset + 4 + field_offset);
     }
 
+    flush_zone!(w, R_COUNTRY);
     w.write_record(R_COUNTRY, &build_country());
 
     // Pre-pass: compute per-sheet extents + LABELSST refcount so the
@@ -2924,62 +3607,91 @@ fn build_workbook_stream(
     // defined names) and the function names that need EXTERNNAME
     // routing (UDFs + post-2007 functions not in the BIFF FTAB).
     let mut xti = build_xti_table(model);
-    let extern_names = build_extern_name_table(model);
+    let mut extern_names = build_extern_name_table(model);
+    if !extern_names.names.is_empty() {
+        // Reserve the add-in supbook's EXTERNSHEET entry BEFORE the
+        // defined-name build below — defined-name rgces may contain
+        // ATP calls whose PtgNameX bakes this ixti in.
+        extern_names.addin_ixti = xti.addin_ixti();
+    }
     let defined_names = build_defined_name_table(model, &mut xti, &extern_names);
     if !xti.entries.is_empty() {
-        // SUPBOOK: ctab(u16) = workbook sheet count, then 0x0401
+        // Record order is load-bearing for POI's LinkTable: each
+        // SUPBOOK is immediately followed by ITS EXTERNNAME records,
+        // and the single EXTERNSHEET comes after all supbook blocks.
+        // (The previous layout — EXTERNNAMEs after EXTERNSHEET,
+        // attached to the internal supbook — made POI NPE in
+        // resolveNameXText on every ATP call.)
+        //
+        // SUPBOOK 0: ctab(u16) = workbook sheet count, then 0x0401
         // marker meaning "this workbook is the supporting book".
+        flush_zone!(w, R_SUPBOOK);
         let mut body: Vec<u8> = Vec::with_capacity(4);
         body.put_u16(model.workbook.worksheets.len() as u16);
         body.put_u16(0x0401);
         w.write_record(R_SUPBOOK, &body);
 
+        if !extern_names.names.is_empty() {
+            // SUPBOOK 1: the add-in supbook ([MS-XLS] 2.4.271 —
+            // ctab=1, virtPath marker 0x3A01), holding one EXTERNNAME
+            // per ATP function. PtgNameX nameindex is 1-based into
+            // this list.
+            let mut body: Vec<u8> = Vec::with_capacity(4);
+            body.put_u16(0x0001);
+            body.put_u16(0x3A01);
+            w.write_record(R_SUPBOOK, &body);
+            for name in &extern_names.names {
+                let body = build_externname_record(name);
+                w.write_record(R_EXTERNNAME, &body);
+            }
+        }
+
         // EXTERNSHEET: cXTI(u16), then per entry: iSupBook(u16) +
-        // itabFirst(u16) + itabLast(u16). All entries point at our
-        // single SUPBOOK (iSupBook=0).
+        // itabFirst(u16) + itabLast(u16). Sheet entries point at the
+        // internal SUPBOOK (iSupBook=0); the reserved add-in entry
+        // points at SUPBOOK 1 with the sheet-independent 0xFFFE tabs.
         let mut body: Vec<u8> = Vec::with_capacity(2 + xti.entries.len() * 6);
         body.put_u16(xti.entries.len() as u16);
-        for &(first, last) in &xti.entries {
-            body.put_u16(0); // iSupBook
+        for (i, &(first, last)) in xti.entries.iter().enumerate() {
+            let is_addin = xti.addin_entry == Some(i as u16);
+            body.put_u16(if is_addin { 1 } else { 0 }); // iSupBook
             body.put_u16(first);
             body.put_u16(last);
         }
         w.write_record(R_EXTERNSHEET, &body);
     }
 
-    // EXTERNNAME records — one per registered extern (UDF /
-    // post-2007 function). PtgNameX nameindex values are 1-based
-    // into this list. Emit BEFORE NAME records so the layout
-    // matches what real Excel produces (ATP/add-in EXTERNNAMES
-    // come immediately after EXTERNSHEET).
-    for name in &extern_names.names {
-        let body = build_externname_record(name);
-        w.write_record(R_EXTERNNAME, &body);
-    }
-
     // Emit NAME (Lbl) records — one per defined name, in the same
     // order as defined_names.entries (so PtgName.ilbl values resolve
     // correctly on read).
+    flush_zone!(w, R_EXTERNSHEET);
+    flush_zone!(w, R_LBL);
     for entry in &defined_names.entries {
         let body = build_lbl_record(entry);
         w.write_record(R_LBL, &body);
     }
+    // Then the NAME-route function names (_xlfn future functions +
+    // VBA UDFs) — their ilbl values continue the defined-name
+    // numbering (extern_names.ilbl_base), so order and position here
+    // are load-bearing.
+    debug_assert_eq!(defined_names.entries.len() as u16, extern_names.ilbl_base);
+    for (name, is_xlfn) in &extern_names.name_fns {
+        let body = build_fn_lbl_record(name, *is_xlfn);
+        w.write_record(R_LBL, &body);
+    }
 
-    // SST + EXTSST.
+    // SST + EXTSST. The pre-SST zone carries RECALCID, FEAT headers,
+    // and MSODRAWINGGROUP (+CONTINUE) — the drawing-objects shared
+    // state the per-sheet MSODRAWING records reference.
+    flush_zone!(w, 0x00FC /* SST */);
     let (sst_table, sst_idx) = build_sst_table(model);
     emit_sst(&mut w, &sst_table, total_labelsst_refs);
 
-    // Globals passthrough: append every source-globals record the
-    // writer doesn't model — MSODRAWINGGROUP (drawing-objects shared
-    // state, referenced by per-sheet MSODRAWING shape IDs), THEME,
-    // XFEXT, STYLEEXT, DXF, TABLESTYLES, XFCRC, FORCEFULLCALCULATION,
-    // EXCEL9FILE, RECALCID, FNGROUPCOUNT, TABID, etc. Position
-    // before EOF is permissive — Excel tolerates these as trailing
-    // records as long as they're inside the globals substream.
-    if let Some(globals) = globals_substream {
-        for rec in crate::xls_save_passthrough::globals_passthrough(globals) {
-            w.write_record(rec.opcode, &rec.data);
-        }
+    // Trailing zone (post-EXTSST FRTs: BOOKEXT, THEME,
+    // COMPRESSPICTURES, GUIDTYPELIB, …) plus any zone whose anchor
+    // the writer never emitted, in source order.
+    for rec in globals_zones.drain_remaining() {
+        w.write_record(rec.opcode, &rec.data);
     }
 
     w.write_record(R_EOF, &build_eof());
@@ -3013,18 +3725,21 @@ fn build_workbook_stream(
         // substream of the sheet with the matching name. Empty zones
         // when there's no preserved data — the writer falls back to
         // greenfield emission.
-        let source_substream = lookup_sheet_substream(name);
-        let zones = source_substream
-            .map(crate::xls_save_passthrough::split_sheet_zones)
-            .unwrap_or_else(crate::xls_save_passthrough::SheetZones::empty);
+        let zones = &all_zones[i];
 
         // pre_dim zone: classic page-setup records (HEADER/FOOTER,
         // HCENTER, VCENTER, margins, SETUP, PLS, page breaks),
         // sheet-protection PROTECT/PASSWORD, etc. — landed here per
         // [MS-XLS] §2.1.7.20.1 ordering.
         for rec in &zones.pre_dim {
-            w.write_record(rec.opcode, &rec.data);
+            write_zone_record(&mut w, rec, &font_remap);
         }
+
+        // DEFCOLWIDTH — Excel always writes it between the page-setup
+        // block and COLINFO. 8 chars is the standard default.
+        let mut dcw = Vec::with_capacity(2);
+        dcw.put_u16(8);
+        w.write_record(R_DEFCOLWIDTH, &dcw);
 
         // COLINFO records — derived from IronCalc Col entries layered
         // with the AppState hidden_cols side-channel. BIFF8 ordering
@@ -3052,12 +3767,9 @@ fn build_workbook_stream(
         };
         w.write_record(R_DIMENSIONS, &build_dimensions(rw_mic, rw_mac, col_mic, col_mac));
 
-        // ROW records — one per IronCalc Row entry, before the cell
-        // records they govern. Carries height + hidden flag.
-        for row in &ws.rows {
-            w.write_record(R_ROW, &build_row_record(row, col_mic, col_mac));
-        }
-
+        // ROW + cell records are emitted together by emit_sheet_cells
+        // in [MS-XLS] row-block layout (≤32 ROW records, then those
+        // rows' cells) — every populated row gets a ROW record.
         emit_sheet_cells(&mut w, ws, i as u32, &sst_table, &sst_idx, parsed, &xti, &defined_names, &extern_names, &style_tables, preserved_rgce);
 
         // post_cells_pre_win2 zone: CONDFMT/CF, HLINK, DVAL/DV,
@@ -3066,18 +3778,36 @@ fn build_workbook_stream(
         // the passthrough (writer-owned) and re-emitted from the
         // model's merge list below so merge edits survive a save.
         for rec in &zones.post_cells_pre_win2 {
-            w.write_record(rec.opcode, &rec.data);
+            write_zone_record(&mut w, rec, &font_remap);
         }
+
+        w.write_record(R_WINDOW2, &build_window2(ws.frozen_rows, ws.frozen_columns, i == 0));
+        // Window-block grammar: WINDOW2 → PLV/SCL → PANE → SELECTION.
+        // The pre-selection slice of the post zone carries the
+        // source's PLV / SCL records.
+        for rec in &zones.post_win2_pre_selection {
+            write_zone_record(&mut w, rec, &font_remap);
+        }
+        if ws.frozen_rows > 0 || ws.frozen_columns > 0 {
+            w.write_record(R_PANE, &build_pane(ws.frozen_rows, ws.frozen_columns));
+        }
+        // SELECTION — one per visible pane, top-left first, the
+        // data-area pane (PANE.pnnAcc) last. Excel emits these after
+        // WINDOW2/PANE; omitting them entirely (the old behavior)
+        // contributed to Excel's "File error: data may have been
+        // lost" repair prompt on open.
+        for pnn in selection_panes(ws.frozen_rows, ws.frozen_columns) {
+            w.write_record(R_SELECTION, &build_selection(pnn));
+        }
+        // MERGECELLS goes AFTER WINDOW2/PANE/SELECTION — that's where
+        // Excel writes it. Emitting it before WINDOW2 (the old spot)
+        // put it inside the sheet's object block on sheets with
+        // drawings, which Office File Validation rejects.
         if !ws.merge_cells.is_empty() {
             let ranges: Vec<&str> = ws.merge_cells.iter().map(|s| s.as_str()).collect();
             for chunk in ranges.chunks(1026) {
                 w.write_record(R_MERGECELLS, &build_mergecells(chunk));
             }
-        }
-
-        w.write_record(R_WINDOW2, &build_window2(ws.frozen_rows, ws.frozen_columns));
-        if ws.frozen_rows > 0 || ws.frozen_columns > 0 {
-            w.write_record(R_PANE, &build_pane(ws.frozen_rows, ws.frozen_columns));
         }
 
         // post_win2 zone: drawings (MSODRAWING/OBJ/TXO + CONTINUE),
@@ -3087,7 +3817,7 @@ fn build_workbook_stream(
         // because we re-emit them above from the model — keeps
         // frozen-pane state consistent with edits.
         for rec in &zones.post_win2 {
-            w.write_record(rec.opcode, &rec.data);
+            write_zone_record(&mut w, rec, &font_remap);
         }
 
         w.write_record(R_EOF, &build_eof());
@@ -3104,7 +3834,7 @@ fn build_workbook_stream(
         let bof_pos = w.pos();
         w.patch_u32(*patch_off, bof_pos);
         for rec in extra.records {
-            w.write_record(rec.opcode, &rec.data);
+            write_zone_record(&mut w, rec, &font_remap);
         }
     }
 
@@ -3744,7 +4474,7 @@ mod tests {
 
     #[test]
     fn window2_default_has_no_frozen_bit() {
-        let body = build_window2(0, 0);
+        let body = build_window2(0, 0, true);
         let grbit = u16::from_le_bytes([body[0], body[1]]);
         assert_eq!(grbit & 0x0008, 0, "fFrozen must be clear when no panes");
         assert_eq!(grbit & 0x0100, 0, "fFrozenNoSplit must be clear when no panes");
@@ -3752,33 +4482,66 @@ mod tests {
 
     #[test]
     fn window2_sets_frozen_bits_when_rows_frozen() {
-        let body = build_window2(2, 0);
+        let body = build_window2(2, 0, true);
         let grbit = u16::from_le_bytes([body[0], body[1]]);
         assert_ne!(grbit & 0x0008, 0, "fFrozen must be set");
         assert_ne!(grbit & 0x0100, 0, "fFrozenNoSplit must be set");
     }
 
     #[test]
+    fn window2_selects_only_the_active_sheet() {
+        let active = build_window2(0, 0, true);
+        let inactive = build_window2(0, 0, false);
+        let g_active = u16::from_le_bytes([active[0], active[1]]);
+        let g_inactive = u16::from_le_bytes([inactive[0], inactive[1]]);
+        assert_eq!(g_active & 0x0600, 0x0600, "active sheet: fSelected+fPaged");
+        assert_eq!(g_inactive & 0x0600, 0, "inactive sheet must not be selected (Group mode)");
+    }
+
+    #[test]
+    fn preserved_rgce_self_containment_gate() {
+        // 1+2 → PtgInt PtgInt PtgAdd: self-contained.
+        let simple = [0x1Eu8, 1, 0, 0x1E, 2, 0, 0x03];
+        assert!(rgce_is_self_contained(&simple));
+        // SUM(A1) via PtgRef + PtgFuncVar: self-contained.
+        let func = [0x44u8, 0, 0, 0, 0x40, 0x22, 1, 4, 0];
+        assert!(rgce_is_self_contained(&func));
+        // PtgRef3d references the source EXTERNSHEET — not replayable.
+        let ref3d = [0x3Au8, 5, 0, 0, 0, 0, 0x40];
+        assert!(!rgce_is_self_contained(&ref3d));
+        // PtgName references the source NAME table — not replayable.
+        let name = [0x23u8, 0x0A, 0x06, 0, 0];
+        assert!(!rgce_is_self_contained(&name));
+        // Truncated PtgStr must not read past the end.
+        let truncated = [0x17u8, 10, 0, b'a'];
+        assert!(!rgce_is_self_contained(&truncated));
+    }
+
+    #[test]
     fn pane_encodes_frozen_split_position() {
         let body = build_pane(3, 5);
+        // [MS-XLS] 2.4.213: PANE is exactly 10 bytes — pnnAcc is u16.
+        // A 9-byte record makes Apache POI reject the whole file.
+        assert_eq!(body.len(), 10, "PANE record must be 10 bytes");
         let x = u16::from_le_bytes([body[0], body[1]]);
         let y = u16::from_le_bytes([body[2], body[3]]);
         let rw_top = u16::from_le_bytes([body[4], body[5]]);
         let col_left = u16::from_le_bytes([body[6], body[7]]);
-        let pnn_act = body[8];
+        let pnn_acc = u16::from_le_bytes([body[8], body[9]]);
         assert_eq!(x, 5, "x = frozen_columns");
         assert_eq!(y, 3, "y = frozen_rows");
         assert_eq!(rw_top, 3);
         assert_eq!(col_left, 5);
-        // Both panes frozen: data area is lower-right, pnnAct=0.
-        assert_eq!(pnn_act, 0);
+        // Both panes frozen: data area is lower-right, pnnAcc=0.
+        assert_eq!(pnn_acc, 0);
     }
 
     #[test]
     fn pane_active_pane_is_lower_left_when_only_rows_frozen() {
         let body = build_pane(1, 0);
-        let pnn_act = body[8];
-        assert_eq!(pnn_act, 2, "rows-only frozen → lower-left active");
+        assert_eq!(body.len(), 10, "PANE record must be 10 bytes");
+        let pnn_acc = u16::from_le_bytes([body[8], body[9]]);
+        assert_eq!(pnn_acc, 2, "rows-only frozen → lower-left active");
     }
 
     #[test]
