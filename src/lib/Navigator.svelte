@@ -45,6 +45,12 @@
   let recents = $state<RecentEntry[]>([]);
   let recentDirs = $state<RecentDir[]>([]);
   let filterEl: HTMLInputElement | null = $state(null);
+  /// Save-mode filename field. Activating a file row copies its name
+  /// here (instead of saving over it immediately); Enter in this field
+  /// commits the save to <listing.dir>/<saveName>. Survives directory
+  /// navigation so "browse elsewhere, keep the name" works.
+  let saveName = $state("");
+  let saveNameEl: HTMLInputElement | null = $state(null);
   /// Recents and recent dirs are shown on the initial open so users
   /// can re-pick a frequently-used file or jump to a known location
   /// without browsing. Once they navigate to a different directory
@@ -127,7 +133,13 @@
     return idx >= 0 ? currentPath.slice(0, idx) : ".";
   }
 
+  function basename(path: string): string {
+    const idx = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+    return idx >= 0 ? path.slice(idx + 1) : path;
+  }
+
   onMount(async () => {
+    if (mode === "save" && currentPath) saveName = basename(currentPath);
     const preferred = startDir || startDirFromCurrentPath();
     const start = preferred ?? (await invoke<string>("start_dir"));
     await Promise.all([navTo(start, null), refreshRecents()]);
@@ -205,6 +217,12 @@
     return dir.endsWith(sep) ? dir + name : dir + sep + name;
   }
 
+  async function focusSaveName() {
+    await tick();
+    saveNameEl?.focus();
+    saveNameEl?.select();
+  }
+
   async function activateEntry(entry: DirEntry) {
     if (!listing) return;
     if (entry.name === "..") {
@@ -213,10 +231,17 @@
     }
     if (entry.is_dir) {
       await navTo(joinPath(listing.dir, entry.name), null);
-    } else {
-      const full = joinPath(listing.dir, entry.name);
-      await onOpenFile(full);
+      return;
     }
+    // Save mode: picking a file loads its name into the Save-as field
+    // for editing rather than saving over it on the spot. Enter in the
+    // field commits (overwrite confirm happens in the caller).
+    if (mode === "save") {
+      saveName = entry.name;
+      await focusSaveName();
+      return;
+    }
+    await onOpenFile(joinPath(listing.dir, entry.name));
   }
 
   async function activateRow(row: NavRow) {
@@ -225,6 +250,14 @@
       return;
     }
     if (row.kind === "recent") {
+      // Save mode: a recent file is a location + name suggestion, not
+      // a thing to open — jump to its directory and stage its name.
+      if (mode === "save") {
+        await navTo(row.recent.dir, null);
+        saveName = row.recent.basename;
+        await focusSaveName();
+        return;
+      }
       await onOpenFile(row.recent.path);
       return;
     }
@@ -244,19 +277,22 @@
     await activateEntry(row.entry);
   }
 
-  function saveTargetFromFilter(): string | null {
-    if (!listing) return null;
-    const raw = filter.trim();
-    if (!raw) return null;
+  async function commitSave() {
+    if (!listing) return;
+    const raw = saveName.trim();
+    if (!raw) {
+      onStatus("no filename");
+      await focusSaveName();
+      return;
+    }
     // Default to .xlsx, but accept .xls explicitly — fastsheet has a
-    // BIFF writer for that path now (formulas round-trip as cached
-    // values until the ptg encoder lands; values + styles round-trip
-    // fully). Any other extension passes through as typed.
+    // BIFF writer for that path. Any other extension passes through
+    // as typed.
     const lower = raw.toLowerCase();
     const filename = (lower.endsWith(".xlsx") || lower.endsWith(".xls"))
       ? raw
       : `${raw}.xlsx`;
-    return joinPath(listing.dir, filename);
+    await onSaveFile(joinPath(listing.dir, filename));
   }
 
   async function submit() {
@@ -264,27 +300,16 @@
       await navTo(filter, listing?.dir ?? null);
       return;
     }
-    // Save-mode: filter has no matching entries — save to <dir>/<filter>[.xlsx]
+    // Save-mode: filter text with no matching entries is a new
+    // filename — stage it in the Save-as field and commit.
     if (mode === "save" && filter.trim() && rows.length === 0) {
-      const target = saveTargetFromFilter();
-      if (target) await onSaveFile(target);
+      saveName = filter.trim();
+      await commitSave();
       return;
     }
     const sel = rows[selectedIdx];
     if (!sel) {
-      if (mode === "save" && filter.trim()) {
-        const target = saveTargetFromFilter();
-        if (target) {
-          await onSaveFile(target);
-          return;
-        }
-      }
       onStatus("no match");
-      return;
-    }
-    // In save mode, picking a file uses it as the save target.
-    if (mode === "save" && sel.kind === "entry" && !sel.entry.is_dir && listing) {
-      await onSaveFile(joinPath(listing.dir, sel.entry.name));
       return;
     }
     await activateRow(sel);
@@ -311,6 +336,20 @@
     } else if (e.key === "Enter") {
       e.preventDefault();
       submit();
+    }
+  }
+
+  function onSaveNameKey(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      onClose();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      commitSave();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Tab") {
+      // Back to browsing — the filter owns list navigation.
+      e.preventDefault();
+      filterEl?.focus();
     }
   }
 </script>
@@ -426,9 +465,22 @@
         <div class="nav-empty">no matches</div>
       {/if}
     </div>
+    {#if mode === "save"}
+      <div class="save-row">
+        <span class="save-label">Save as:</span>
+        <input
+          class="nav-filter save-name"
+          bind:this={saveNameEl}
+          bind:value={saveName}
+          onkeydown={onSaveNameKey}
+        />
+      </div>
+    {/if}
     <div class="nav-hint">
       {#if fileKind === "directory"}
         ↑/↓ to select · Enter to pick directory or drill in · Esc cancel
+      {:else if mode === "save"}
+        ↑/↓ Tab to select · Enter on file/dir picks name/drills in · Enter in Save-as saves · Esc cancel
       {:else}
         ↑/↓ Tab to select · Enter open · Esc cancel
       {/if}
@@ -542,5 +594,20 @@
   .nav-hint {
     color: #888;
     font-size: 11px;
+  }
+  .save-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .save-label {
+    color: #b88a00;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .save-name {
+    flex: 1;
   }
 </style>
