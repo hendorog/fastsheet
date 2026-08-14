@@ -163,7 +163,7 @@ pub fn load_xls(
     // so the writer can replay them into a saved file. Best-effort —
     // returns an empty PreservedXlsData when the file has no VBA
     // (which is most files).
-    let preserved = extract_preserved(&bytes);
+    let mut preserved = extract_preserved(&bytes);
     timer.lap("preserve_extract");
 
     // Calamine 0.26's xls reader unconditionally parses any embedded
@@ -265,7 +265,15 @@ pub fn load_xls(
         let unwrapped = unwrap_user_xlfn(&patched);
         let normalized = normalize_range_order(&unwrapped);
         let quoted = quote_sheet_refs(&normalized, &names_needing_quotes);
-        let _ = model.new_defined_name(raw_name, None, &quoted);
+        // Carry the source Lbl's scope: itab 0 = workbook-global,
+        // else 1-based sheet index. Importing sheet-scoped names as
+        // global (the old behaviour) moved them to itab=0 on save.
+        let scope = shape
+            .raw_names
+            .iter()
+            .find(|rn| rn.name.eq_ignore_ascii_case(raw_name))
+            .and_then(|rn| (rn.itab != 0).then(|| rn.itab as u32 - 1));
+        let _ = model.new_defined_name(raw_name, scope, &quoted);
     }
     timer.lap("defined_names");
 
@@ -433,6 +441,21 @@ pub fn load_xls(
                         if let Ok(ws) = model.workbook.worksheet_mut(sheet_idx as u32) {
                             let _ = ws.set_cell_with_error(r, c, ic_err, 0);
                         }
+                        continue;
+                    }
+                }
+                // Literal text that STARTS with '=' (e.g. a lone "="
+                // used as a visual separator): set_user_input would
+                // parse it as a formula and store a parse-error cell —
+                // Excel shows "=", fastsheet showed "#ERROR!", and the
+                // round-trip degraded it to #VALUE!. Route through the
+                // typed text setter so it stays a label (LABELSST on
+                // save), matching the source record type.
+                if let Data::String(s) = cell {
+                    if calamine_text.is_none() && own_decoded.is_none() && s.starts_with('=') {
+                        if r > max_row_1 { max_row_1 = r; }
+                        if c > max_col_1 { max_col_1 = c; }
+                        let _ = model.update_cell_with_text(sheet_idx as u32, r, c, s);
                         continue;
                     }
                 }
@@ -919,6 +942,87 @@ pub fn load_xls(
                 let _ = model.set_user_input(*sheet, r, c, formula);
             }
         }
+        // Snapshot the range for the writer's ARRAY re-emission:
+        // the source rgce (verbatim) plus the model's canonical
+        // formula text for every replicated cell. The writer
+        // re-reads the same cells at save time; equal text means
+        // the range is unedited and safe to fold back into a
+        // FORMULA(PtgExp) + ARRAY structure.
+        let Some(sheet_name) = model
+            .workbook
+            .worksheets
+            .get(*sheet as usize)
+            .map(|w| w.name.clone())
+        else {
+            continue;
+        };
+        let mut cell_formulas = Vec::with_capacity(((r2 - r1 + 1) * (c2 - c1 + 1)) as usize);
+        for r in *r1..=*r2 {
+            for c in *c1..=*c2 {
+                cell_formulas.push(model.get_cell_formula(*sheet, r, c).ok().flatten());
+            }
+        }
+        preserved.array_formulas.push(crate::xls_preserve::PreservedArrayFormula {
+            sheet_name,
+            r1: *r1,
+            r2: *r2,
+            c1: *c1,
+            c2: *c2,
+            rgce: rgce.clone(),
+            cell_formulas,
+        });
+    }
+    // Source-table context for every preserved-rgce replay (arrays,
+    // #ERROR! cells, unimported names): the NAME list in Lbl order
+    // (1-based PtgName inames index it) and each EXTERNSHEET entry's
+    // sheet names (Ptg*3d ixtis index those).
+    preserved.source_defined_names = shape
+        .raw_names
+        .iter()
+        .map(|n| n.name.clone())
+        .collect();
+    preserved.source_xti_sheets = shape
+        .xti_table
+        .iter()
+        .map(|e| {
+            if e.isup_book != 0 || e.itab_first < 0 || e.itab_last < 0 {
+                return None;
+            }
+            let first = shape.biff_sheet_names.get(e.itab_first as usize)?;
+            let last = shape.biff_sheet_names.get(e.itab_last as usize)?;
+            Some((first.clone(), last.clone()))
+        })
+        .collect();
+    // NAME records the import loop above could not register in the
+    // model (builtin _FilterDatabase / Print_Titles, _xlfn stubs,
+    // grammar-rejected names like `Is_Ulx_Allowed?`, #REF! names) —
+    // keep them for verbatim replay on save. Names that DID import
+    // are owned by the model from here on.
+    let imported: HashSet<String> = model
+        .workbook
+        .defined_names
+        .iter()
+        .map(|dn| dn.name.to_lowercase())
+        .collect();
+    for rn in &shape.raw_names {
+        if !rn.name.is_empty() && imported.contains(&rn.name.to_lowercase()) {
+            continue;
+        }
+        let sheet_name = if rn.itab == 0 {
+            None
+        } else {
+            match shape.biff_sheet_names.get(rn.itab as usize - 1) {
+                Some(n) => Some(n.clone()),
+                None => continue,
+            }
+        };
+        preserved.preserved_names.push(crate::xls_preserve::PreservedName {
+            name: rn.name.clone(),
+            grbit: rn.grbit,
+            ch_key: rn.ch_key,
+            sheet_name,
+            rgce: rn.rgce.clone(),
+        });
     }
     timer.lap("my_replicate");
 
