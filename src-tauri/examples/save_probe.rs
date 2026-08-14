@@ -16,7 +16,7 @@ use std::io::Read;
 fn main() {
     let path = std::env::args().nth(1).expect("usage: save_probe <input.xls>");
     println!("=== load {path}");
-    let (mut model, _hidden, _preserved, raw_rgce) = fastsheet_lib::load_xls(&path).expect("load_xls");
+    let (mut model, _hidden, mut preserved, raw_rgce) = fastsheet_lib::load_xls(&path).expect("load_xls");
     model.evaluate();
     let prgce = fastsheet_lib::xls_load::finalize_preserved_rgce(&model, raw_rgce);
     if !prgce.is_empty() {
@@ -71,23 +71,30 @@ fn main() {
 
     let out = std::env::temp_dir().join("save_probe_out.xls");
     println!("=== save_xls → {}", out.display());
-    let mut preserved = fastsheet_lib::xls_preserve::extract(&std::fs::read(&path).expect("read"));
+    // `preserved` comes from load_xls (not a fresh extract) so it also
+    // carries the array-formula snapshots the app's save path sees.
     // Bisection support: FASTSHEET_PROBE_STRIP selectively drops
     // preservation layers so an external validator (Excel, POI) can
     // localize which passthrough content a reader is objecting to.
     //   substreams   — no record passthrough at all (VBA/props kept)
     //   globals-only — keep only the globals substream passthrough
     //   entries      — drop VBA/property streams (records kept)
+    //   arrays       — no ARRAY re-emission (per-cell expansion)
     //   all          — greenfield write, nothing preserved
     match std::env::var("FASTSHEET_PROBE_STRIP").as_deref() {
         Ok("substreams") => preserved.workbook_substreams.clear(),
         Ok("globals-only") => preserved.workbook_substreams.retain(|s| s.bof_dt == 0x0005),
         Ok("entries") => preserved.entries.clear(),
+        Ok("arrays") => preserved.array_formulas.clear(),
         Ok("all") => {
             preserved.workbook_substreams.clear();
             preserved.entries.clear();
+            preserved.array_formulas.clear();
         }
         _ => {}
+    }
+    if !preserved.array_formulas.is_empty() {
+        println!("  preserved {} array-formula ranges", preserved.array_formulas.len());
     }
     if !preserved.workbook_substreams.is_empty() {
         println!("  preserved {} substreams from source workbook stream", preserved.workbook_substreams.len());

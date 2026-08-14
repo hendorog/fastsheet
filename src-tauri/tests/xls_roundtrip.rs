@@ -567,3 +567,126 @@ fn rt_vba_absent_when_source_has_none() {
     assert!(preserved.is_empty(), "no-VBA source should yield empty bundle");
     std::fs::remove_file(&src_path).ok();
 }
+
+/// Array-formula (CSE) preservation: a spill range replicated the way
+/// `load_xls` does (per-cell `MY*(..., dr, dc)`) plus a
+/// `PreservedArrayFormula` snapshot must fold back into
+/// FORMULA(PtgExp) + ARRAY records on save, with PtgName inames
+/// remapped to the writer's NAME table. An edited cell in the range
+/// must drop the whole range back to per-cell expansion.
+#[test]
+fn rt_array_formula_records_survive_save() {
+    use fastsheet_lib::xls_preserve::{PreservedArrayFormula, PreservedXlsData};
+
+    fn build_model() -> Model<'static> {
+        let mut m = Model::new_empty("rt", "en", "UTC", "en").unwrap();
+        m.set_user_input(0, 1, 1, "x".into()).unwrap();
+        m.set_user_input(0, 2, 1, "y".into()).unwrap();
+        m.set_user_input(0, 3, 1, "x".into()).unwrap();
+        m.new_defined_name("arrdata", None, "Sheet1!$A$1:$A$3").unwrap();
+        for dr in 0..3 {
+            m.set_user_input(0, 1 + dr, 2, format!("=MYUNIQUE(arrdata, {dr}, 0)"))
+                .unwrap();
+        }
+        m.evaluate();
+        m
+    }
+
+    // Source-style ARRAY rgce: PtgName(MYUNIQUE=1) PtgName(arrdata=2)
+    // PtgRef(B1 rel/rel) PtgFuncVar(cparams=3, iftab=255). The inames
+    // are 1-based into `source_defined_names` and deliberately do NOT
+    // match the writer's table, so the test proves the remap.
+    let rgce: Vec<u8> = vec![
+        0x23, 0x01, 0x00, 0x00, 0x00, // PtgName MYUNIQUE (source iname 1)
+        0x23, 0x02, 0x00, 0x00, 0x00, // PtgName arrdata (source iname 2)
+        0x24, 0x00, 0x00, 0x01, 0xC0, // PtgRef B1, rel/rel
+        0x42, 0x03, 0xFF, 0x00,       // PtgFuncVar User, 3 params
+    ];
+
+    let model = build_model();
+    let cell_formulas: Vec<Option<String>> = (1..=3)
+        .map(|r| model.get_cell_formula(0, r, 2).ok().flatten())
+        .collect();
+    assert!(cell_formulas.iter().all(|f| f.is_some()), "replicated cells must have formulas");
+    let mut preserved = PreservedXlsData::default();
+    preserved.array_formulas.push(PreservedArrayFormula {
+        sheet_name: "Sheet1".into(),
+        r1: 1,
+        r2: 3,
+        c1: 2,
+        c2: 2,
+        rgce,
+        cell_formulas,
+    });
+    preserved.source_defined_names = vec!["MYUNIQUE".into(), "arrdata".into()];
+
+    let out = std::env::temp_dir().join("fastsheet_rt_array_records.xls");
+    fastsheet_lib::save_xls_with_preserved(&model, &out, Some(&preserved), None)
+        .expect("save with preserved arrays");
+
+    // The saved file must contain the ARRAY record with the range and
+    // an rgce that decodes to the anchor formula against the SAVED
+    // file's name table.
+    let bytes = {
+        use std::io::Read;
+        let mut comp = cfb::open(&out).expect("cfb open");
+        let mut s = comp.open_stream("/Workbook").expect("workbook stream");
+        let mut b = Vec::new();
+        s.read_to_end(&mut b).unwrap();
+        b
+    };
+    let shape = fastsheet_lib::xls_biff::scan_xls_shape(&std::fs::read(&out).unwrap());
+    assert_eq!(
+        shape.array_ranges,
+        vec![(0, 1, 3, 2, 2)],
+        "saved file must carry one ARRAY range over B1:B3"
+    );
+    assert!(!bytes.is_empty());
+
+    // Reload through the normal loader: the ARRAY record replicates
+    // back into per-cell MY* formulas with identical values.
+    let (mut reloaded, _, re_preserved, _) =
+        fastsheet_lib::load_xls(&out.to_string_lossy()).expect("reload");
+    reloaded.evaluate();
+    for r in 1..=3 {
+        let orig = model.get_formatted_cell_value(0, r, 2).unwrap_or_default();
+        let rt = reloaded.get_formatted_cell_value(0, r, 2).unwrap_or_default();
+        assert_eq!(orig, rt, "B{r} value must survive the array round-trip");
+    }
+    assert_eq!(
+        re_preserved.array_formulas.len(),
+        1,
+        "reload must capture the array range for the NEXT save"
+    );
+    std::fs::remove_file(&out).ok();
+
+    // Edited-range fallback: a changed formula inside the spill range
+    // invalidates the snapshot; the writer must expand per-cell and
+    // emit NO ARRAY record.
+    let mut edited = build_model();
+    edited.set_user_input(0, 2, 2, "=1+1".into()).unwrap();
+    edited.evaluate();
+    let cell_formulas: Vec<Option<String>> = (1..=3)
+        .map(|r| model.get_cell_formula(0, r, 2).ok().flatten())
+        .collect();
+    let mut preserved2 = PreservedXlsData::default();
+    preserved2.array_formulas.push(PreservedArrayFormula {
+        sheet_name: "Sheet1".into(),
+        r1: 1,
+        r2: 3,
+        c1: 2,
+        c2: 2,
+        rgce: vec![0x23, 0x01, 0x00, 0x00, 0x00, 0x42, 0x01, 0xFF, 0x00],
+        cell_formulas,
+    });
+    preserved2.source_defined_names = vec!["MYUNIQUE".into(), "arrdata".into()];
+    let out2 = std::env::temp_dir().join("fastsheet_rt_array_edited.xls");
+    fastsheet_lib::save_xls_with_preserved(&edited, &out2, Some(&preserved2), None)
+        .expect("save edited");
+    let shape2 = fastsheet_lib::xls_biff::scan_xls_shape(&std::fs::read(&out2).unwrap());
+    assert!(
+        shape2.array_ranges.is_empty(),
+        "edited range must fall back to per-cell expansion (no ARRAY record)"
+    );
+    std::fs::remove_file(&out2).ok();
+}

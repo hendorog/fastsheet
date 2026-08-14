@@ -45,6 +45,11 @@ path = "examples/trace_probe.rs"
 required-features = ["dev-bins"]
 
 [[example]]
+name = "array_probe"
+path = "examples/array_probe.rs"
+required-features = ["dev-bins"]
+
+[[example]]
 name = "biff_surgery"
 path = "examples/biff_surgery.rs"
 required-features = ["dev-bins"]

@@ -74,6 +74,7 @@ const R_LABELSST: u16 = 0x00FD;
 const R_BOOLERR: u16 = 0x0205;
 const R_FORMULA: u16 = 0x0006;
 const R_STRING: u16 = 0x0207;
+const R_ARRAY: u16 = 0x0221;
 const R_ROW: u16 = 0x0208;
 const R_COLINFO: u16 = 0x007D;
 const R_SUPBOOK: u16 = 0x01AE;
@@ -1263,6 +1264,7 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
             fill_pattern, fill_fg_icv, fill_bg_icv,
         ));
         cell_xf_index.push((xfs.len() - 1) as u16);
+
     }
 
     StyleTables {
@@ -1540,10 +1542,24 @@ fn build_formula(
     cached: &FormulaCachedValue,
     rgce: &[u8],
 ) -> Vec<u8> {
+    build_formula_with_grbit(rw, col, ixfe, cached, rgce, 0)
+}
+
+/// Same as `build_formula` but with an explicit grbit. Array-member
+/// cells (rgce = PtgExp) carry 0x0020 (fClearErrors), matching what
+/// Excel writes for every cell of an array-entered range.
+fn build_formula_with_grbit(
+    rw: u32,
+    col: u32,
+    ixfe: u16,
+    cached: &FormulaCachedValue,
+    rgce: &[u8],
+    grbit: u16,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(22 + rgce.len());
     put_cell_header(&mut body, rw, col, ixfe);
     body.extend_from_slice(&build_formula_cached_bytes(cached));
-    body.put_u16(0); // grbit (no shared / array / fAlwaysCalc)
+    body.put_u16(grbit);
     body.put_u32(0); // chn — reserved
     body.put_u16(rgce.len() as u16);
     body.extend_from_slice(rgce);
@@ -1624,6 +1640,30 @@ impl XtiTable {
     }
     fn lookup_single(&self, sheet_idx: u32) -> Option<u16> {
         self.single_sheet_lookup.get(&sheet_idx).copied()
+    }
+    /// (first, last) sheet-span entry — used by preserved-rgce
+    /// remapping, where a source Ptg*3d may span sheets. The add-in
+    /// entry's (0xFFFE, 0xFFFE) marker can't collide with real sheet
+    /// indices. Linear scan; xti tables stay small.
+    fn lookup_or_add_pair(&mut self, first: u16, last: u16) -> u16 {
+        if first == last {
+            return self.lookup_or_add_single(first as u32);
+        }
+        if let Some(i) = self.entries.iter().position(|&e| e == (first, last)) {
+            return i as u16;
+        }
+        let i = self.entries.len() as u16;
+        self.entries.push((first, last));
+        i
+    }
+    fn lookup_pair(&self, first: u16, last: u16) -> Option<u16> {
+        if first == last {
+            return self.lookup_single(first as u32);
+        }
+        self.entries
+            .iter()
+            .position(|&e| e == (first, last))
+            .map(|i| i as u16)
     }
     fn addin_ixti(&mut self) -> u16 {
         if let Some(i) = self.addin_entry {
@@ -1747,10 +1787,22 @@ fn build_defined_name_table(
     let mut table = DefinedNameTable::default();
     for dn in &model.workbook.defined_names {
         let formula = dn.formula.strip_prefix('=').unwrap_or(&dn.formula);
-        let scope_sheet = dn.sheet_id.unwrap_or(0);
+        // dn.sheet_id is the worksheet's ID field, NOT its index
+        // (new_defined_name converts the caller's index via
+        // ws.sheet_id). Resolve back to the index — emitting the raw
+        // ID as if it were an index pointed sheet-scoped names one
+        // sheet too far (IDs start at 1 in typical workbooks).
+        let scope_index: Option<u32> = dn.sheet_id.and_then(|id| {
+            model
+                .workbook
+                .worksheets
+                .iter()
+                .position(|w| w.sheet_id == id)
+                .map(|i| i as u32)
+        });
         let context = CellReferenceRC {
             sheet: worksheet_names
-                .get(scope_sheet as usize)
+                .get(scope_index.unwrap_or(0) as usize)
                 .cloned()
                 .unwrap_or_default(),
             column: 1,
@@ -1773,13 +1825,14 @@ fn build_defined_name_table(
             xti,
             &DefinedNameTable::default(),
             extern_names,
+            CLS_REF,
         )
         .unwrap_or_default();
         let ilbl = (table.entries.len() + 1) as u16;
         table.lookup.insert((dn.name.to_lowercase(), dn.sheet_id), ilbl);
         table.entries.push(DefinedNameEntry {
             name: dn.name.clone(),
-            sheet_id: dn.sheet_id,
+            sheet_id: scope_index,
             rgce,
         });
     }
@@ -1966,6 +2019,88 @@ fn build_fn_lbl_record(name: &str, is_xlfn: bool) -> Vec<u8> {
     body
 }
 
+/// Select which preserved source NAME records get replayed and give
+/// each its final ilbl. Skips names the writer already emits (a model
+/// defined name, or a function NAME on the `_xlfn.*` / VBA-UDF
+/// route), and sheet-scoped names whose scope sheet no longer exists.
+/// Returns (index into `preserved_names`, Lbl itab) per record, in
+/// emission order; ilbls continue the numbering after the model
+/// names and the function NAMEs and are registered in the
+/// defined-name lookup so preserved rgce referencing them resolves.
+fn plan_preserved_names(
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
+    defined_names: &mut DefinedNameTable,
+    extern_names: &ExternNameTable,
+    sheet_by_name: &HashMap<String, u32>,
+) -> Vec<(usize, u16)> {
+    let mut plans: Vec<(usize, u16)> = Vec::new();
+    let Some(p) = preserved else { return plans };
+    let emitted_fn_names: std::collections::HashSet<String> = extern_names
+        .name_fns
+        .iter()
+        .map(|(n, _)| n.to_lowercase())
+        .collect();
+    let base = defined_names.entries.len() + extern_names.name_fns.len();
+    for (idx, pn) in p.preserved_names.iter().enumerate() {
+        if pn.name.is_empty() {
+            continue;
+        }
+        let key = pn.name.to_lowercase();
+        if defined_names.lookup.contains_key(&(key.clone(), None))
+            || emitted_fn_names.contains(&key)
+        {
+            continue;
+        }
+        let (itab, scope) = match &pn.sheet_name {
+            None => (0u16, None),
+            Some(sn) => match sheet_by_name.get(&sn.to_lowercase()) {
+                Some(&i) => (i as u16 + 1, Some(i)),
+                None => continue,
+            },
+        };
+        let ilbl = (base + plans.len() + 1) as u16;
+        defined_names.lookup.insert((key, scope), ilbl);
+        plans.push((idx, itab));
+    }
+    plans
+}
+
+/// Lbl record body for a preserved source NAME, replayed with its
+/// original flags / chKey and a remapped rgce. Same field layout as
+/// `build_lbl_record` / `build_fn_lbl_record` ([MS-XLS] 2.4.187).
+fn build_preserved_lbl_record(
+    pn: &crate::xls_preserve::PreservedName,
+    itab: u16,
+    rgce: &[u8],
+) -> Vec<u8> {
+    let chars: Vec<u16> = pn.name.encode_utf16().collect();
+    let cch = chars.len().min(255) as u8;
+    let high_byte = chars.iter().any(|&c| c > 0xFF);
+    let mut body = Vec::with_capacity(15 + chars.len() * 2 + rgce.len());
+    body.put_u16(pn.grbit);
+    body.put_u8(pn.ch_key);
+    body.put_u8(cch);
+    body.put_u16(rgce.len() as u16);
+    body.put_u16(0); // ixals (reserved)
+    body.put_u16(itab);
+    body.put_u8(0); // cchCustMenu
+    body.put_u8(0); // cchDescription
+    body.put_u8(0); // cchHelpTopic
+    body.put_u8(0); // cchStatusText
+    body.put_u8(if high_byte { 0x01 } else { 0x00 });
+    if high_byte {
+        for c in chars.iter().take(cch as usize) {
+            body.put_u16(*c);
+        }
+    } else {
+        for c in chars.iter().take(cch as usize) {
+            body.put_u8(*c as u8);
+        }
+    }
+    body.extend_from_slice(rgce);
+    body
+}
+
 /// Build the body of one Lbl (NAME) record. [MS-XLS] 2.4.187.
 fn build_lbl_record(entry: &DefinedNameEntry) -> Vec<u8> {
     let chars: Vec<u16> = entry.name.encode_utf16().collect();
@@ -1992,12 +2127,28 @@ fn build_lbl_record(entry: &DefinedNameEntry) -> Vec<u8> {
     body
 }
 
-/// Encode an IronCalc Node tree to BIFF8 rgce bytes. Returns None when
-/// any subtree contains a construct we can't yet encode — the caller
-/// then falls back to the placeholder rgce path. We deliberately
-/// fail-closed rather than try to half-encode, because a malformed
-/// rgce rendered through a BIFF reader produces nonsense formulas
-/// (the parser walks ptgs by fixed sizes and mis-aligns on garbage).
+/// Operand-class bits ([MS-XLS] 2.5.198.2), OR'd into the base ptg id
+/// of operand tokens (Ref 0x04, Area 0x05, Ref3d 0x1A, Area3d 0x1B,
+/// Name 0x03, NameX 0x19, FuncVar 0x02). Excel's recalc engine is
+/// strict about them in places: a reference-class PtgName or Ptg*3d
+/// where a value is required (formula root, operator operand) makes
+/// every recalculated dependent show #VALUE! — verified 2026-08-14 by
+/// flipping a single class byte (0x3A→0x5A) in a broken save and
+/// watching the cell recover. Ref class is only correct where Excel
+/// itself writes it: ref-taking builtin args (per FN_PARAM_CLASSES)
+/// and User-call (VBA UDF / _xlfn / add-in) ref args.
+const CLS_REF: u8 = 0x20;
+const CLS_VAL: u8 = 0x40;
+
+/// Encode an IronCalc Node tree to BIFF8 rgce bytes. `root_cls` is
+/// the operand class required by the rgce's context: CLS_VAL for cell
+/// formulas (the result is a value), CLS_REF for defined-name
+/// definitions (a name is a reference). Returns None when any subtree
+/// contains a construct we can't yet encode — the caller then falls
+/// back to the placeholder rgce path. We deliberately fail-closed
+/// rather than try to half-encode, because a malformed rgce rendered
+/// through a BIFF reader produces nonsense formulas (the parser walks
+/// ptgs by fixed sizes and mis-aligns on garbage).
 fn encode_formula_rgce_with_names(
     node: &ironcalc::base::expressions::parser::Node,
     sheet_idx: u32,
@@ -2005,9 +2156,10 @@ fn encode_formula_rgce_with_names(
     xti: &XtiTable,
     defined_names: &DefinedNameTable,
     extern_names: &ExternNameTable,
+    root_cls: u8,
 ) -> Option<Vec<u8>> {
     let mut rgce = Vec::with_capacity(64);
-    encode_node(&mut rgce, node, sheet_idx, anchor, xti, defined_names, extern_names).ok()?;
+    encode_node(&mut rgce, node, sheet_idx, anchor, xti, defined_names, extern_names, root_cls).ok()?;
     Some(rgce)
 }
 
@@ -2040,14 +2192,21 @@ fn encode_node_parenthesized(
     xti: &XtiTable,
     defined_names: &DefinedNameTable,
     extern_names: &ExternNameTable,
+    cls: u8,
 ) -> Result<(), ()> {
-    encode_node(rgce, node, sheet_idx, anchor, xti, defined_names, extern_names)?;
+    encode_node(rgce, node, sheet_idx, anchor, xti, defined_names, extern_names, cls)?;
     if is_compound_binop(node) {
         rgce.put_u8(0x15); // PtgParen — passive; affects rendering only
     }
     Ok(())
 }
 
+/// `cls` is the operand class this node's result must carry (CLS_REF
+/// or CLS_VAL). It lands on direct operand ptgs (refs, areas, names)
+/// and on PtgFuncVar; operator operands always evaluate as values so
+/// the recursion resets to CLS_VAL below them, and function args get
+/// their class from FN_PARAM_CLASSES (builtins) or CLS_REF (User
+/// calls) inside emit_function_call_named.
 fn encode_node(
     rgce: &mut Vec<u8>,
     node: &ironcalc::base::expressions::parser::Node,
@@ -2056,6 +2215,7 @@ fn encode_node(
     xti: &XtiTable,
     defined_names: &DefinedNameTable,
     extern_names: &ExternNameTable,
+    cls: u8,
 ) -> Result<(), ()> {
     use ironcalc::base::expressions::parser::Node;
     use ironcalc::base::expressions::token::{OpCompare, OpProduct, OpSum, OpUnary};
@@ -2079,10 +2239,10 @@ fn encode_node(
             ..
         } => {
             if *sheet_index == sheet_idx {
-                emit_ptg_ref(rgce, *row, *column, *absolute_row, *absolute_column, anchor)?;
+                emit_ptg_ref(rgce, *row, *column, *absolute_row, *absolute_column, anchor, cls)?;
             } else {
                 let ixti = xti.lookup_single(*sheet_index).ok_or(())?;
-                emit_ptg_ref3d(rgce, ixti, *row, *column, *absolute_row, *absolute_column, anchor)?;
+                emit_ptg_ref3d(rgce, ixti, *row, *column, *absolute_row, *absolute_column, anchor, cls)?;
             }
         }
         Node::RangeKind {
@@ -2102,7 +2262,7 @@ fn encode_node(
                     rgce,
                     *row1, *column1, *absolute_row1, *absolute_column1,
                     *row2, *column2, *absolute_row2, *absolute_column2,
-                    anchor,
+                    anchor, cls,
                 )?;
             } else {
                 let ixti = xti.lookup_single(*sheet_index).ok_or(())?;
@@ -2110,39 +2270,39 @@ fn encode_node(
                     rgce, ixti,
                     *row1, *column1, *absolute_row1, *absolute_column1,
                     *row2, *column2, *absolute_row2, *absolute_column2,
-                    anchor,
+                    anchor, cls,
                 )?;
             }
         }
         Node::OpSumKind { kind, left, right } => {
-            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names)?;
-            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names)?;
+            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
+            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
             rgce.put_u8(match kind {
                 OpSum::Add => 0x03,    // PtgAdd
                 OpSum::Minus => 0x04,  // PtgSub
             });
         }
         Node::OpProductKind { kind, left, right } => {
-            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names)?;
-            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names)?;
+            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
+            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
             rgce.put_u8(match kind {
                 OpProduct::Times => 0x05,   // PtgMul
                 OpProduct::Divide => 0x06,  // PtgDiv
             });
         }
         Node::OpPowerKind { left, right } => {
-            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names)?;
-            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names)?;
+            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
+            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
             rgce.put_u8(0x07); // PtgPower
         }
         Node::OpConcatenateKind { left, right } => {
-            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names)?;
-            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names)?;
+            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
+            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
             rgce.put_u8(0x08); // PtgConcat
         }
         Node::CompareKind { kind, left, right } => {
-            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names)?;
-            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names)?;
+            encode_node_parenthesized(rgce, left, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
+            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
             rgce.put_u8(match kind {
                 OpCompare::LessThan => 0x09,            // PtgLT
                 OpCompare::LessOrEqualThan => 0x0A,     // PtgLE
@@ -2153,7 +2313,7 @@ fn encode_node(
             });
         }
         Node::UnaryKind { kind, right } => {
-            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names)?;
+            encode_node_parenthesized(rgce, right, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL)?;
             rgce.put_u8(match kind {
                 OpUnary::Minus => 0x13,       // PtgUminus
                 OpUnary::Percentage => 0x14,  // PtgPercent
@@ -2166,11 +2326,11 @@ fn encode_node(
             // language gives us the canonical Excel function name.
             let lang = ironcalc::base::language::get_default_language();
             let name = kind.to_localized_name(lang);
-            emit_function_call_named(rgce, &name, args, sheet_idx, anchor, xti, defined_names, extern_names)?;
+            emit_function_call_named(rgce, &name, args, sheet_idx, anchor, xti, defined_names, extern_names, cls)?;
         }
         Node::DefinedNameKind((name, scope, _formula)) => {
             let ilbl = defined_names.ilbl_for(name, *scope).ok_or(())?;
-            rgce.put_u8(0x23); // PtgName (reference class)
+            rgce.put_u8(0x03 | cls); // PtgName
             // Wire: u16 ilbl + u16 reserved. Calamine reads as one
             // u32 nameindex (LE), so this comes out 1-based.
             rgce.put_u16(ilbl);
@@ -2243,7 +2403,7 @@ fn resolve_to_absolute_1based(coord: i32, abs_flag: bool, anchor_coord: i32) -> 
     if abs_flag { coord } else { coord + anchor_coord }
 }
 
-/// PtgRef (0x24 reference class). [MS-XLS] 2.5.198 RgceLoc.
+/// PtgRef (base 0x04 | operand class). [MS-XLS] 2.5.198 RgceLoc.
 /// Resolves IronCalc's relative-ref offsets to absolute targets via
 /// the anchor cell, then converts 1-based → 0-based for BIFF storage.
 /// Bits 0..13 of col_word = column; bit 14 = fColRel; bit 15 = fRwRel.
@@ -2254,6 +2414,7 @@ fn emit_ptg_ref(
     absolute_row: bool,
     absolute_column: bool,
     anchor: CellAnchor,
+    cls: u8,
 ) -> Result<(), ()> {
     let abs_row = resolve_to_absolute_1based(row, absolute_row, anchor.row);
     let abs_col = resolve_to_absolute_1based(column, absolute_column, anchor.column);
@@ -2263,18 +2424,19 @@ fn emit_ptg_ref(
     let mut col_word = c0 as u16 & 0x3FFF;
     if !absolute_column { col_word |= 0x4000; }
     if !absolute_row    { col_word |= 0x8000; }
-    rgce.put_u8(0x24);
+    rgce.put_u8(0x04 | cls);
     rgce.put_u16(r0 as u16);
     rgce.put_u16(col_word);
     Ok(())
 }
 
-/// PtgArea (0x25 reference class). [MS-XLS] 2.5.198a — pair of RgceLocs.
+/// PtgArea (base 0x05 | operand class). [MS-XLS] 2.5.198a — pair of RgceLocs.
 fn emit_ptg_area(
     rgce: &mut Vec<u8>,
     row1: i32, column1: i32, abs_row1: bool, abs_col1: bool,
     row2: i32, column2: i32, abs_row2: bool, abs_col2: bool,
     anchor: CellAnchor,
+    cls: u8,
 ) -> Result<(), ()> {
     let r1_abs = resolve_to_absolute_1based(row1, abs_row1, anchor.row);
     let c1_abs = resolve_to_absolute_1based(column1, abs_col1, anchor.column);
@@ -2291,7 +2453,7 @@ fn emit_ptg_area(
         if !abs_r { w |= 0x8000; }
         w
     };
-    rgce.put_u8(0x25);
+    rgce.put_u8(0x05 | cls);
     rgce.put_u16(r1 as u16);
     rgce.put_u16(r2 as u16);
     rgce.put_u16(pack(c1, abs_col1, abs_row1));
@@ -2314,13 +2476,30 @@ fn emit_function_call_named(
     xti: &XtiTable,
     defined_names: &DefinedNameTable,
     extern_names: &ExternNameTable,
+    cls: u8,
 ) -> Result<(), ()> {
     if args.len() > 255 { return Err(()); }
     if let Some(iftab) = ftab_iftab_for_name(func_name) {
-        for arg in args {
-            encode_node(rgce, arg, sheet_idx, anchor, xti, defined_names, extern_names)?;
+        // Builtin args carry the operand class Excel's own writer
+        // uses, from the per-function table (last class repeats for
+        // varargs). Missing table entry → value class, the common
+        // case. Getting this wrong breaks recalc in Excel: a
+        // ref-class arg where the function wants a value makes the
+        // call error, and a value-class arg where it wants a
+        // reference (SUM, OFFSET, ...) collapses the range via
+        // implicit intersection.
+        let params = crate::xls_fn_classes::FN_PARAM_CLASSES
+            .get(iftab as usize)
+            .copied()
+            .flatten();
+        for (i, arg) in args.iter().enumerate() {
+            let arg_cls = params
+                .and_then(|p| p.get(i).or(p.last()))
+                .copied()
+                .unwrap_or(CLS_VAL);
+            encode_node(rgce, arg, sheet_idx, anchor, xti, defined_names, extern_names, arg_cls)?;
         }
-        rgce.put_u8(0x22); // PtgFuncVar (value class)
+        rgce.put_u8(0x02 | cls); // PtgFuncVar
         rgce.put_u8(args.len() as u8);
         rgce.put_u16(iftab);
         return Ok(());
@@ -2330,14 +2509,18 @@ fn emit_function_call_named(
     // internal NAME record via PtgName; the Lbl records are emitted
     // right after the model's defined names, so ilbl continues their
     // numbering. Same PtgFuncVar(255) wrapper as the add-in route.
+    // User-call ref/name args keep reference class — that is what
+    // Excel writes for array-entered VBA UDF calls (neutral.xls ARRAY
+    // rgces), and it is what delivers a Range object to a VBA
+    // `As Range` parameter.
     if let Some(ilbl) = extern_names.name_fn_ilbl(func_name) {
-        rgce.put_u8(0x23); // PtgName (reference class)
+        rgce.put_u8(0x23); // PtgName (fn-name slot is always ref class)
         rgce.put_u16(ilbl);
         rgce.put_u16(0);   // reserved (calamine reads ilbl as u32 LE)
         for arg in args {
-            encode_node(rgce, arg, sheet_idx, anchor, xti, defined_names, extern_names)?;
+            encode_node(rgce, arg, sheet_idx, anchor, xti, defined_names, extern_names, CLS_REF)?;
         }
-        rgce.put_u8(0x22); // PtgFuncVar
+        rgce.put_u8(0x02 | cls); // PtgFuncVar
         rgce.put_u8((args.len() + 1) as u8); // argc = args + 1 for the name
         rgce.put_u16(0xFF); // iftab = 255 ("User": first arg is the fn)
         return Ok(());
@@ -2348,20 +2531,20 @@ fn emit_function_call_named(
     // ...)`. xls_load.rs's patch_ptg_name_x + unwrap_user_xlfn
     // collapse that back to `<name>(arg1, ...)` on reload.
     let nameindex = extern_names.get(func_name).ok_or(())?;
-    rgce.put_u8(0x39);    // PtgNameX (reference class)
+    rgce.put_u8(0x39);    // PtgNameX (fn-name slot is always ref class)
     rgce.put_u16(extern_names.addin_ixti); // xti entry of the add-in supbook
     rgce.put_u16(nameindex);
     rgce.put_u16(0);      // reserved
     for arg in args {
-        encode_node(rgce, arg, sheet_idx, anchor, xti, defined_names, extern_names)?;
+        encode_node(rgce, arg, sheet_idx, anchor, xti, defined_names, extern_names, CLS_REF)?;
     }
-    rgce.put_u8(0x22);    // PtgFuncVar
+    rgce.put_u8(0x02 | cls); // PtgFuncVar
     rgce.put_u8((args.len() + 1) as u8); // argc = args + 1 for the name itself
     rgce.put_u16(0xFF);   // iftab = 255 (FTAB[255] = "User")
     Ok(())
 }
 
-/// PtgRef3d (0x3A reference class). [MS-XLS] 2.5.198.97. Layout:
+/// PtgRef3d (base 0x1A | operand class). [MS-XLS] 2.5.198.97. Layout:
 /// ptg + ixti(u16) + rwu(u16) + colu_with_flags(u16). The ixti
 /// indexes into the EXTERNSHEET xti table, which in turn maps to a
 /// (supBook, sheet_first, sheet_last) tuple. For self-referencing
@@ -2374,6 +2557,7 @@ fn emit_ptg_ref3d(
     absolute_row: bool,
     absolute_column: bool,
     anchor: CellAnchor,
+    cls: u8,
 ) -> Result<(), ()> {
     let abs_row = resolve_to_absolute_1based(row, absolute_row, anchor.row);
     let abs_col = resolve_to_absolute_1based(column, absolute_column, anchor.column);
@@ -2383,14 +2567,14 @@ fn emit_ptg_ref3d(
     let mut col_word = c0 as u16 & 0x3FFF;
     if !absolute_column { col_word |= 0x4000; }
     if !absolute_row    { col_word |= 0x8000; }
-    rgce.put_u8(0x3A);
+    rgce.put_u8(0x1A | cls);
     rgce.put_u16(ixti);
     rgce.put_u16(r0 as u16);
     rgce.put_u16(col_word);
     Ok(())
 }
 
-/// PtgArea3d (0x3B reference class). Layout: ptg + ixti(u16) +
+/// PtgArea3d (base 0x1B | operand class). Layout: ptg + ixti(u16) +
 /// rwFirst(u16) + rwLast(u16) + colFirst_w_flags(u16) + colLast_w_flags(u16).
 fn emit_ptg_area3d(
     rgce: &mut Vec<u8>,
@@ -2398,6 +2582,7 @@ fn emit_ptg_area3d(
     row1: i32, column1: i32, abs_row1: bool, abs_col1: bool,
     row2: i32, column2: i32, abs_row2: bool, abs_col2: bool,
     anchor: CellAnchor,
+    cls: u8,
 ) -> Result<(), ()> {
     let r1_abs = resolve_to_absolute_1based(row1, abs_row1, anchor.row);
     let c1_abs = resolve_to_absolute_1based(column1, abs_col1, anchor.column);
@@ -2414,7 +2599,7 @@ fn emit_ptg_area3d(
         if !abs_r { w |= 0x8000; }
         w
     };
-    rgce.put_u8(0x3B);
+    rgce.put_u8(0x1B | cls);
     rgce.put_u16(ixti);
     rgce.put_u16(r1 as u16);
     rgce.put_u16(r2 as u16);
@@ -2943,6 +3128,281 @@ fn rgce_is_self_contained(rgce: &[u8]) -> bool {
     i == rgce.len()
 }
 
+/// Size of the ptg at offset `i`, or `None` for ptgs preserved-rgce
+/// replay doesn't handle (PtgExp / PtgTbl / PtgArray / PtgMemArea
+/// carry trailing data or anchor semantics; anything unknown).
+fn ptg_size_at(rgce: &[u8], i: usize) -> Option<usize> {
+    Some(match rgce[i] {
+        0x03..=0x16 => 1,
+        0x17 => {
+            if i + 3 > rgce.len() {
+                return None;
+            }
+            let cch = rgce[i + 1] as usize;
+            let wide = rgce[i + 2] & 1 == 1;
+            3 + cch * if wide { 2 } else { 1 }
+        }
+        0x19 => {
+            if i + 4 > rgce.len() {
+                return None;
+            }
+            if rgce[i + 1] & 0x04 != 0 {
+                let nc = u16::from_le_bytes([rgce[i + 2], rgce[i + 3]]) as usize;
+                4 + 2 * (nc + 1)
+            } else {
+                4
+            }
+        }
+        0x1C | 0x1D => 2,        // PtgErr, PtgBool
+        0x1E => 3,               // PtgInt
+        0x1F => 9,               // PtgNum
+        0x21 | 0x41 | 0x61 => 3, // PtgFunc
+        0x22 | 0x42 | 0x62 => 4, // PtgFuncVar
+        0x23 | 0x43 | 0x63 => 5, // PtgName
+        0x24 | 0x44 | 0x64 => 5, // PtgRef
+        0x25 | 0x45 | 0x65 => 9, // PtgArea
+        0x29 | 0x49 | 0x69 => 3, // PtgMemFunc
+        0x2A | 0x4A | 0x6A => 5, // PtgRefErr
+        0x2B | 0x4B | 0x6B => 9, // PtgAreaErr
+        0x2C | 0x4C | 0x6C => 5, // PtgRefN
+        0x2D | 0x4D | 0x6D => 9, // PtgAreaN
+        0x39 | 0x59 | 0x79 => 7,  // PtgNameX
+        0x3A | 0x5A | 0x7A => 7,  // PtgRef3d
+        0x3B | 0x5B | 0x7B => 11, // PtgArea3d
+        0x3C | 0x5C | 0x7C => 7,  // PtgRefErr3d
+        0x3D | 0x5D | 0x7D => 11, // PtgAreaErr3d
+        _ => return None,
+    })
+}
+
+/// Source-file table context for preserved-rgce replay: the NAME list
+/// in source Lbl order (PtgName inames are 1-based into it), the
+/// per-source-ixti sheet names, and the current model's sheet-name →
+/// index map for resolving those back.
+struct SourceRgceCtx<'a> {
+    names: &'a [String],
+    xti_sheets: &'a [Option<(String, String)>],
+    sheet_by_name: &'a HashMap<String, u32>,
+}
+
+impl<'a> SourceRgceCtx<'a> {
+    /// Resolve a source ixti to the model's (first, last) sheet
+    /// indices; None for add-in / external / deleted entries or
+    /// sheets that no longer exist.
+    fn resolve_ixti(&self, src_ixti: usize) -> Option<(u16, u16)> {
+        let (first, last) = self.xti_sheets.get(src_ixti)?.as_ref()?;
+        let fi = *self.sheet_by_name.get(&first.to_lowercase())? as u16;
+        let li = *self.sheet_by_name.get(&last.to_lowercase())? as u16;
+        Some((fi, li))
+    }
+}
+
+/// Rewrite a preserved (source-file) rgce so its table references
+/// point into THIS writer's rebuilt tables: PtgName inames remap by
+/// name string, Ptg*3d / Ptg*Err3d ixtis remap by sheet name through
+/// the writer's xti table (whose entries must have been registered by
+/// `register_preserved_xti` before EXTERNSHEET emission). Everything
+/// else passes verbatim — including the source's operand classes,
+/// which are Excel-authored and correct by construction. Returns
+/// `None` (caller falls back) on PtgNameX (the add-in list isn't
+/// name-remappable), unresolvable names/sheets, or unknown ptgs.
+fn remap_source_rgce(
+    rgce: &[u8],
+    ctx: &SourceRgceCtx,
+    defined_names: &DefinedNameTable,
+    extern_names: &ExternNameTable,
+    xti: &XtiTable,
+) -> Option<Vec<u8>> {
+    let mut out = rgce.to_vec();
+    let mut i = 0usize;
+    while i < out.len() {
+        match out[i] {
+            0x23 | 0x43 | 0x63 => {
+                if i + 5 > out.len() {
+                    return None;
+                }
+                let iname =
+                    u32::from_le_bytes([out[i + 1], out[i + 2], out[i + 3], out[i + 4]]) as usize;
+                let name = ctx.names.get(iname.checked_sub(1)?)?;
+                let canon = name.strip_prefix("_xlfn.").unwrap_or(name);
+                let ilbl = extern_names
+                    .name_fn_ilbl(canon)
+                    .or_else(|| defined_names.ilbl_for(name, None))?;
+                out[i + 1..i + 3].copy_from_slice(&ilbl.to_le_bytes());
+                out[i + 3] = 0;
+                out[i + 4] = 0;
+            }
+            0x3A | 0x5A | 0x7A | 0x3B | 0x5B | 0x7B | 0x3C | 0x5C | 0x7C | 0x3D | 0x5D
+            | 0x7D => {
+                if i + 3 > out.len() {
+                    return None;
+                }
+                let src_ixti = u16::from_le_bytes([out[i + 1], out[i + 2]]) as usize;
+                let (fi, li) = ctx.resolve_ixti(src_ixti)?;
+                let new_ixti = xti.lookup_pair(fi, li)?;
+                out[i + 1..i + 3].copy_from_slice(&new_ixti.to_le_bytes());
+            }
+            0x39 | 0x59 | 0x79 => return None, // PtgNameX
+            _ => {}
+        }
+        i += ptg_size_at(&out, i)?;
+    }
+    (i == out.len()).then_some(out)
+}
+
+/// Pre-pass before EXTERNSHEET emission: register in the writer's
+/// xti table every sheet span referenced by a preserved rgce (array
+/// formulas, unimported NAME records, #ERROR!-cell replays), so
+/// `remap_source_rgce` finds them at emission time.
+fn register_preserved_xti(
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
+    preserved_rgce: Option<&HashMap<(u32, i32, i32), Vec<u8>>>,
+    ctx: &SourceRgceCtx,
+    xti: &mut XtiTable,
+) {
+    let mut reg = |rgce: &[u8]| {
+        let mut i = 0usize;
+        while i < rgce.len() {
+            if matches!(
+                rgce[i],
+                0x3A | 0x5A | 0x7A | 0x3B | 0x5B | 0x7B | 0x3C | 0x5C | 0x7C | 0x3D | 0x5D | 0x7D
+            ) && i + 3 <= rgce.len()
+            {
+                let src_ixti = u16::from_le_bytes([rgce[i + 1], rgce[i + 2]]) as usize;
+                if let Some((fi, li)) = ctx.resolve_ixti(src_ixti) {
+                    xti.lookup_or_add_pair(fi, li);
+                }
+            }
+            match ptg_size_at(rgce, i) {
+                Some(sz) => i += sz,
+                None => break,
+            }
+        }
+    };
+    if let Some(p) = preserved {
+        for pa in &p.array_formulas {
+            reg(&pa.rgce);
+        }
+        for pn in &p.preserved_names {
+            reg(&pn.rgce);
+        }
+    }
+    if let Some(m) = preserved_rgce {
+        for r in m.values() {
+            reg(r);
+        }
+    }
+}
+
+/// Per-sheet plan for folding load-time-replicated array formulas
+/// back into their FORMULA(PtgExp) + ARRAY record structure on save.
+/// Built from `PreservedXlsData.array_formulas` by
+/// `build_array_plans`; only ranges whose cells are byte-for-byte
+/// unedited since load make it in — anything touched falls back to
+/// the per-cell expansion (which is also the pre-existing behaviour
+/// for every array range when no plan exists).
+struct SheetArrayPlan {
+    /// (row, col) 1-based → the range anchor as 0-based (rw, col),
+    /// ready for the PtgExp payload. Includes the anchor cell itself.
+    members: HashMap<(i32, i32), (u16, u16)>,
+    /// anchor (row, col) 1-based → prebuilt ARRAY record body,
+    /// written immediately after the anchor's FORMULA record.
+    anchors: HashMap<(i32, i32), Vec<u8>>,
+}
+
+fn build_array_plans(
+    model: &ironcalc::base::Model,
+    preserved: Option<&crate::xls_preserve::PreservedXlsData>,
+    ctx: Option<&SourceRgceCtx>,
+    defined_names: &DefinedNameTable,
+    extern_names: &ExternNameTable,
+    xti: &XtiTable,
+) -> HashMap<u32, SheetArrayPlan> {
+    let mut plans: HashMap<u32, SheetArrayPlan> = HashMap::new();
+    let Some(p) = preserved else { return plans };
+    for pa in &p.array_formulas {
+        // BIFF limits: rows u16, cols u8 in the ARRAY record's range.
+        if pa.r1 < 1 || pa.c1 < 1 || pa.r2 > 0x1_0000 || pa.c2 > 256 {
+            continue;
+        }
+        let Some(sheet_idx) = model
+            .workbook
+            .worksheets
+            .iter()
+            .position(|w| w.name.eq_ignore_ascii_case(&pa.sheet_name))
+        else {
+            continue;
+        };
+        let sheet_idx = sheet_idx as u32;
+        // Unedited check: the model's canonical formula text for every
+        // cell in the range must equal the snapshot taken right after
+        // load-time replication.
+        let mut snap = pa.cell_formulas.iter();
+        let unedited = (pa.r1..=pa.r2).all(|r| {
+            (pa.c1..=pa.c2).all(|c| {
+                let actual = model.get_cell_formula(sheet_idx, r, c).ok().flatten();
+                snap.next().map(|expected| *expected == actual).unwrap_or(false)
+            })
+        });
+        if !unedited {
+            continue;
+        }
+        let Some(rgce) = ctx
+            .and_then(|c| remap_source_rgce(&pa.rgce, c, defined_names, extern_names, xti))
+        else {
+            continue;
+        };
+        // ARRAY record body ([MS-XLS] 2.4.4): rwFirst(2) rwLast(2)
+        // colFirst(1) colLast(1) flags(2) chn(4) cce(2) rgce.
+        let mut body = Vec::with_capacity(14 + rgce.len());
+        body.put_u16((pa.r1 - 1) as u16);
+        body.put_u16((pa.r2 - 1) as u16);
+        body.put_u8((pa.c1 - 1) as u8);
+        body.put_u8((pa.c2 - 1) as u8);
+        body.put_u16(0); // flags
+        body.put_u32(0); // chn — reserved, readers rebuild it
+        body.put_u16(rgce.len() as u16);
+        body.extend_from_slice(&rgce);
+        let plan = plans.entry(sheet_idx).or_insert_with(|| SheetArrayPlan {
+            members: HashMap::new(),
+            anchors: HashMap::new(),
+        });
+        let anchor0 = ((pa.r1 - 1) as u16, (pa.c1 - 1) as u16);
+        for r in pa.r1..=pa.r2 {
+            for c in pa.c1..=pa.c2 {
+                plan.members.insert((r, c), anchor0);
+            }
+        }
+        plan.anchors.insert((pa.r1, pa.c1), body);
+    }
+    plans
+}
+
+/// Cached-value classification for an array-member cell. `None` for
+/// non-formula cells — can't happen for a validated range (the
+/// unedited check requires formula text in every cell), but the
+/// caller falls back to normal emission rather than panicking.
+fn array_member_cached(
+    cell: &ironcalc::base::types::Cell,
+) -> Option<(FormulaCachedValue, Option<&str>)> {
+    use ironcalc::base::types::Cell;
+    match cell {
+        Cell::CellFormulaNumber { v, .. } => Some((FormulaCachedValue::Number(*v), None)),
+        Cell::CellFormulaBoolean { v, .. } => Some((FormulaCachedValue::Bool(*v), None)),
+        Cell::CellFormulaError { ei, .. } => {
+            Some((FormulaCachedValue::Error(ironcalc_error_to_biff(ei)), None))
+        }
+        Cell::CellFormulaString { v, .. } if v.is_empty() => {
+            Some((FormulaCachedValue::Blank, None))
+        }
+        Cell::CellFormulaString { v, .. } => {
+            Some((FormulaCachedValue::StringPending, Some(v.as_str())))
+        }
+        Cell::CellFormula { .. } => Some((FormulaCachedValue::Number(0.0), None)),
+        _ => None,
+    }
+}
+
 /// Try to encode the parsed formula at index `f`; on any failure (no
 /// such index, encoder hit an unsupported node), fall back to the
 /// placeholder rgce that just pushes the cached value. Anchor is the
@@ -2961,7 +3421,7 @@ fn encode_or_placeholder(
     cached_string: Option<&str>,
 ) -> Vec<u8> {
     if let Some(node) = parsed_formulas.get(f as usize) {
-        if let Some(rgce) = encode_formula_rgce_with_names(node, sheet_idx, anchor, xti, defined_names, extern_names) {
+        if let Some(rgce) = encode_formula_rgce_with_names(node, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL) {
             return rgce;
         }
     }
@@ -3089,6 +3549,8 @@ fn emit_sheet_cells(
     extern_names: &ExternNameTable,
     style_tables: &StyleTables,
     preserved_rgce: Option<&HashMap<(u32, i32, i32), Vec<u8>>>,
+    arrays: Option<&SheetArrayPlan>,
+    remap_ctx: Option<&SourceRgceCtx>,
 ) {
     use ironcalc::base::types::Cell;
     // The cell table is organized in row blocks of up to 32 rows:
@@ -3165,6 +3627,31 @@ fn emit_sheet_cells(
                 .get(s as usize)
                 .copied()
                 .unwrap_or(style_tables.default_cell_xf_idx);
+            // Array-entered cell (validated-unedited range from the
+            // source file): emit FORMULA with a PtgExp rgce pointing
+            // at the range anchor; the anchor's FORMULA is followed
+            // by the ARRAY record carrying the real (remapped) rgce.
+            // Record order matches Excel: FORMULA → ARRAY → STRING.
+            if let Some((anchor0, (cached, pending_str))) = arrays.and_then(|plan| {
+                let anchor0 = plan.members.get(&(*row, *col))?;
+                Some((anchor0, array_member_cached(cell)?))
+            }) {
+                let mut rgce = Vec::with_capacity(5);
+                rgce.put_u8(0x01); // PtgExp
+                rgce.put_u16(anchor0.0);
+                rgce.put_u16(anchor0.1);
+                w.write_record(
+                    R_FORMULA,
+                    &build_formula_with_grbit(rw, cl, ixfe, &cached, &rgce, 0x0020),
+                );
+                if let Some(body) = arrays.and_then(|plan| plan.anchors.get(&(*row, *col))) {
+                    w.write_record(R_ARRAY, body);
+                }
+                if let Some(v) = pending_str {
+                    w.write_record(R_STRING, &build_string(v));
+                }
+                continue;
+            }
             match cell {
                 Cell::EmptyCell { s } => {
                     // Only emit BLANK if the cell has non-default styling
@@ -3220,7 +3707,7 @@ fn emit_sheet_cells(
                     let mut emitted = false;
                     if let Some(node) = parsed_formulas.get(*f as usize) {
                         if let Some(rgce) = encode_formula_rgce_with_names(
-                            node, sheet_idx, anchor, xti, defined_names, extern_names,
+                            node, sheet_idx, anchor, xti, defined_names, extern_names, CLS_VAL,
                         ) {
                             if v.is_empty() {
                                 // Empty cached result — Blank tag
@@ -3269,11 +3756,24 @@ fn emit_sheet_cells(
                     // with different numbering — replaying those made
                     // POI throw IndexOutOfBounds on the dangling ixti
                     // (2026-08-14 report follow-up).
+                    // Verbatim replay when self-contained; otherwise
+                    // remap the source rgce's table references into
+                    // this file's rebuilt tables (the xti spans were
+                    // registered before EXTERNSHEET emission). Keeps
+                    // formula identity for cells IronCalc can't parse
+                    // — e.g. the `#REF!#REF!` dead-3D-ref idiom.
                     let key = (sheet_idx, *row, *col);
                     let rgce = preserved_rgce
                         .and_then(|m| m.get(&key))
-                        .filter(|r| rgce_is_self_contained(r))
-                        .cloned()
+                        .and_then(|r| {
+                            if rgce_is_self_contained(r) {
+                                Some(r.clone())
+                            } else {
+                                remap_ctx.and_then(|c| {
+                                    remap_source_rgce(r, c, defined_names, extern_names, xti)
+                                })
+                            }
+                        })
                         .unwrap_or_else(|| {
                             encode_or_placeholder(parsed_formulas, *f, sheet_idx, anchor, xti, defined_names, extern_names, &cached, None)
                         });
@@ -3614,7 +4114,44 @@ fn build_workbook_stream(
         // ATP calls whose PtgNameX bakes this ixti in.
         extern_names.addin_ixti = xti.addin_ixti();
     }
-    let defined_names = build_defined_name_table(model, &mut xti, &extern_names);
+    let mut defined_names = build_defined_name_table(model, &mut xti, &extern_names);
+    // Preserved-rgce replay context: source NAME order + source xti
+    // sheet names + the model's sheet-name index. Shared by array
+    // re-emission, unimported-NAME replay, and #ERROR!-cell replay.
+    let sheet_by_name: HashMap<String, u32> = model
+        .workbook
+        .worksheets
+        .iter()
+        .enumerate()
+        .map(|(i, ws)| (ws.name.to_lowercase(), i as u32))
+        .collect();
+    let src_ctx: Option<SourceRgceCtx> = preserved.map(|p| SourceRgceCtx {
+        names: &p.source_defined_names,
+        xti_sheets: &p.source_xti_sheets,
+        sheet_by_name: &sheet_by_name,
+    });
+    // Unimported source NAME records to append after the writer's own
+    // Lbl records (registers their ilbls in the lookup so preserved
+    // rgce referencing them can remap).
+    let preserved_name_plans =
+        plan_preserved_names(preserved, &mut defined_names, &extern_names, &sheet_by_name);
+    // Register every sheet span referenced from preserved rgce BEFORE
+    // the EXTERNSHEET record is emitted below — remapping at cell/Lbl
+    // emission time can only LOOK UP entries.
+    if let Some(ctx) = src_ctx.as_ref() {
+        register_preserved_xti(preserved, preserved_rgce, ctx, &mut xti);
+    }
+    // Array-formula re-emission plans: which cell ranges get folded
+    // back into FORMULA(PtgExp) + ARRAY records instead of expanded
+    // per-cell formulas. Needs both name tables for the rgce remap.
+    let array_plans = build_array_plans(
+        model,
+        preserved,
+        src_ctx.as_ref(),
+        &defined_names,
+        &extern_names,
+        &xti,
+    );
     if !xti.entries.is_empty() {
         // Record order is load-bearing for POI's LinkTable: each
         // SUPBOOK is immediately followed by ITS EXTERNNAME records,
@@ -3678,6 +4215,23 @@ fn build_workbook_stream(
     for (name, is_xlfn) in &extern_names.name_fns {
         let body = build_fn_lbl_record(name, *is_xlfn);
         w.write_record(R_LBL, &body);
+    }
+    // Then the preserved source NAME records the loader couldn't
+    // import (builtin _FilterDatabase / Print_Titles, _xlfn stubs,
+    // grammar-rejected and #REF! names) — replayed with their rgce
+    // remapped into this file's tables. A failed remap emits the Lbl
+    // with an empty rgce (resolves #REF!) rather than dropping the
+    // record: the name keeps existing, which is what AutoFilter /
+    // print setup / VBA lookups care about.
+    if let Some(p) = preserved {
+        for &(idx, itab) in &preserved_name_plans {
+            let pn = &p.preserved_names[idx];
+            let rgce = src_ctx
+                .as_ref()
+                .and_then(|c| remap_source_rgce(&pn.rgce, c, &defined_names, &extern_names, &xti))
+                .unwrap_or_default();
+            w.write_record(R_LBL, &build_preserved_lbl_record(pn, itab, &rgce));
+        }
     }
 
     // SST + EXTSST. The pre-SST zone carries RECALCID, FEAT headers,
@@ -3770,7 +4324,7 @@ fn build_workbook_stream(
         // ROW + cell records are emitted together by emit_sheet_cells
         // in [MS-XLS] row-block layout (≤32 ROW records, then those
         // rows' cells) — every populated row gets a ROW record.
-        emit_sheet_cells(&mut w, ws, i as u32, &sst_table, &sst_idx, parsed, &xti, &defined_names, &extern_names, &style_tables, preserved_rgce);
+        emit_sheet_cells(&mut w, ws, i as u32, &sst_table, &sst_idx, parsed, &xti, &defined_names, &extern_names, &style_tables, preserved_rgce, array_plans.get(&(i as u32)), src_ctx.as_ref());
 
         // post_cells_pre_win2 zone: CONDFMT/CF, HLINK, DVAL/DV,
         // PHONETICINFO, FEAT, etc. — these land between the cell
@@ -4721,5 +5275,93 @@ mod tests {
         assert_eq!(recs[0].1, MAX_RECORD_BODY);
         assert_eq!(recs[1].0, R_CONTINUE);
         assert_eq!(recs[1].1, 100);
+    }
+
+    /// Extract the rgce of the FORMULA record at (rw0, col0) — 0-based
+    /// — anywhere in the stream. Cell coordinates are unique enough
+    /// for these single-sheet-of-interest tests.
+    fn formula_rgce_at(buf: &[u8], rw0: u16, col0: u16) -> Option<Vec<u8>> {
+        let mut pos = 0;
+        while pos + 4 <= buf.len() {
+            let rt = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+            let rl = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+            let body = &buf[pos + 4..pos + 4 + rl];
+            if rt == R_FORMULA && body.len() >= 22 {
+                let rw = u16::from_le_bytes([body[0], body[1]]);
+                let col = u16::from_le_bytes([body[2], body[3]]);
+                if rw == rw0 && col == col0 {
+                    let cce = u16::from_le_bytes([body[20], body[21]]) as usize;
+                    return Some(body[22..22 + cce].to_vec());
+                }
+            }
+            pos += 4 + rl;
+        }
+        None
+    }
+
+    /// Operand-class pins. Excel's recalc engine turns ref-class
+    /// PtgName / Ptg*3d in value contexts into #VALUE! on every
+    /// dependent (2026-08-14, neutral.xls: proven by flipping the
+    /// single class byte 0x3A→0x5A on one cell and watching it
+    /// recover). These assertions pin the class byte the encoder
+    /// emits per context.
+    #[test]
+    fn operand_classes_match_excel_conventions() {
+        let mut m = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        m.add_sheet("Data").unwrap();
+        m.set_user_input(1, 1, 1, "5".into()).unwrap();
+        m.new_defined_name("DataCol", None, "Data!$A$1:$A$3").unwrap();
+        // A1: cross-sheet ref at root — must be VALUE class (0x5A).
+        m.set_user_input(0, 1, 1, "=Data!A1".into()).unwrap();
+        // A2: name at root — VALUE class PtgName (0x43).
+        m.set_user_input(0, 2, 1, "=DataCol".into()).unwrap();
+        // A3: SUM's arg is declared ref class — Area3d stays 0x3B.
+        m.set_user_input(0, 3, 1, "=SUM(Data!A1:A3)".into()).unwrap();
+        // A4: same-sheet ref as operator operand — VALUE class (0x44).
+        m.set_user_input(0, 4, 1, "=A1+1".into()).unwrap();
+        m.evaluate();
+        let bytes = build_xls_bytes(&m, None);
+
+        let a1 = formula_rgce_at(&bytes, 0, 0).expect("A1 rgce");
+        assert_eq!(a1[0], 0x5A, "root cross-sheet ref must be value-class PtgRef3d");
+        let a2 = formula_rgce_at(&bytes, 1, 0).expect("A2 rgce");
+        assert_eq!(a2[0], 0x43, "root defined name must be value-class PtgName");
+        let a3 = formula_rgce_at(&bytes, 2, 0).expect("A3 rgce");
+        assert_eq!(a3[0], 0x3B, "SUM's range arg keeps ref-class PtgArea3d");
+        assert_eq!(a3[a3.len() - 4], 0x42, "PtgFuncVar carries value class in cell context");
+        let a4 = formula_rgce_at(&bytes, 3, 0).expect("A4 rgce");
+        assert_eq!(a4[0], 0x44, "operator operand ref must be value class");
+    }
+
+    /// Defined-name definitions are reference contexts: their rgce
+    /// must keep base/ref-class ptgs (Excel writes temp1 as 0x3B).
+    #[test]
+    fn defined_name_rgce_stays_reference_class() {
+        let mut m = ironcalc::base::Model::new_empty("t", "en", "UTC", "en").unwrap();
+        m.add_sheet("Data").unwrap();
+        m.new_defined_name("DataCol", None, "Data!$A$1:$A$3").unwrap();
+        m.evaluate();
+        let bytes = build_xls_bytes(&m, None);
+        let mut pos = 0;
+        let mut found = false;
+        while pos + 4 <= bytes.len() {
+            let rt = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
+            let rl = u16::from_le_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+            if rt == R_LBL {
+                let body = &bytes[pos + 4..pos + 4 + rl];
+                let cch = body[3] as usize;
+                let cce = u16::from_le_bytes([body[4], body[5]]) as usize;
+                let hi = body[14] & 1 == 1;
+                let name_len = if hi { cch * 2 } else { cch };
+                let name = &body[15..15 + cch.min(body.len() - 15)];
+                if !hi && name == b"DataCol" {
+                    let rgce = &body[15 + name_len..15 + name_len + cce];
+                    assert_eq!(rgce[0], 0x3B, "name definition must be ref-class PtgArea3d");
+                    found = true;
+                }
+            }
+            pos += 4 + rl;
+        }
+        assert!(found, "DataCol Lbl record not found");
     }
 }
