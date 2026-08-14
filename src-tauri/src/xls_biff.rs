@@ -159,6 +159,14 @@ pub struct XlsShape {
     /// = 51 = 0x33) decodes to `$B$2:$Z$56` when bit 0x20 is set in
     /// the high byte. Keyed by name in lowercase.
     pub defined_name_refs: HashMap<String, Vec<String>>,
+    /// Every NAME (Lbl) record in stream order, raw: name string,
+    /// flags, scope itab and rgce bytes. 1-based PtgName inames index
+    /// this list. The loader uses it to build the save-side
+    /// preservation list for names it can't import into the IronCalc
+    /// model (builtin _FilterDatabase / Print_Titles, `_xlfn.*`
+    /// stubs, names IronCalc's identifier grammar rejects, #REF!
+    /// names).
+    pub raw_names: Vec<RawNameEntry>,
     /// Excel's cached last-evaluated value for each FORMULA cell —
     /// either a number, a boolean, an error code, or a string (strings
     /// arrive separately in a STRING record, so we only capture the
@@ -243,6 +251,19 @@ pub struct XtiEntry {
     pub isup_book: u16,
     pub itab_first: i16,
     pub itab_last: i16,
+}
+
+/// One NAME (Lbl) record captured verbatim by the scanner. `itab` is
+/// the Lbl scope field: 0 = workbook-global, otherwise 1-based sheet
+/// index. `name` may be a single control character for builtin names
+/// ([MS-XLS] 2.5.65: 0x0D = _FilterDatabase, 0x06 = Print_Titles, ...).
+#[derive(Debug, Clone, Default)]
+pub struct RawNameEntry {
+    pub grbit: u16,
+    pub ch_key: u8,
+    pub itab: u16,
+    pub name: String,
+    pub rgce: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -756,6 +777,13 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                 .unwrap_or_default();
                 let rgce_start = name_bytes_start + name_byte_len;
                 let rgce = &data[rgce_start..rgce_start + cce];
+                shape.raw_names.push(RawNameEntry {
+                    grbit,
+                    ch_key: data[2],
+                    itab: u16::from_le_bytes([data[8], data[9]]),
+                    name: name.clone(),
+                    rgce: rgce.to_vec(),
+                });
                 if !is_builtin && !name.is_empty() && cce > 0 {
                     let refs = extract_refs_with_xti(
                         rgce,
