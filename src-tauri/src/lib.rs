@@ -11,6 +11,7 @@ mod util;
 mod workbook;
 mod wsl;
 pub mod xls_biff;
+mod xls_fn_classes;
 pub mod xls_load;
 pub mod xls_preserve;
 pub mod xls_save;
