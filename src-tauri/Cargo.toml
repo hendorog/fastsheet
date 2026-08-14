@@ -50,6 +50,11 @@ path = "examples/array_probe.rs"
 required-features = ["dev-bins"]
 
 [[example]]
+name = "style_diff"
+path = "examples/style_diff.rs"
+required-features = ["dev-bins"]
+
+[[example]]
 name = "biff_surgery"
 path = "examples/biff_surgery.rs"
 required-features = ["dev-bins"]

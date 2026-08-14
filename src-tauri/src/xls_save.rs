@@ -44,6 +44,8 @@ const R_HIDEOBJ: u16 = 0x008D;
 const R_FONT: u16 = 0x0031;
 const R_FORMAT: u16 = 0x041E;
 const R_XF: u16 = 0x00E0;
+const R_XFCRC: u16 = 0x087C;
+const R_XFEXT: u16 = 0x087D;
 const R_STYLE: u16 = 0x0293;
 const R_USESELFS: u16 = 0x0160;
 const R_COUNTRY: u16 = 0x008C;
@@ -245,14 +247,23 @@ impl BiffBody for Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// BOF — Beginning of File / substream marker. [MS-XLS] 2.4.21.
+///
+/// The version fields must declare a MODERN Excel writer. The old
+/// values (rupBuild 0x0DBB, rupYear 0x07CC = 1996, bfh 0x41) said
+/// "last saved by an Excel-97-era build", and Excel gates its trust
+/// in post-2003 FRT records on them — with the old BOF, Excel
+/// silently discarded our XFEXT true-color records even with a valid
+/// XFCRC (2026-08-14). These constants mirror what current Excel
+/// writes in real files (neutral.xls: rupBuild 20314, rupYear 1997,
+/// verLastXLSaved in bfh = 0x8xxxx band, verLowestBiff 6).
 fn build_bof(substream: u16) -> Vec<u8> {
     let mut body = Vec::with_capacity(16);
     body.put_u16(0x0600); // vers = BIFF8
     body.put_u16(substream); // dt = substream type
-    body.put_u16(0x0DBB);    // rupBuild (arbitrary)
-    body.put_u16(0x07CC);    // rupYear (arbitrary; Excel 2000+ accepts)
-    body.put_u32(0x00000041); // bfh = file history flags
-    body.put_u32(0x00000006); // sfh = lowest BIFF version that can read
+    body.put_u16(0x4F5A);    // rupBuild (20314, modern Excel)
+    body.put_u16(0x07CD);    // rupYear (1997 — fixed for BIFF8)
+    body.put_u32(0x000380D9); // bfh: history flags + verLastXLSaved
+    body.put_u32(0x00000806); // sfo: verLowestBiff=6 + reserved
     body
 }
 
@@ -796,6 +807,79 @@ fn match_default_palette_icv(rgb: [u8; 3]) -> Option<u16> {
         .find_map(|&(icv, c)| if c == rgb { Some(icv) } else { None })
 }
 
+/// MsoCRC32 ([MS-OSHARED] 2.4.3): the checksum Excel stores in XFCRC
+/// (0x087C) over the concatenated data of all XF records, and checks
+/// on load to decide whether the file's XFEXT records are trustworthy
+/// (a writer that rebuilt the XF table without updating the crc has
+/// stale extensions). The cache is spec-literal — including the odd
+/// 16-bit mask — and verified against Excel's own XFCRC in
+/// neutral.xls (0xB4C2D16A over 2,111 XF records, 2026-08-14).
+fn mso_crc32(data: &[u8], init: u32) -> u32 {
+    let mut cache = [0u32; 256];
+    for (i, slot) in cache.iter_mut().enumerate() {
+        let mut v = (i as u32) << 24;
+        for _ in 0..8 {
+            v = if v & 0x8000_0000 != 0 {
+                (v << 1) ^ 0xAF
+            } else {
+                v << 1
+            };
+        }
+        *slot = v & 0xFFFF;
+    }
+    let mut crc = init;
+    for &b in data {
+        let idx = ((crc >> 24) as u8 ^ b) as usize;
+        crc = (crc << 8) ^ cache[idx];
+    }
+    crc
+}
+
+/// XFCRC record body ([MS-XLS] 2.4.354): frtHeader(12) + reserved(2)
+/// + cxfs(2) + the MsoCRC32 of all XF record bodies.
+fn build_xfcrc_record(xfs: &[Vec<u8>]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    for xf in xfs {
+        blob.extend_from_slice(xf);
+    }
+    let crc = mso_crc32(&blob, 0);
+    let mut body = Vec::with_capacity(20);
+    body.put_u16(0x087C); // frtHeader.rt
+    body.put_u16(0);      // frtHeader.grbitFrt
+    body.extend_from_slice(&[0u8; 8]); // frtHeader.reserved
+    body.put_u16(0);      // reserved1
+    body.put_u16(xfs.len() as u16); // cxfs
+    body.put_u32(crc);
+    body
+}
+
+/// XFEXT record body ([MS-XLS] 2.4.355): frtHeader(12) + reserved1(2)
+/// + ixfe(2) + reserved2(2) + cexts(2) + ExtProps. Each ExtProp is
+/// extType(2) + cb(2)=20 + FullColorExt(xclrType=2 RGB, tint=0,
+/// LongRGBA value, 8 unused).
+fn build_xfext_record(ixfe: u16, exts: &[(u16, [u8; 3])]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(20 + exts.len() * 20);
+    body.put_u16(0x087D);
+    body.put_u16(0);
+    body.extend_from_slice(&[0u8; 8]);
+    body.put_u16(0);
+    body.put_u16(ixfe);
+    body.put_u16(0);
+    body.put_u16(exts.len() as u16);
+    for &(ext_type, rgb) in exts {
+        body.put_u16(ext_type);
+        body.put_u16(20); // cb: 4 header + 16 FullColorExt
+        body.put_u16(2);  // xclrType = RGB
+        body.put_u16(0);  // nTintShade
+        body.put_u8(rgb[0]);
+        body.put_u8(rgb[1]);
+        body.put_u8(rgb[2]);
+        body.put_u8(0xFF); // LongRGBA alpha
+        body.extend_from_slice(&[0u8; 8]); // unused
+    }
+    body
+}
+
 /// Pre-computed BIFF style records derived from the IronCalc model.
 struct StyleTables {
     /// FONT record bodies in file-emission order. Length is at least 5
@@ -817,6 +901,13 @@ struct StyleTables {
     /// default palette at specific slots. Slots not in this list
     /// keep their default colors. Empty ⇒ no PALETTE record needed.
     palette: Vec<(u16, [u8; 3])>,
+    /// True-color extensions per BIFF XF index, for colors the
+    /// 56-slot palette could only approximate: (ixfe, [(extType,
+    /// rgb)]). Emitted as XFCRC + XFEXT records so modern Excel (and
+    /// our own loader) render the exact colors while legacy readers
+    /// fall back to the nearest-palette icv baked into the XF —
+    /// the same two-tier scheme Excel itself writes.
+    xfext: Vec<(u16, Vec<(u16, [u8; 3])>)>,
 }
 
 /// Map a model font's array index to its BIFF8 file font index, applying
@@ -897,7 +988,47 @@ fn palette_assign(state: &mut PaletteState, color: Option<&str>) -> u16 {
         }
         candidate += 1;
     }
-    ICV_AUTO
+    // Palette exhausted (a workbook with more unique colors than the
+    // 56 slots — neutral.xls has 66 fills alone). Falling back to
+    // ICV_AUTO here made solid fills render as NO fill (auto
+    // foreground on a solid pattern reads back as unset): 6,136 cells
+    // lost their fill on the 2026-08-14 fidelity audit. Do what Excel
+    // itself does when quantizing to the legacy palette: nearest
+    // color by squared RGB distance over every assigned slot. Exact
+    // colors ride the XFEXT records on top.
+    nearest_palette_icv(state, rgb)
+}
+
+/// Nearest already-assigned palette slot (defaults + custom
+/// overrides) by squared RGB distance.
+fn nearest_palette_icv(state: &PaletteState, rgb: [u8; 3]) -> u16 {
+    let dist = |a: [u8; 3]| -> i64 {
+        let dr = a[0] as i64 - rgb[0] as i64;
+        let dg = a[1] as i64 - rgb[1] as i64;
+        let db = a[2] as i64 - rgb[2] as i64;
+        dr * dr + dg * dg + db * db
+    };
+    // Custom slots override the default color at their icv, so a
+    // default entry whose slot was reassigned no longer exists.
+    BIFF_DEFAULT_PALETTE
+        .iter()
+        .filter(|(icv, _)| !state.custom.iter().any(|(ci, _)| ci == icv))
+        .map(|&(icv, c)| (icv, dist(c)))
+        .chain(state.custom.iter().map(|&(icv, c)| (icv, dist(c))))
+        .min_by_key(|&(_, d)| d)
+        .map(|(icv, _)| icv)
+        .unwrap_or(ICV_AUTO)
+}
+
+/// The color currently occupying a palette slot: custom override
+/// first, then the BIFF default. None for auto / out-of-range icvs.
+fn palette_rgb(state: &PaletteState, icv: u16) -> Option<[u8; 3]> {
+    if let Some(&(_, rgb)) = state.custom.iter().find(|(i, _)| *i == icv) {
+        return Some(rgb);
+    }
+    BIFF_DEFAULT_PALETTE
+        .iter()
+        .find_map(|&(i, c)| if i == icv { Some(c) } else { None })
 }
 
 /// Build a BIFF FONT record from an IronCalc Font.
@@ -1200,6 +1331,7 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
     xfs.push(build_xf_record(0, 0, false, 0, 0, 2, false, 0, 0, 0, 0, (0, 0, 0, 0), 0, 0, 0));
 
     let mut cell_xf_index: Vec<u16> = Vec::with_capacity(styles.cell_xfs.len());
+    let mut xfext: Vec<(u16, Vec<(u16, [u8; 3])>)> = Vec::new();
     for cxf in &styles.cell_xfs {
         // Resolve font.
         let ifnt = if cxf.font_id >= 0 {
@@ -1265,6 +1397,61 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
         ));
         cell_xf_index.push((xfs.len() - 1) as u16);
 
+        // XFEXT capture: any color whose palette slot doesn't hold the
+        // exact RGB (nearest-match fallback, or auto because the color
+        // never got a slot) gets a FullColorExt carrying the true
+        // value. extType codes per [MS-XLS] 2.5.108 / our scanner:
+        // 0x04 fill fg, 0x05 fill bg, 0x07-0x0A border t/b/l/r,
+        // 0x0D font color.
+        let mut exts: Vec<(u16, [u8; 3])> = Vec::new();
+        fn ext_check(
+            palette: &PaletteState,
+            exts: &mut Vec<(u16, [u8; 3])>,
+            ext_type: u16,
+            color: Option<&str>,
+            icv: u16,
+        ) {
+            let Some(hex) = color else { return };
+            let Some(rgb) = parse_hex_color(hex) else { return };
+            if palette_rgb(palette, icv) != Some(rgb) {
+                exts.push((ext_type, rgb));
+            }
+        }
+        if cxf.fill_id >= 0 {
+            if let Some(fill) = styles.fills.get(cxf.fill_id as usize) {
+                ext_check(&palette, &mut exts, 0x0004, fill.fg_color.as_deref(), fill_fg_icv);
+                ext_check(&palette, &mut exts, 0x0005, fill.bg_color.as_deref(), fill_bg_icv);
+            }
+        }
+        if cxf.border_id >= 0 {
+            if let Some(bd) = styles.borders.get(cxf.border_id as usize) {
+                let color = |it: &Option<ironcalc::base::types::BorderItem>| {
+                    it.as_ref().and_then(|b| b.color.clone())
+                };
+                ext_check(&palette, &mut exts, 0x0007, color(&bd.top).as_deref(), icv_t);
+                ext_check(&palette, &mut exts, 0x0008, color(&bd.bottom).as_deref(), icv_b);
+                ext_check(&palette, &mut exts, 0x0009, color(&bd.left).as_deref(), icv_l);
+                ext_check(&palette, &mut exts, 0x000A, color(&bd.right).as_deref(), icv_r);
+            }
+        }
+        if cxf.font_id >= 0 {
+            if let Some(font) = styles.fonts.get(cxf.font_id as usize) {
+                if let Some(hex) = font.color.as_deref() {
+                    // Re-derive the icv the FONT record got — the
+                    // palette state is stable by now, so assignment
+                    // is a pure lookup.
+                    let icv = palette_assign(&mut palette, Some(hex));
+                    ext_check(&palette, &mut exts, 0x000D, Some(hex), icv);
+                }
+            }
+        }
+        if !exts.is_empty() {
+            // fHasXFExt — bit 25 of the u32 at XF offset 14; Excel
+            // ignores XFEXT records whose XF doesn't opt in.
+            let body = xfs.last_mut().unwrap();
+            body[17] |= 0x02;
+            xfext.push(((xfs.len() - 1) as u16, exts));
+        }
     }
 
     StyleTables {
@@ -1274,6 +1461,7 @@ fn build_style_tables(model: &ironcalc::base::Model) -> StyleTables {
         default_cell_xf_idx,
         cell_xf_index,
         palette: palette.custom,
+        xfext,
     }
 }
 
@@ -4000,6 +4188,15 @@ fn build_workbook_stream(
     flush_zone!(w, R_XF);
     for body in &style_tables.xfs {
         w.write_record(R_XF, body);
+    }
+    // XFCRC + XFEXT: true colors for palette-approximated slots.
+    // Excel validates the crc against the XF records above and only
+    // honours the XFEXTs when it matches.
+    if !style_tables.xfext.is_empty() {
+        w.write_record(R_XFCRC, &build_xfcrc_record(&style_tables.xfs));
+        for (ixfe, exts) in &style_tables.xfext {
+            w.write_record(R_XFEXT, &build_xfext_record(*ixfe, exts));
+        }
     }
 
     // STYLE records — register the 6 standard built-in styles. The
