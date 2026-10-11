@@ -14,6 +14,7 @@
     rangeC1: number;
     rangeR2: number;
     rangeC2: number;
+    initialTab?: "number" | "font" | "border" | "fill" | "alignment";
     onClose: () => void;
     onApplied: () => void | Promise<void>;
     onStatus: (msg: string) => void;
@@ -46,13 +47,16 @@
     rangeC1,
     rangeR2,
     rangeC2,
+    initialTab,
     onClose,
     onApplied,
     onStatus,
   }: Props = $props();
 
   type Tab = "number" | "font" | "border" | "fill" | "alignment";
-  let activeTab = $state<Tab>("number");
+  // Capture-at-mount is intended: the dialog remounts on every open.
+  // svelte-ignore state_referenced_locally
+  let activeTab = $state<Tab>(initialTab ?? "number");
   let initial = $state<FormatInfo | null>(null);
   let busy = $state(false);
   let cardEl: HTMLDivElement | null = $state(null);
@@ -538,6 +542,12 @@
         </div>
       {:else if activeTab === "font"}
         <div class="font-grid">
+          <div class="font-current">
+            <span class="font-current-label">Font</span>
+            <span class="font-current-value">
+              {initial ? `${initial.font_name} ${initial.font_size}` : "…"}
+            </span>
+          </div>
           <label class="check">
             <input type="checkbox" bind:checked={bold} /> <strong>Bold</strong>
           </label>
@@ -562,8 +572,9 @@
             {/if}
           </div>
           <p class="hint">
-            Font face + size are sourced from the file's defaults. Use the
-            colour picker to override per-cell text colour.
+            Font face + size are read-only for now (shown as the file
+            resolved them for this cell). Use the colour picker to
+            override per-cell text colour.
           </p>
         </div>
       {:else if activeTab === "border"}
@@ -813,6 +824,26 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+  .font-current {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 10px;
+    border: 1px dashed #ccc;
+    border-radius: 2px;
+    background: #fafafa;
+    margin-bottom: 4px;
+  }
+  .font-current-label {
+    color: #888;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .font-current-value {
+    font-size: 14px;
+    font-weight: 600;
   }
   .border-grid {
     display: grid;

@@ -19,16 +19,22 @@ fn get_border(node: Node, name: &str) -> Result<Option<BorderItem>, XlsxError> {
         .collect::<Vec<Node>>();
     if border_nodes.len() == 1 {
         let border = border_nodes[0];
+        // OOXML style tokens are camelCase ("mediumDashed"); the
+        // upstream match used lowercase for the multi-word tokens (so
+        // they never matched) and omitted "dotted" entirely — both
+        // collapsed to Thin. Fastsheet vendor patch. Tokens with no
+        // BorderStyle variant (dashed, hair, dashDot, dashDotDot)
+        // still fall back to Thin.
         style = match border.attribute("style") {
             Some("thin") => BorderStyle::Thin,
             Some("medium") => BorderStyle::Medium,
             Some("thick") => BorderStyle::Thick,
             Some("double") => BorderStyle::Double,
-            Some("slantdashdot") => BorderStyle::SlantDashDot,
-            Some("mediumdashed") => BorderStyle::MediumDashed,
-            Some("mediumdashdot") => BorderStyle::MediumDashDot,
-            Some("mediumdashdotdot") => BorderStyle::MediumDashDotDot,
-            // TODO: Should we fail in this case or set the border to None?
+            Some("dotted") => BorderStyle::Dotted,
+            Some("slantDashDot") => BorderStyle::SlantDashDot,
+            Some("mediumDashed") => BorderStyle::MediumDashed,
+            Some("mediumDashDot") => BorderStyle::MediumDashDot,
+            Some("mediumDashDotDot") => BorderStyle::MediumDashDotDot,
             Some(_) => BorderStyle::Thin,
             None => {
                 return Ok(None);
@@ -90,6 +96,7 @@ pub(super) fn load_styles<R: Read + std::io::Seek>(
         // In IronCalc convert double underline to simple
         // This in excel is u with a value of "double"
         let mut u = false;
+        let mut u_double = false;
         let mut b = false;
         let mut i = false;
         let mut strike = false;
@@ -111,6 +118,13 @@ pub(super) fn load_styles<R: Read + std::io::Seek>(
                 }
                 "u" => {
                     u = true;
+                    // val="double" / "doubleAccounting" → double underline
+                    // (fastsheet vendor patch; upstream collapsed to single).
+                    if let Some(val) = feature.attribute("val") {
+                        if val.starts_with("double") {
+                            u_double = true;
+                        }
+                    }
                 }
                 "b" => {
                     b = true;
@@ -149,6 +163,7 @@ pub(super) fn load_styles<R: Read + std::io::Seek>(
         fonts.push(Font {
             strike,
             u,
+            u_double,
             b,
             i,
             sz,

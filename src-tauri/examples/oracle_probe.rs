@@ -6,7 +6,7 @@
 //! what Excel itself computed, so any mismatch is either a fidelity bug or a
 //! formula the loader mis-translated.
 //!
-//! Usage: cargo run --release --features dev-bins --bin oracle_probe -- <file.xls> [...]
+//! Usage: cargo run --release --features dev-bins --example oracle_probe -- <file.xls> [...]
 //!
 //! Cells whose formula is volatile (NOW/TODAY/RAND/RANDBETWEEN) are skipped;
 //! cells that merely depend on volatile cells will still be reported, so

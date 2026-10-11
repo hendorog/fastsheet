@@ -80,8 +80,8 @@ jobs:
             See the [commit history](../../commits/${{ github.ref_name }}) for what changed in this release.
 
             **Windows install:** download the `*_x64-setup.exe` (NSIS)
-            or `*_x64_en-US.msi` from below and run it. Both install
-            to your user profile — no admin required.
+            from below and run it. It installs to your user profile —
+            no admin required.
 
             **Portable:** the standalone `*_x64-portable.exe` is also
             attached and runs without installation (no admin, no setup).

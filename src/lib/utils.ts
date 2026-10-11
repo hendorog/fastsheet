@@ -101,27 +101,37 @@ export function autoFitRowPx(
 /// color / text-decoration go on the inner `.cell-content` div which
 /// has padding 1px 4px — applying borders THERE would inset them by
 /// the padding offset, looking visibly wrong on real workbooks.
-export function cellTdStyle(cell: CellView | undefined): string {
-  if (!cell) return "";
-  const s = cell.style;
+export function cellTdStyle(
+  cell: CellView | undefined,
+  below?: CellView,
+  right?: CellView,
+): string {
+  const s = cell?.style;
   const parts: string[] = [];
   if (s) {
     if (s.bg) parts.push(`background:${s.bg}`);
-    if (s.align_h) parts.push(`text-align:${s.align_h}`);
+    // "fill" repeats content (Grid renders the repetition); the text
+    // itself starts at the left edge like Excel.
+    if (s.align_h) parts.push(`text-align:${s.align_h === "fill" ? "left" : s.align_h}`);
     if (s.align_v) parts.push(`vertical-align:${s.align_v}`);
-    if (s.border_top) parts.push("border-top:1px solid #000");
-    if (s.border_bottom) parts.push("border-bottom:1px solid #000");
-    if (s.border_left) parts.push("border-left:1px solid #000");
-    if (s.border_right) parts.push("border-right:1px solid #000");
   }
-  // Default alignment (left for text, right for numbers) belongs on
-  // the <td> too — text-align inherits into .cell-content.
+  // border-collapse resolves shared edges in favour of the top/left
+  // cell, so a cell's declared top/left border always LOSES to the
+  // neighbour's gridline (this is why top/left borders never showed).
+  // Express every border as the bottom/right of the cell above/left of
+  // the edge instead: each td renders its own bottom/right merged with
+  // the below/right neighbour's declared top/left. (A top border on
+  // the very first grid row has no cell above to host it — accepted.)
+  const bottom = s?.border_bottom ?? below?.style?.border_top;
+  const rightBorder = s?.border_right ?? right?.style?.border_left;
+  if (bottom) parts.push(`border-bottom:${bottom}`);
+  if (rightBorder) parts.push(`border-right:${rightBorder}`);
+  // Excel "General" alignment when no explicit halign: numbers right,
+  // booleans and errors centered, text left. The backend classifies
+  // the value (cell.kind) — no formatted-text sniffing.
   if (!s?.align_h && cell) {
-    const text = cell.text;
-    if (text !== "") {
-      const n = Number(text.replace(/,/g, "").trim());
-      if (Number.isFinite(n)) parts.push("text-align:right");
-    }
+    if (cell.kind === "n") parts.push("text-align:right");
+    else if (cell.kind === "b" || cell.kind === "e") parts.push("text-align:center");
   }
   return parts.join(";");
 }
@@ -138,6 +148,7 @@ export function cellContentStyle(cell: CellView | undefined): string {
       if (s.underline) decos.push("underline");
       if (s.strike) decos.push("line-through");
       parts.push(`text-decoration:${decos.join(" ")}`);
+      if (s.underline_double) parts.push("text-decoration-style:double");
     }
     if (s.size_pt) parts.push(`font-size:${s.size_pt}pt`);
     if (s.family)

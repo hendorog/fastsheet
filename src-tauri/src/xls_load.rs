@@ -41,7 +41,7 @@ use crate::util::col_letter_i;
 use crate::xlsx_load::strip_trailing_anchor;
 use crate::xls_biff::{
     decode_array_formula as fastsheet_lib_decode_array,
-    scan_xls_shape,
+    scan_xls_shape, ExtColor, XlsShape,
 };
 use crate::xls_preserve::{extract as extract_preserved, PreservedXlsData};
 
@@ -163,7 +163,7 @@ pub fn load_xls(
     // so the writer can replay them into a saved file. Best-effort —
     // returns an empty PreservedXlsData when the file has no VBA
     // (which is most files).
-    let preserved = extract_preserved(&bytes);
+    let mut preserved = extract_preserved(&bytes);
     timer.lap("preserve_extract");
 
     // Calamine 0.26's xls reader unconditionally parses any embedded
@@ -265,7 +265,15 @@ pub fn load_xls(
         let unwrapped = unwrap_user_xlfn(&patched);
         let normalized = normalize_range_order(&unwrapped);
         let quoted = quote_sheet_refs(&normalized, &names_needing_quotes);
-        let _ = model.new_defined_name(raw_name, None, &quoted);
+        // Carry the source Lbl's scope: itab 0 = workbook-global,
+        // else 1-based sheet index. Importing sheet-scoped names as
+        // global (the old behaviour) moved them to itab=0 on save.
+        let scope = shape
+            .raw_names
+            .iter()
+            .find(|rn| rn.name.eq_ignore_ascii_case(raw_name))
+            .and_then(|rn| (rn.itab != 0).then(|| rn.itab as u32 - 1));
+        let _ = model.new_defined_name(raw_name, scope, &quoted);
     }
     timer.lap("defined_names");
 
@@ -458,6 +466,21 @@ pub fn load_xls(
                         continue;
                     }
                 }
+                // Literal text that STARTS with '=' (e.g. a lone "="
+                // used as a visual separator): set_user_input would
+                // parse it as a formula and store a parse-error cell —
+                // Excel shows "=", fastsheet showed "#ERROR!", and the
+                // round-trip degraded it to #VALUE!. Route through the
+                // typed text setter so it stays a label (LABELSST on
+                // save), matching the source record type.
+                if let Data::String(s) = cell {
+                    if calamine_text.is_none() && own_decoded.is_none() && s.starts_with('=') {
+                        if r > max_row_1 { max_row_1 = r; }
+                        if c > max_col_1 { max_col_1 = c; }
+                        let _ = model.update_cell_with_text(sheet_idx as u32, r, c, s);
+                        continue;
+                    }
+                }
                 let Some(v) = value else { continue };
                 if r > max_row_1 { max_row_1 = r; }
                 if c > max_col_1 { max_col_1 = c; }
@@ -615,14 +638,18 @@ pub fn load_xls(
     // Numfmt application is folded into the same pass — the previous
     // separate loop was paying the same get/set cost a second time.
     //
-    // IronCalc's formatter rejects some BIFF format strings (conditional
-    // `[Red]`, locale prefixes, custom text literals) and turns the cell
-    // into `#ERROR!`. Heuristic-gate to "safe" strings: digit-grouping,
-    // decimals, percent, currency, and date tokens. Force-apply
-    // everything via FASTSHEET_XLS_APPLY_NUMFMT=all for diagnostics.
-    let force_all_numfmt = std::env::var("FASTSHEET_XLS_APPLY_NUMFMT")
-        .map(|v| v == "all")
-        .unwrap_or(false);
+    // IronCalc's formatter rejects a subset of valid BIFF format strings
+    // (locale-prefixed dates like `[$-409]d-mmm-yy`, currency codes like
+    // `[$USD-409]`, `mm:ss.0`) and would render such cells as `#VALUE!`.
+    // Instead of guessing by character class, trial-render each unique
+    // format string through the formatter once (numfmt_renders_cleanly)
+    // and apply it only when the formatter accepts it. Escape hatches:
+    // FASTSHEET_XLS_APPLY_NUMFMT=all force-applies everything
+    // (diagnostics), =off disables numfmt application entirely.
+    let numfmt_mode = std::env::var("FASTSHEET_XLS_APPLY_NUMFMT").unwrap_or_default();
+    let force_all_numfmt = numfmt_mode == "all";
+    let numfmt_off = numfmt_mode == "off";
+    let mut numfmt_ok_cache: HashMap<u16, bool> = HashMap::new();
     let mut style_cache: HashMap<u16, i32> = HashMap::new();
     for (&(sheet, row, col), &ixfe) in &shape.cell_xfs {
         let xf = match shape.xfs.get(ixfe as usize) {
@@ -631,12 +658,21 @@ pub fn load_xls(
         };
 
         // Resolve the numfmt to apply for this XF, if any.
-        let numfmt_override: Option<&str> = shape
-            .formats
-            .get(&xf.fmt_idx)
-            .map(|s| s.as_str())
-            .filter(|s| !s.is_empty() && *s != "General")
-            .filter(|s| force_all_numfmt || is_safe_numfmt(s));
+        let numfmt_override: Option<&str> = if numfmt_off {
+            None
+        } else {
+            shape
+                .formats
+                .get(&xf.fmt_idx)
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty() && *s != "General")
+                .filter(|s| {
+                    force_all_numfmt
+                        || *numfmt_ok_cache
+                            .entry(xf.fmt_idx)
+                            .or_insert_with(|| numfmt_renders_cleanly(s))
+                })
+        };
 
         // Fast path: cell hasn't been styled yet, and we already built
         // the merged Style for this ixfe. Just write the cached index.
@@ -652,40 +688,18 @@ pub fn load_xls(
 
         // Slow path: build the merged Style for this XF, register it,
         // and cache the resulting index for subsequent cells with the
-        // same ixfe. Resolve the effective font_idx via XF inheritance.
-        // If this cell XF has fAtrFnt=0 it doesn't override the parent
-        // style XF's font — many real-world templates use that pattern
-        // for "bordered but otherwise default" cells. Tiered rule:
-        //   1. cell.font_idx == 0 → use workbook default font directly,
-        //      ignore the parent style chain. Dominant case for cost-
-        //      summary numeric cells whose style XFs walk to a font
-        //      that was used for borders/fills only.
-        //   2. cell.font_idx > 0 → bold/italic/underline/strike/color
-        //      from cell font, size+face from parent style font (so
-        //      cells with stale Arial 14 pointers don't visually
-        //      balloon next to 11pt neighbours).
-        //   3. Style XFs themselves keep their resolved font as-is.
+        // same ixfe. Font per spec XF inheritance: the cell XF's own
+        // font when fAtrFnt is set (or it has no parent), else the
+        // parent style XF's font. The fonts Vec is ifnt-aligned (the
+        // scanner occupies the phantom slot 4), so indexing is exact.
+        // The old "empirical tiered rule" (attrs from the cell font,
+        // face/size from the parent) was fitted while the font table
+        // was off by one for ifnt >= 5 — the "stale Arial 14 pointers"
+        // it compensated for were the misindexed fonts themselves.
         let resolved_font_idx = resolve_xf_font(&shape.xfs, ixfe);
-        let resolved_font = match shape.fonts.get(resolved_font_idx as usize) {
+        let font = match shape.fonts.get(resolved_font_idx as usize) {
             Some(f) => f.clone(),
             None => continue,
-        };
-        let workbook_default = shape.fonts.get(0).cloned().unwrap_or_else(|| resolved_font.clone());
-        let cell_font = shape.fonts.get(xf.font_idx as usize).cloned();
-        let font = if !xf.is_style && xf.font_idx == 0 {
-            workbook_default.clone()
-        } else if let (false, Some(c)) = (xf.is_style, cell_font) {
-            crate::xls_biff::FontEntry {
-                bold: c.bold,
-                italic: c.italic,
-                underline: c.underline,
-                strike: c.strike,
-                color_idx: c.color_idx,
-                size_pt: resolved_font.size_pt,
-                name: resolved_font.name.clone(),
-            }
-        } else {
-            resolved_font.clone()
         };
         let font = &font;
         // Fills, borders, and alignment read from the XF directly —
@@ -702,15 +716,24 @@ pub fn load_xls(
             border_right: xf.border_right,
             border_top: xf.border_top,
             border_bottom: xf.border_bottom,
+            icv_left: xf.border_icv_left,
+            icv_right: xf.border_icv_right,
+            icv_top: xf.border_icv_top,
+            icv_bottom: xf.border_icv_bottom,
         };
         let effective_align = ResolvedAlign {
             h_align: xf.h_align,
             v_align: xf.v_align,
             wrap: xf.wrap,
         };
+        // XFEXT full-color overrides (rgb / theme+tint) trump the icv
+        // approximations stored in the XF itself — modern Excel writes
+        // the true colors there and only a nearest-palette icv for
+        // legacy readers.
+        let ext = shape.xfext.get(&ixfe).copied().unwrap_or_default();
         let has_fill = effective_fill.fill_pattern == 1
-            && effective_fill.fill_fg != 64
-            && effective_fill.fill_fg != 65;
+            && (ext.fill_fg.is_some()
+                || (effective_fill.fill_fg != 64 && effective_fill.fill_fg != 65));
         let has_border = effective_border.border_left != 0
             || effective_border.border_right != 0
             || effective_border.border_top != 0
@@ -725,7 +748,13 @@ pub fn load_xls(
             || (font.size_pt > 0 && font.size_pt != default_font_size)
             || (font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64)
             || (!font.name.is_empty() && font.name != default_font_name);
-        if !has_fill && !has_border && !has_align && !has_nondefault_font && numfmt_override.is_none() {
+        if !has_fill
+            && !has_border
+            && !has_align
+            && !has_nondefault_font
+            && ext.font_color.is_none()
+            && numfmt_override.is_none()
+        {
             continue;
         }
         let Ok(mut style) = model.get_style_for_cell(sheet, row, col) else { continue };
@@ -746,8 +775,13 @@ pub fn load_xls(
         if font.bold { style.font.b = true; }
         if font.italic { style.font.i = true; }
         if font.underline { style.font.u = true; }
+        if font.underline_double { style.font.u_double = true; }
         if font.strike { style.font.strike = true; }
-        if font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64 {
+        if let Some(hex) = ext.font_color.and_then(|c| resolve_ext_color(c, &shape)) {
+            if hex != "#000000" {
+                style.font.color = Some(hex);
+            }
+        } else if font.color_idx != 0x7FFF && font.color_idx != 8 && font.color_idx != 64 {
             if let Some(hex) = shape.palette.get(&font.color_idx) {
                 style.font.color = Some(hex.clone());
             }
@@ -756,9 +790,13 @@ pub fn load_xls(
         // 64 ("system window") and 65 ("system bg") mean "use theme /
         // none" — skip those.
         if has_fill {
-            if let Some(hex) = shape.palette.get(&effective_fill.fill_fg) {
+            let hex = ext
+                .fill_fg
+                .and_then(|c| resolve_ext_color(c, &shape))
+                .or_else(|| shape.palette.get(&effective_fill.fill_fg).cloned());
+            if let Some(hex) = hex {
                 style.fill.pattern_type = "solid".to_string();
-                style.fill.fg_color = Some(hex.clone());
+                style.fill.fg_color = Some(hex);
                 style.fill.bg_color = None;
             }
         }
@@ -790,23 +828,58 @@ pub fn load_xls(
                 style.alignment = Some(a);
             }
         }
-        // Borders — only flag presence; xlsx path renders any
-        // Some(BorderItem) as a thin black border.
-        let border_item = || BorderItem {
-            style: BorderStyle::Thin,
-            color: Some("#000000".to_string()),
+        // Borders — map the BIFF dg* style code back to the IronCalc
+        // BorderStyle (inverse of xls_save::border_style_to_biff) and
+        // the edge's icv to a palette color. Codes with no BorderStyle
+        // variant (3 dashed, 7 hair, 9 dashDot, 11 dashDotDot) fall
+        // back to Thin, matching the xlsx reader's fallback; icv 64
+        // ("auto") and anything outside the palette render black.
+        let border_item = |code: u16, icv: u16, ext_color: Option<ExtColor>| BorderItem {
+            style: match code {
+                2 => BorderStyle::Medium,
+                4 => BorderStyle::Dotted,
+                5 => BorderStyle::Thick,
+                6 => BorderStyle::Double,
+                8 => BorderStyle::MediumDashed,
+                10 => BorderStyle::MediumDashDot,
+                12 => BorderStyle::MediumDashDotDot,
+                13 => BorderStyle::SlantDashDot,
+                _ => BorderStyle::Thin,
+            },
+            color: Some(
+                ext_color
+                    .and_then(|c| resolve_ext_color(c, &shape))
+                    .or_else(|| shape.palette.get(&icv).cloned())
+                    .unwrap_or_else(|| "#000000".to_string()),
+            ),
         };
         if effective_border.border_left != 0 && style.border.left.is_none() {
-            style.border.left = Some(border_item());
+            style.border.left = Some(border_item(
+                effective_border.border_left as u16,
+                effective_border.icv_left,
+                ext.border_left,
+            ));
         }
         if effective_border.border_right != 0 && style.border.right.is_none() {
-            style.border.right = Some(border_item());
+            style.border.right = Some(border_item(
+                effective_border.border_right as u16,
+                effective_border.icv_right,
+                ext.border_right,
+            ));
         }
         if effective_border.border_top != 0 && style.border.top.is_none() {
-            style.border.top = Some(border_item());
+            style.border.top = Some(border_item(
+                effective_border.border_top as u16,
+                effective_border.icv_top,
+                ext.border_top,
+            ));
         }
         if effective_border.border_bottom != 0 && style.border.bottom.is_none() {
-            style.border.bottom = Some(border_item());
+            style.border.bottom = Some(border_item(
+                effective_border.border_bottom as u16,
+                effective_border.icv_bottom,
+                ext.border_bottom,
+            ));
         }
         // Numfmt — folded into the same Style write so the cached index
         // captures both styling and number format.
@@ -891,6 +964,87 @@ pub fn load_xls(
                 let _ = model.set_user_input(*sheet, r, c, formula);
             }
         }
+        // Snapshot the range for the writer's ARRAY re-emission:
+        // the source rgce (verbatim) plus the model's canonical
+        // formula text for every replicated cell. The writer
+        // re-reads the same cells at save time; equal text means
+        // the range is unedited and safe to fold back into a
+        // FORMULA(PtgExp) + ARRAY structure.
+        let Some(sheet_name) = model
+            .workbook
+            .worksheets
+            .get(*sheet as usize)
+            .map(|w| w.name.clone())
+        else {
+            continue;
+        };
+        let mut cell_formulas = Vec::with_capacity(((r2 - r1 + 1) * (c2 - c1 + 1)) as usize);
+        for r in *r1..=*r2 {
+            for c in *c1..=*c2 {
+                cell_formulas.push(model.get_cell_formula(*sheet, r, c).ok().flatten());
+            }
+        }
+        preserved.array_formulas.push(crate::xls_preserve::PreservedArrayFormula {
+            sheet_name,
+            r1: *r1,
+            r2: *r2,
+            c1: *c1,
+            c2: *c2,
+            rgce: rgce.clone(),
+            cell_formulas,
+        });
+    }
+    // Source-table context for every preserved-rgce replay (arrays,
+    // #ERROR! cells, unimported names): the NAME list in Lbl order
+    // (1-based PtgName inames index it) and each EXTERNSHEET entry's
+    // sheet names (Ptg*3d ixtis index those).
+    preserved.source_defined_names = shape
+        .raw_names
+        .iter()
+        .map(|n| n.name.clone())
+        .collect();
+    preserved.source_xti_sheets = shape
+        .xti_table
+        .iter()
+        .map(|e| {
+            if e.isup_book != 0 || e.itab_first < 0 || e.itab_last < 0 {
+                return None;
+            }
+            let first = shape.biff_sheet_names.get(e.itab_first as usize)?;
+            let last = shape.biff_sheet_names.get(e.itab_last as usize)?;
+            Some((first.clone(), last.clone()))
+        })
+        .collect();
+    // NAME records the import loop above could not register in the
+    // model (builtin _FilterDatabase / Print_Titles, _xlfn stubs,
+    // grammar-rejected names like `Is_Ulx_Allowed?`, #REF! names) —
+    // keep them for verbatim replay on save. Names that DID import
+    // are owned by the model from here on.
+    let imported: HashSet<String> = model
+        .workbook
+        .defined_names
+        .iter()
+        .map(|dn| dn.name.to_lowercase())
+        .collect();
+    for rn in &shape.raw_names {
+        if !rn.name.is_empty() && imported.contains(&rn.name.to_lowercase()) {
+            continue;
+        }
+        let sheet_name = if rn.itab == 0 {
+            None
+        } else {
+            match shape.biff_sheet_names.get(rn.itab as usize - 1) {
+                Some(n) => Some(n.clone()),
+                None => continue,
+            }
+        };
+        preserved.preserved_names.push(crate::xls_preserve::PreservedName {
+            name: rn.name.clone(),
+            grbit: rn.grbit,
+            ch_key: rn.ch_key,
+            sheet_name,
+            rgce: rn.rgce.clone(),
+        });
     }
     timer.lap("my_replicate");
 
@@ -962,6 +1116,113 @@ fn resolve_xf_font(
     xfs.get(cur as usize).map(|x| x.font_idx).unwrap_or(0)
 }
 
+/// Default Office theme (2013+) clrScheme in file order: dk1, lt1,
+/// dk2, lt2, accent1..6, hlink, folHlink. Used when the workbook has
+/// no THEME payload of its own.
+const DEFAULT_THEME_COLORS: [&str; 12] = [
+    "#000000", "#FFFFFF", "#44546A", "#E7E6E6", "#4472C4", "#ED7D31",
+    "#A5A5A5", "#FFC000", "#5B9BD5", "#70AD47", "#0563C1", "#954F72",
+];
+
+/// Resolve an XFEXT FullColorExt to "#RRGGBB", applying the tint.
+/// Theme indices use the xlsx numbering (0=lt1, 1=dk1, 2=lt2, 3=dk2,
+/// 4..9=accent1-6) — pairwise-swapped vs the clrScheme file order.
+fn resolve_ext_color(c: ExtColor, shape: &XlsShape) -> Option<String> {
+    let (hex, tint) = match c {
+        ExtColor::Rgb(rgb, t) => {
+            (format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]), t)
+        }
+        ExtColor::Icv(icv, t) => (shape.palette.get(&icv)?.clone(), t),
+        ExtColor::Theme(idx, t) => {
+            let file_idx: usize = match idx {
+                0 => 1,
+                1 => 0,
+                2 => 3,
+                3 => 2,
+                4..=11 => idx as usize,
+                _ => return None,
+            };
+            let hex = shape
+                .theme_colors
+                .as_ref()
+                .and_then(|v| v.get(file_idx).cloned())
+                .unwrap_or_else(|| DEFAULT_THEME_COLORS[file_idx].to_string());
+            (hex, t)
+        }
+    };
+    if tint == 0 {
+        return Some(hex);
+    }
+    Some(apply_tint(&hex, f64::from(tint) / 32767.0))
+}
+
+/// Apply an OOXML tint/shade to a hex color: positive tint raises HSL
+/// luminance toward white (L' = L·(1−t) + t), negative lowers it
+/// toward black (L' = L·(1+t)) — the same transform xlsx theme tints
+/// use, so .xls and .xlsx render tinted theme colors identically.
+fn apply_tint(hex: &str, tint: f64) -> String {
+    let Some([r, g, b]) = crate::xls_save::parse_hex_color(hex) else {
+        return hex.to_string();
+    };
+    let (h, s, l) = rgb_to_hsl(r, g, b);
+    let l = if tint < 0.0 {
+        l * (1.0 + tint)
+    } else {
+        l * (1.0 - tint) + tint
+    };
+    let (r, g, b) = hsl_to_rgb(h, s, l.clamp(0.0, 1.0));
+    format!("#{:02X}{:02X}{:02X}", r, g, b)
+}
+
+fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
+    let r = f64::from(r) / 255.0;
+    let g = f64::from(g) / 255.0;
+    let b = f64::from(b) / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < f64::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if (max - r).abs() < f64::EPSILON {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if (max - g).abs() < f64::EPSILON {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    } / 6.0;
+    (h, s, l)
+}
+
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
+    let to_byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    if s <= 0.0 {
+        let v = to_byte(l);
+        return (v, v, v);
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hue = |mut t: f64| {
+        t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    (
+        to_byte(hue(h + 1.0 / 3.0)),
+        to_byte(hue(h)),
+        to_byte(hue(h - 1.0 / 3.0)),
+    )
+}
+
 #[derive(Default, Clone, Copy)]
 struct ResolvedFill { fill_pattern: u16, fill_fg: u16 }
 
@@ -999,7 +1260,16 @@ fn resolve_xf_fill(
 }
 
 #[derive(Default, Clone, Copy)]
-struct ResolvedBorder { border_left: u8, border_right: u8, border_top: u8, border_bottom: u8 }
+struct ResolvedBorder {
+    border_left: u8,
+    border_right: u8,
+    border_top: u8,
+    border_bottom: u8,
+    icv_left: u16,
+    icv_right: u16,
+    icv_top: u16,
+    icv_bottom: u16,
+}
 
 #[allow(dead_code)]
 fn resolve_xf_border(
@@ -1018,6 +1288,10 @@ fn resolve_xf_border(
                 border_right: xf.border_right,
                 border_top: xf.border_top,
                 border_bottom: xf.border_bottom,
+                icv_left: xf.border_icv_left,
+                icv_right: xf.border_icv_right,
+                icv_top: xf.border_icv_top,
+                icv_bottom: xf.border_icv_bottom,
             };
         }
         if xf.ixf_parent == cur { break; }
@@ -1029,6 +1303,10 @@ fn resolve_xf_border(
             border_right: xf.border_right,
             border_top: xf.border_top,
             border_bottom: xf.border_bottom,
+            icv_left: xf.border_icv_left,
+            icv_right: xf.border_icv_right,
+            icv_top: xf.border_icv_top,
+            icv_bottom: xf.border_icv_bottom,
         })
         .unwrap_or_default()
 }
@@ -1575,28 +1853,35 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 /// Given formula text and an index pointing at the first char after
-/// `User(`, try to identify an `_xlfn.FOO` first argument. Returns
+/// `User(`, try to identify the function-name head. Returns
 /// (bare_function_name, resume_index) on success. resume_index points
 /// at the first character of the remaining args, with the leading
 /// comma already consumed — or at the position just past the close of
-/// the User() call if _xlfn.FOO has no args.
+/// the User() call if the head has no args.
+///
+/// The head is any identifier (dots allowed — defined names can
+/// contain them, and future functions like `_xlfn.CEILING.MATH` need
+/// them); `_xlfn.` and the nested `_xlfn._xlws.` prefixes are
+/// stripped. Accepting a bare identifier is per [MS-XLS]: PtgFuncVar
+/// with iftab=255 ("User") means the FIRST ARGUMENT is the function,
+/// so `User(MYUNIQUE, …)` — how a PtgName-routed VBA-UDF call
+/// renders — collapses to `MYUNIQUE(…)`.
 fn parse_xlfn_head(formula: &str, start: usize) -> Option<(String, usize)> {
     let bytes = formula.as_bytes();
-    // Expect `_xlfn.`
-    let prefix = "_xlfn.";
-    if !formula[start..].starts_with(prefix) {
-        return None;
-    }
-    let name_start = start + prefix.len();
-    // Read identifier chars for the function name.
-    let mut j = name_start;
-    while j < bytes.len() && is_ident_name_char(bytes[j]) {
+    let mut j = start;
+    while j < bytes.len() && (is_ident_name_char(bytes[j]) || bytes[j] == b'.') {
         j += 1;
     }
-    if j == name_start {
+    if j == start {
         return None;
     }
-    let fn_name = formula[name_start..j].to_string();
+    let mut head = &formula[start..j];
+    head = head.strip_prefix("_xlfn.").unwrap_or(head);
+    head = head.strip_prefix("_xlws.").unwrap_or(head);
+    if head.is_empty() {
+        return None;
+    }
+    let fn_name = head.to_string();
     // Three shapes to handle:
     //   User(_xlfn.FOO,<args>)           ← most common
     //   User(_xlfn.FOO(<args>))          ← also seen
@@ -1689,33 +1974,34 @@ fn quote_sheet_refs(formula: &str, names: &[String]) -> String {
     result
 }
 
-/// Conservative filter for number-format strings we're willing to apply
-/// by default. IronCalc's formatter blows up on a subset of valid BIFF
-/// formats (conditional sections, bracketed color/locale, text-literal
-/// patterns). These heuristic-exclude the patterns that tripped probe.
-/// Anything not matching here can still be force-applied by setting
-/// `FASTSHEET_XLS_APPLY_NUMFMT=all`.
-fn is_safe_numfmt(s: &str) -> bool {
-    // Reject bracketed sections ([Red], [>0], [$-409], [h], etc.) —
-    // these are the common source of parse errors.
-    if s.contains('[') {
+/// Trial-render `fmt` through IronCalc's formatter over a spread of
+/// sample values; the format qualifies for default application only if
+/// every render succeeds. "Invalid date value" errors are tolerated —
+/// they mean the sample landed outside the format's value domain (a
+/// negative serial against `m/d/yyyy`), not that the format is
+/// unsupported; real date cells carry valid serials, and Excel itself
+/// shows `#####` for negative dates. The error strings matched here are
+/// defined in the VENDORED formatter (vendor/base/src/formatter/
+/// format.rs), so the coupling can't drift under an upstream upgrade
+/// without the unit tests below catching it.
+fn numfmt_renders_cleanly(fmt: &str) -> bool {
+    use ironcalc::base::formatter::format::format_number;
+    use ironcalc::base::locale::get_locale;
+    let Ok(locale) = get_locale("en") else {
         return false;
-    }
-    // Reject text-literal markers (`@` meaning "original text") — these
-    // tend to collide with IronCalc's own text handling.
-    if s.contains('@') {
-        return false;
-    }
-    // Reject padding markers (`_`) — these produce space padding in
-    // Excel but IronCalc doesn't always honor them.
-    if s.contains('_') {
-        return false;
-    }
-    // Reject text in quotes — rare but trips formatter on some files.
-    if s.contains('"') {
-        return false;
-    }
-    true
+    };
+    // Positive/negative/zero pick different format sections; 0.42 and a
+    // 2023 date serial exercise the decimal and y/m/d token paths.
+    const SAMPLES: [f64; 5] = [1234.5678, -1234.5678, 0.0, 0.42, 44927.75];
+    SAMPLES.into_iter().all(|v| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match format_number(v, fmt, locale).error {
+                None => true,
+                Some(e) => e.starts_with("Invalid date value"),
+            }
+        }))
+        .unwrap_or(false)
+    })
 }
 
 /// Quick heuristic for "is this format string a date/time format?" — the
@@ -1779,5 +2065,51 @@ fn format_number(f: f64) -> String {
         format!("{}", f as i64)
     } else {
         format!("{}", f)
+    }
+}
+
+#[cfg(test)]
+mod numfmt_tests {
+    use super::numfmt_renders_cleanly;
+
+    // These pin the empirical behaviour of the vendored formatter. If an
+    // IronCalc upgrade changes what parses, these fail and the applied-
+    // by-default format set shifts — which is exactly what we want to
+    // notice.
+    #[test]
+    fn accepts_common_real_world_formats() {
+        for fmt in [
+            "#,##0.00",
+            "0.00%",
+            "$#,##0.00",
+            "\"$\"#,##0.00",
+            "#,##0.00;[Red](#,##0.00)",
+            "_-* #,##0.00_-;-* #,##0.00_-;_-* \"-\"??_-;_-@_-",
+            "_(\"$\"* #,##0.00_);_(\"$\"* \\(#,##0.00\\);_(\"$\"* \"-\"??_);_(@_)",
+            "m/d/yyyy",
+            "d-mmm-yy",
+            "yyyy-mm-dd",
+            "h:mm:ss",
+            "h:mm AM/PM",
+            "[h]:mm:ss",
+            "0.00E+00",
+            "# ?/?",
+            "[>=1000]#,##0;0",
+            "#,##0\\ \"units\"",
+        ] {
+            assert!(numfmt_renders_cleanly(fmt), "expected accept: {fmt}");
+        }
+    }
+
+    #[test]
+    fn rejects_formats_ironcalc_cannot_parse() {
+        for fmt in [
+            "[$-409]d-mmm-yy",
+            "[$-409]h:mm:ss AM/PM",
+            "[$USD-409]#,##0.00",
+            "mm:ss.0",
+        ] {
+            assert!(!numfmt_renders_cleanly(fmt), "expected reject: {fmt}");
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! Capture-and-replay for .xls structured-storage subtrees that the
-//! greenfield BIFF writer doesn't model — currently just VBA / macro
-//! storages.
+//! greenfield BIFF writer doesn't model — VBA / macro storages plus
+//! the top-level OLE property streams (CompObj, SummaryInformation,
+//! DocumentSummaryInformation).
 //!
 //! Why this works without offset arithmetic: VBA lives in its own
 //! storage tree (`/_VBA_PROJECT_CUR`, optionally `/VBA`, `/Macros`,
@@ -72,6 +73,60 @@ pub struct SubstreamSnapshot {
     pub index_in_source: usize,
 }
 
+/// One array-entered (CSE) formula range from the source file. The
+/// loader replicates the anchor formula across the spill range as
+/// per-cell `MY*(..., dr, dc)` formulas so IronCalc can evaluate
+/// them; this snapshot lets the writer reverse that expansion and
+/// re-emit the original FORMULA(PtgExp) + ARRAY record structure.
+/// Without it, Excel/POI receive per-cell calls whose trailing args
+/// are numbers where the VBA/POI UDF expects an anchor reference,
+/// and every spill cell except the anchor evaluates wrong.
+#[derive(Debug, Clone)]
+pub struct PreservedArrayFormula {
+    /// Sheet name at load time; the writer resolves it back to a
+    /// model sheet index case-insensitively (sheet indices can shift
+    /// if sheets are added/removed between load and save).
+    pub sheet_name: String,
+    /// 1-based inclusive spill rectangle; (r1, c1) is the anchor.
+    pub r1: i32,
+    pub r2: i32,
+    pub c1: i32,
+    pub c2: i32,
+    /// The ARRAY record's rgce, verbatim from the source. PtgName
+    /// inames index the SOURCE file's NAME table and must be
+    /// remapped against the writer's rebuilt tables before replay.
+    pub rgce: Vec<u8>,
+    /// Canonical per-cell formula text (row-major over the range,
+    /// via `Model::get_cell_formula`) captured right after load-time
+    /// replication. At save the writer re-reads the same cells; any
+    /// mismatch means the user edited inside the range and the whole
+    /// range falls back to per-cell expansion.
+    pub cell_formulas: Vec<Option<String>>,
+}
+
+/// One source NAME (Lbl) record the loader could NOT import into the
+/// IronCalc model — builtin names (_FilterDatabase = AutoFilter
+/// ranges, Print_Titles = print repeat rows/cols), `_xlfn.*` /
+/// `_xleta.*` stubs, names IronCalc's identifier grammar rejects
+/// (e.g. containing `?`), and #REF! names. The writer replays these
+/// as appended Lbl records with the rgce remapped into its rebuilt
+/// NAME / EXTERNSHEET tables; dropping them silently degrades
+/// AutoFilter, print setup and any later reference to the name.
+#[derive(Debug, Clone)]
+pub struct PreservedName {
+    /// Raw name string; a single control char for builtin names.
+    pub name: String,
+    pub grbit: u16,
+    pub ch_key: u8,
+    /// Scope sheet resolved from the Lbl itab at load time; None =
+    /// workbook-global. Stored as a name so sheet insertion/removal
+    /// between load and save can't silently retarget the scope.
+    pub sheet_name: Option<String>,
+    /// Source rgce verbatim; PtgName inames / Ptg*3d ixtis index the
+    /// SOURCE tables and are remapped at save.
+    pub rgce: Vec<u8>,
+}
+
 /// Bundle of preserved entries from one source workbook. Iterating
 /// `entries` in order recreates the VBA storage tree (parents before
 /// children — the extractor walks in CFB preorder).
@@ -81,11 +136,32 @@ pub struct SubstreamSnapshot {
 pub struct PreservedXlsData {
     pub entries: Vec<PreservedEntry>,
     pub workbook_substreams: Vec<SubstreamSnapshot>,
+    /// Array-formula ranges the loader replicated (see
+    /// `PreservedArrayFormula`). Populated by `load_xls`, not by
+    /// `extract` — the data comes from the BIFF shape scan plus the
+    /// post-replication model, neither of which `extract` sees.
+    pub array_formulas: Vec<PreservedArrayFormula>,
+    /// The source workbook's defined names in BIFF NAME-record order.
+    /// PtgName inames in any preserved rgce (arrays, error cells,
+    /// preserved names) are 1-based indices into this list.
+    pub source_defined_names: Vec<String>,
+    /// Source NAME records the loader couldn't import (see
+    /// `PreservedName`). Populated by `load_xls`.
+    pub preserved_names: Vec<PreservedName>,
+    /// Per source EXTERNSHEET xti index: the (first, last) sheet
+    /// names for internal-supbook single/multi-sheet entries, `None`
+    /// for add-in / external-book / deleted-sheet entries. Lets the
+    /// writer remap a preserved rgce's Ptg*3d ixti into its own
+    /// rebuilt table by sheet name.
+    pub source_xti_sheets: Vec<Option<(String, String)>>,
 }
 
 impl PreservedXlsData {
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.workbook_substreams.is_empty()
+        self.entries.is_empty()
+            && self.workbook_substreams.is_empty()
+            && self.array_formulas.is_empty()
+            && self.preserved_names.is_empty()
     }
 }
 
@@ -97,6 +173,18 @@ const VBA_STORAGE_ROOTS: &[&str] = &[
     "/_VBA_PROJECT",
     "/VBA",
     "/Macros",
+];
+
+/// Top-level OLE property streams preserved verbatim. These are
+/// self-contained (no references into the workbook stream):
+/// SummaryInformation / DocumentSummaryInformation carry document
+/// metadata (author, title, company, custom properties); CompObj
+/// identifies the document class for OLE embedding. Dropping them
+/// loses metadata and shell integration (2026-08-14 report, Issue 3).
+const PROPERTY_STREAMS: &[&str] = &[
+    "/\u{1}CompObj",
+    "/\u{5}SummaryInformation",
+    "/\u{5}DocumentSummaryInformation",
 ];
 
 /// Walk the source CFB for VBA-related storage subtrees and capture
@@ -164,7 +252,31 @@ pub fn extract(bytes: &[u8]) -> PreservedXlsData {
             }
         }
     }
-    PreservedXlsData { entries, workbook_substreams }
+    for path in PROPERTY_STREAMS {
+        if !cfb.exists(path) || cfb.is_storage(path) {
+            continue;
+        }
+        let mut data = Vec::new();
+        let ok = cfb
+            .open_stream(path)
+            .and_then(|mut s| s.read_to_end(&mut data).map(|_| ()))
+            .is_ok();
+        if ok {
+            entries.push(PreservedEntry {
+                path: PathBuf::from(path),
+                is_storage: false,
+                data: Some(data),
+            });
+        }
+    }
+    PreservedXlsData {
+        entries,
+        workbook_substreams,
+        array_formulas: Vec::new(),
+        source_defined_names: Vec::new(),
+        preserved_names: Vec::new(),
+        source_xti_sheets: Vec::new(),
+    }
 }
 
 /// Walk the workbook stream byte-by-byte, splitting it at each BOF

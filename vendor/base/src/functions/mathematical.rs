@@ -473,6 +473,161 @@ impl<'a> Model<'a> {
         CalcResult::Number(acc.unwrap_or(0) as f64)
     }
 
+    // SUMPRODUCT(array1, [array2, ...]) — element-wise product across
+    // equally-dimensioned ranges, summed. Non-numeric elements inside a
+    // range count as 0 (Excel semantics); dimension mismatch is
+    // #VALUE!; cell errors propagate. Full-column/full-row ranges are
+    // iterated only to the sheets' used extent — rows beyond any used
+    // range contribute zero products, so the result is unchanged.
+    // Fastsheet addition — missing from upstream 0.7.1.
+    pub(crate) fn fn_sumproduct(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if args.is_empty() {
+            return CalcResult::new_args_number_error(cell);
+        }
+        enum SpArg {
+            Scalar(f64),
+            Range { sheet: u32, row: i32, column: i32 },
+        }
+        let mut dims: Option<(i32, i32)> = None;
+        let mut used_rows: i32 = 0;
+        let mut used_cols: i32 = 0;
+        let mut parsed: Vec<SpArg> = Vec::with_capacity(args.len());
+        for arg in args {
+            match self.evaluate_node_with_reference(arg, cell) {
+                CalcResult::Range { left, right } => {
+                    if left.sheet != right.sheet {
+                        return CalcResult::new_error(
+                            Error::VALUE,
+                            cell,
+                            "SUMPRODUCT: 3D ranges not supported".to_string(),
+                        );
+                    }
+                    let rows = right.row - left.row + 1;
+                    let cols = right.column - left.column + 1;
+                    match dims {
+                        None => dims = Some((rows, cols)),
+                        Some(d) if d != (rows, cols) => {
+                            return CalcResult::new_error(
+                                Error::VALUE,
+                                cell,
+                                "SUMPRODUCT: ranges must have the same dimensions".to_string(),
+                            )
+                        }
+                        _ => {}
+                    }
+                    let dim = match self.workbook.worksheet(left.sheet) {
+                        Ok(ws) => ws.dimension(),
+                        Err(_) => {
+                            return CalcResult::new_error(
+                                Error::ERROR,
+                                cell,
+                                format!("Invalid worksheet index: '{}'", left.sheet),
+                            )
+                        }
+                    };
+                    let eff_rows = if left.row == 1 && right.row == LAST_ROW {
+                        dim.max_row
+                    } else {
+                        rows
+                    };
+                    let eff_cols = if left.column == 1 && right.column == LAST_COLUMN {
+                        dim.max_column
+                    } else {
+                        cols
+                    };
+                    used_rows = used_rows.max(eff_rows.min(rows));
+                    used_cols = used_cols.max(eff_cols.min(cols));
+                    parsed.push(SpArg::Range {
+                        sheet: left.sheet,
+                        row: left.row,
+                        column: left.column,
+                    });
+                }
+                CalcResult::Number(v) => {
+                    match dims {
+                        None => dims = Some((1, 1)),
+                        Some((1, 1)) => {}
+                        Some(_) => {
+                            return CalcResult::new_error(
+                                Error::VALUE,
+                                cell,
+                                "SUMPRODUCT: ranges must have the same dimensions".to_string(),
+                            )
+                        }
+                    }
+                    used_rows = used_rows.max(1);
+                    used_cols = used_cols.max(1);
+                    parsed.push(SpArg::Scalar(v));
+                }
+                CalcResult::Boolean(b) => {
+                    match dims {
+                        None => dims = Some((1, 1)),
+                        Some((1, 1)) => {}
+                        Some(_) => {
+                            return CalcResult::new_error(
+                                Error::VALUE,
+                                cell,
+                                "SUMPRODUCT: ranges must have the same dimensions".to_string(),
+                            )
+                        }
+                    }
+                    used_rows = used_rows.max(1);
+                    used_cols = used_cols.max(1);
+                    parsed.push(SpArg::Scalar(if b { 1.0 } else { 0.0 }));
+                }
+                CalcResult::String(_) | CalcResult::EmptyCell | CalcResult::EmptyArg => {
+                    match dims {
+                        None => dims = Some((1, 1)),
+                        Some((1, 1)) => {}
+                        Some(_) => {
+                            return CalcResult::new_error(
+                                Error::VALUE,
+                                cell,
+                                "SUMPRODUCT: ranges must have the same dimensions".to_string(),
+                            )
+                        }
+                    }
+                    used_rows = used_rows.max(1);
+                    used_cols = used_cols.max(1);
+                    parsed.push(SpArg::Scalar(0.0));
+                }
+                error @ CalcResult::Error { .. } => return error,
+                CalcResult::Array(_) => {
+                    return CalcResult::Error {
+                        error: Error::NIMPL,
+                        origin: cell,
+                        message: "Arrays not supported yet".to_string(),
+                    }
+                }
+            }
+        }
+        let mut total = 0.0;
+        for r in 0..used_rows {
+            for c in 0..used_cols {
+                let mut product = 1.0;
+                for p in &parsed {
+                    let v = match p {
+                        SpArg::Scalar(v) => *v,
+                        SpArg::Range { sheet, row, column } => {
+                            match self.evaluate_cell(CellReferenceIndex {
+                                sheet: *sheet,
+                                row: row + r,
+                                column: column + c,
+                            }) {
+                                CalcResult::Number(v) => v,
+                                error @ CalcResult::Error { .. } => return error,
+                                _ => 0.0,
+                            }
+                        }
+                    };
+                    product *= v;
+                }
+                total += product;
+            }
+        }
+        CalcResult::Number(total)
+    }
+
     pub(crate) fn fn_sum(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.is_empty() {
             return CalcResult::new_args_number_error(cell);

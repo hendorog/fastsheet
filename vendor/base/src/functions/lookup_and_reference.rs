@@ -351,9 +351,12 @@ impl<'a> Model<'a> {
         if lookup_value.is_error() {
             return lookup_value;
         }
-        // Excel treats a blank lookup value as the number 0 (and blank
-        // cells in the lookup row never match)
-        let lookup_value = if matches!(lookup_value, CalcResult::EmptyCell) {
+        // fastsheet patch (Excel semantics): a blank lookup cell behaves
+        // as the number 0, and blank cells in the lookup vector never
+        // match it — without this, blank-to-blank "matches" returned the
+        // first blank-keyed column instead of #N/A.
+        let lookup_was_blank = matches!(lookup_value, CalcResult::EmptyCell);
+        let lookup_value = if lookup_was_blank {
             CalcResult::Number(0.0)
         } else {
             lookup_value
@@ -429,6 +432,9 @@ impl<'a> Model<'a> {
                             row: left.row,
                             column: left.column + l,
                         });
+                        if lookup_was_blank && matches!(value, CalcResult::EmptyCell) {
+                            continue;
+                        }
                         if result_matches(&value) {
                             return self.evaluate_cell(CellReferenceIndex {
                                 sheet: left.sheet,
@@ -470,9 +476,10 @@ impl<'a> Model<'a> {
         if lookup_value.is_error() {
             return lookup_value;
         }
-        // Excel treats a blank lookup value as the number 0 (and blank
-        // cells in the lookup column never match)
-        let lookup_value = if matches!(lookup_value, CalcResult::EmptyCell) {
+        // fastsheet patch (Excel semantics): see fn_hlookup — blank
+        // lookup behaves as 0, blank vector cells never match it.
+        let lookup_was_blank = matches!(lookup_value, CalcResult::EmptyCell);
+        let lookup_value = if lookup_was_blank {
             CalcResult::Number(0.0)
         } else {
             lookup_value
@@ -548,6 +555,9 @@ impl<'a> Model<'a> {
                             row: left.row + l,
                             column: left.column,
                         });
+                        if lookup_was_blank && matches!(value, CalcResult::EmptyCell) {
+                            continue;
+                        }
                         if result_matches(&value) {
                             return self.evaluate_cell(CellReferenceIndex {
                                 sheet: left.sheet,
@@ -759,7 +769,154 @@ impl<'a> Model<'a> {
         }
     }
 
-    // INDIRECT(ref_tex)
+    /// Parse an R1C1-style reference ("R2C1", "R[1]C[-2]", "RC", "RC5",
+    /// "Sheet2!R2C3", "R2C1:R4C2") relative to `base` (the cell holding
+    /// the formula). Returns the range corners, or None when the text
+    /// isn't valid R1C1 or falls outside sheet bounds. Fastsheet vendor
+    /// addition for two-arg INDIRECT — upstream 0.7.1 returned #N/IMPL!
+    /// for every two-arg call.
+    fn parse_r1c1_reference(
+        &mut self,
+        text: &str,
+        base: CellReferenceIndex,
+    ) -> Option<(CellReferenceIndex, CellReferenceIndex)> {
+        let text = text.trim();
+        let (sheet, rest) = match text.rsplit_once('!') {
+            Some((sheet_name, rest)) => (
+                self.get_sheet_index_by_name(sheet_name.trim().trim_matches('\''))?,
+                rest,
+            ),
+            None => (base.sheet, text),
+        };
+        let parse_cell = |part: &str| -> Option<(i32, i32)> {
+            let mut s = part.trim();
+            let row = parse_r1c1_axis(&mut s, 'r', base.row)?;
+            let column = parse_r1c1_axis(&mut s, 'c', base.column)?;
+            if !s.is_empty() {
+                return None;
+            }
+            if !(1..=LAST_ROW).contains(&row) || !(1..=LAST_COLUMN).contains(&column) {
+                return None;
+            }
+            Some((row, column))
+        };
+        let (first, second) = match rest.split_once(':') {
+            Some((l, r)) => (parse_cell(l)?, parse_cell(r)?),
+            None => {
+                let c = parse_cell(rest)?;
+                (c, c)
+            }
+        };
+        Some((
+            CellReferenceIndex {
+                sheet,
+                row: first.0.min(second.0),
+                column: first.1.min(second.1),
+            },
+            CellReferenceIndex {
+                sheet,
+                row: first.0.max(second.0),
+                column: first.1.max(second.1),
+            },
+        ))
+    }
+
+    // ADDRESS(row, column, [abs_num = 1], [a1 = TRUE], [sheet_text])
+    // Builds an address string. abs_num: 1 = absolute, 2 = row
+    // absolute, 3 = column absolute, 4 = relative. a1 = FALSE gives
+    // R1C1 text (relative parts bracketed). Sheet names that aren't
+    // plain identifiers get quoted. Fastsheet addition — missing from
+    // upstream 0.7.1.
+    pub(crate) fn fn_address(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
+        if !(2..=5).contains(&args.len()) {
+            return CalcResult::new_args_number_error(cell);
+        }
+        let row = match self.get_number(&args[0], cell) {
+            Ok(f) => f.trunc() as i64,
+            Err(e) => return e,
+        };
+        let column = match self.get_number(&args[1], cell) {
+            Ok(f) => f.trunc() as i64,
+            Err(e) => return e,
+        };
+        let abs_num = if args.len() > 2 {
+            match self.get_number(&args[2], cell) {
+                Ok(f) => f.trunc() as i64,
+                Err(e) => return e,
+            }
+        } else {
+            1
+        };
+        let a1 = if args.len() > 3 {
+            match self.get_boolean(&args[3], cell) {
+                Ok(b) => b,
+                Err(e) => return e,
+            }
+        } else {
+            true
+        };
+        let sheet_text = if args.len() > 4 {
+            match self.get_string(&args[4], cell) {
+                Ok(s) => Some(s),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
+        if row < 1
+            || row > LAST_ROW as i64
+            || column < 1
+            || column > LAST_COLUMN as i64
+            || !(1..=4).contains(&abs_num)
+        {
+            return CalcResult::new_error(
+                Error::VALUE,
+                cell,
+                "ADDRESS: argument out of range".to_string(),
+            );
+        }
+        let cell_part = if a1 {
+            let col_letters = match crate::expressions::utils::number_to_column(column as i32) {
+                Some(s) => s,
+                None => {
+                    return CalcResult::new_error(
+                        Error::VALUE,
+                        cell,
+                        "ADDRESS: invalid column".to_string(),
+                    )
+                }
+            };
+            match abs_num {
+                1 => format!("${col_letters}${row}"),
+                2 => format!("{col_letters}${row}"),
+                3 => format!("${col_letters}{row}"),
+                _ => format!("{col_letters}{row}"),
+            }
+        } else {
+            match abs_num {
+                1 => format!("R{row}C{column}"),
+                2 => format!("R{row}C[{column}]"),
+                3 => format!("R[{row}]C{column}"),
+                _ => format!("R[{row}]C[{column}]"),
+            }
+        };
+        let prefix = match sheet_text {
+            None => String::new(),
+            Some(name) => {
+                let plain = !name.is_empty()
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    && !name.chars().next().is_some_and(|c| c.is_ascii_digit());
+                if plain {
+                    format!("{name}!")
+                } else {
+                    format!("'{}'!", name.replace('\'', "''"))
+                }
+            }
+        };
+        CalcResult::String(format!("{prefix}{cell_part}"))
+    }
+
+    // INDIRECT(ref_text, [a1])
     // Returns the reference specified by 'ref_text'
     pub(crate) fn fn_indirect(&mut self, args: &[Node], cell: CellReferenceIndex) -> CalcResult {
         if args.len() > 2 || args.is_empty() {
@@ -769,11 +926,23 @@ impl<'a> Model<'a> {
         match value {
             Ok(s) => {
                 if args.len() == 2 {
-                    return CalcResult::Error {
-                        error: Error::NIMPL,
-                        origin: cell,
-                        message: "Not implemented".to_string(),
+                    // Excel: a1 omitted or TRUE → A1-style (fall through
+                    // to the parse below); FALSE → R1C1-style, resolved
+                    // relative to the cell holding the INDIRECT call.
+                    let a1_mode = match self.get_boolean(&args[1], cell) {
+                        Ok(b) => b,
+                        Err(e) => return e,
                     };
+                    if !a1_mode {
+                        return match self.parse_r1c1_reference(&s, cell) {
+                            Some((left, right)) => CalcResult::Range { left, right },
+                            None => CalcResult::Error {
+                                error: Error::REF,
+                                origin: cell,
+                                message: format!("Invalid R1C1 reference: '{s}'"),
+                            },
+                        };
+                    }
                 }
 
                 let parsed_reference = ParsedReference::parse_reference_formula(
@@ -981,4 +1150,30 @@ impl<'a> Model<'a> {
             }
         }
     }
+}
+
+/// Consume one R1C1 axis ("R", "R7", "R[-2]") from the front of `s`.
+/// `letter` is 'r' or 'c' (matched case-insensitively); `base` anchors
+/// the bare ("R" alone = same row) and bracketed-relative forms.
+/// Advances `s` past the consumed axis. Companion to
+/// `parse_r1c1_reference` above (fastsheet vendor addition).
+fn parse_r1c1_axis(s: &mut &str, letter: char, base: i32) -> Option<i32> {
+    let first = s.chars().next()?;
+    if first.to_ascii_lowercase() != letter {
+        return None;
+    }
+    *s = &s[1..];
+    if let Some(rest) = s.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let n: i32 = rest[..end].parse().ok()?;
+        *s = &rest[end + 1..];
+        return Some(base + n);
+    }
+    let digit_count = s.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return Some(base);
+    }
+    let n: i32 = s[..digit_count].parse().ok()?;
+    *s = &s[digit_count..];
+    Some(n)
 }

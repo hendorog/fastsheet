@@ -50,6 +50,16 @@ pub struct XlsShape {
     /// Palette color indices → "#RRGGBB" strings. Seeded with the
     /// default 56-entry palette; PALETTE records in the file overlay.
     pub palette: HashMap<u16, String>,
+    /// XFEXT (0x087D) full-color overrides keyed by ixfe. Modern Excel
+    /// keeps the legacy palette untouched and stores true colors
+    /// (rgb / theme+tint) here — the icv in the XF is only a
+    /// nearest-palette approximation for old readers.
+    pub xfext: HashMap<u16, XfExtProps>,
+    /// Theme palette from the THEME (0x0896) record's zipped theme XML,
+    /// in clrScheme file order: dk1, lt1, dk2, lt2, accent1..6, hlink,
+    /// folHlink. None when the file has no theme payload (use the
+    /// default Office theme).
+    pub theme_colors: Option<Vec<String>>,
     /// Array-formula spill ranges per sheet: each entry is
     /// (sheet, r1, r2, c1, c2) in 1-based indices. The anchor cell
     /// is (r1, c1); spill cells are everything else in the rectangle.
@@ -149,6 +159,14 @@ pub struct XlsShape {
     /// = 51 = 0x33) decodes to `$B$2:$Z$56` when bit 0x20 is set in
     /// the high byte. Keyed by name in lowercase.
     pub defined_name_refs: HashMap<String, Vec<String>>,
+    /// Every NAME (Lbl) record in stream order, raw: name string,
+    /// flags, scope itab and rgce bytes. 1-based PtgName inames index
+    /// this list. The loader uses it to build the save-side
+    /// preservation list for names it can't import into the IronCalc
+    /// model (builtin _FilterDatabase / Print_Titles, `_xlfn.*`
+    /// stubs, names IronCalc's identifier grammar rejects, #REF!
+    /// names).
+    pub raw_names: Vec<RawNameEntry>,
     /// Excel's cached last-evaluated value for each FORMULA cell —
     /// either a number, a boolean, an error code, or a string (strings
     /// arrive separately in a STRING record, so we only capture the
@@ -195,10 +213,37 @@ pub struct FontEntry {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub underline_double: bool,
     pub strike: bool,
     pub size_pt: i32,
     pub color_idx: u16,
     pub name: String,
+}
+
+/// One FullColorExt value from an XFEXT property ([MS-XLS] 2.5.155):
+/// the color plus a tint/shade in -32767..32767 (negative darkens,
+/// positive lightens, applied to HSL luminance like xlsx tint).
+#[derive(Debug, Clone, Copy)]
+pub enum ExtColor {
+    /// xclrType=2 — literal RGB.
+    Rgb([u8; 3], i16),
+    /// xclrType=3 — theme color index in xlsx numbering (0=lt1, 1=dk1,
+    /// 2=lt2, 3=dk2, 4..9=accent1-6, 10=hlink, 11=folHlink).
+    Theme(u32, i16),
+    /// xclrType=1 — legacy palette index.
+    Icv(u16, i16),
+}
+
+/// Full-color overrides one XFEXT record carries for its XF.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XfExtProps {
+    pub font_color: Option<ExtColor>,
+    pub fill_fg: Option<ExtColor>,
+    pub fill_bg: Option<ExtColor>,
+    pub border_left: Option<ExtColor>,
+    pub border_right: Option<ExtColor>,
+    pub border_top: Option<ExtColor>,
+    pub border_bottom: Option<ExtColor>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -206,6 +251,19 @@ pub struct XtiEntry {
     pub isup_book: u16,
     pub itab_first: i16,
     pub itab_last: i16,
+}
+
+/// One NAME (Lbl) record captured verbatim by the scanner. `itab` is
+/// the Lbl scope field: 0 = workbook-global, otherwise 1-based sheet
+/// index. `name` may be a single control character for builtin names
+/// ([MS-XLS] 2.5.65: 0x0D = _FilterDatabase, 0x06 = Print_Titles, ...).
+#[derive(Debug, Clone, Default)]
+pub struct RawNameEntry {
+    pub grbit: u16,
+    pub ch_key: u8,
+    pub itab: u16,
+    pub name: String,
+    pub rgce: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -246,6 +304,11 @@ pub struct XfEntry {
     pub border_right: u8,
     pub border_top: u8,
     pub border_bottom: u8,
+    /// Border color palette indices per edge (icv; 64 = auto/black).
+    pub border_icv_left: u16,
+    pub border_icv_right: u16,
+    pub border_icv_top: u16,
+    pub border_icv_bottom: u16,
 }
 
 // BIFF record types we care about.
@@ -288,6 +351,8 @@ const R_EXTERNSHEET: u16 = 0x0017;
 const R_EXTERNNAME: u16 = 0x0223;
 const R_EXTERNNAME_ALT: u16 = 0x0023;
 const R_CONTINUE: u16 = 0x003C;
+const R_XFEXT: u16 = 0x087D;
+const R_THEME: u16 = 0x0896;
 
 // BOF substream types.
 const DT_SHEET: u16 = 0x0010;
@@ -494,13 +559,20 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                 let cell_options = u16::from_le_bytes([data[4], data[5]]);
                 let is_style = (cell_options & 0x0004) != 0;
                 let ixf_parent = (cell_options >> 4) & 0x0FFF;
+                // fAtr* live at bits 2-7 of byte 9 per [MS-XLS] 2.4.353
+                // (bits 0-1 are reserved). These masks were shifted two
+                // bits low for a long time, which read the reserved bits
+                // as fAtrNum/fAtrFnt — so atr_fnt never registered and
+                // font resolution always walked to the parent style XF,
+                // dropping name/size that a cell XF legitimately owned
+                // (found by the style gauntlet's xls round-trip).
                 let atr = data[9];
-                let atr_num = (atr & 0x01) != 0;
-                let atr_fnt = (atr & 0x02) != 0;
-                let atr_alc = (atr & 0x04) != 0;
-                let atr_bdr = (atr & 0x08) != 0;
-                let atr_pat = (atr & 0x10) != 0;
-                let atr_prot = (atr & 0x20) != 0;
+                let atr_num = (atr & 0x04) != 0;
+                let atr_fnt = (atr & 0x08) != 0;
+                let atr_alc = (atr & 0x10) != 0;
+                let atr_bdr = (atr & 0x20) != 0;
+                let atr_pat = (atr & 0x40) != 0;
+                let atr_prot = (atr & 0x80) != 0;
                 // alignment byte 6: bits 0-2 h-align, bit 3 wrap,
                 // bits 4-6 v-align, bit 7 justLast
                 let align = data[6];
@@ -513,6 +585,15 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                 let border_right = ((border_styles >> 4) & 0x000F) as u8;
                 let border_top = ((border_styles >> 8) & 0x000F) as u8;
                 let border_bottom = ((border_styles >> 12) & 0x000F) as u8;
+                // bytes 12-13 (u16): icvLeft bits 0-6, icvRight 7-13.
+                let border_colors = u16::from_le_bytes([data[12], data[13]]);
+                let border_icv_left = border_colors & 0x007F;
+                let border_icv_right = (border_colors >> 7) & 0x007F;
+                // icvTop / icvBottom live in bits 0-6 / 7-13 of the u32
+                // at offset 14 (the same u32 whose top bits carry fls).
+                let tb = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
+                let border_icv_top = (tb & 0x7F) as u16;
+                let border_icv_bottom = ((tb >> 7) & 0x7F) as u16;
                 // Fill encoding (cross-referenced against Apache POI's
                 // HSSF ExtendedFormatRecord):
                 //   bytes 14..18 (u32):
@@ -551,6 +632,10 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                     border_right,
                     border_top,
                     border_bottom,
+                    border_icv_left,
+                    border_icv_right,
+                    border_icv_top,
+                    border_icv_bottom,
                 });
             }
             R_FONT if data.len() >= 16 => {
@@ -569,10 +654,23 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                 } else {
                     String::new()
                 };
+                // BIFF8 skips font index 4: stream record k has
+                // ifnt = k for k < 4 and ifnt = k + 1 from the fifth
+                // record on ([MS-XLS] 2.4.122 — "the fifth Font record
+                // never exists"). Occupy the phantom slot with a copy
+                // of the default font so XF.ifnt indexes this Vec
+                // directly. Without this every font from ifnt 5 up
+                // resolved one record late (Arial-14-instead-of-
+                // Calibri-11 class of mismatch on Excel-authored files).
+                if shape.fonts.len() == 4 {
+                    let dummy = shape.fonts[0].clone();
+                    shape.fonts.push(dummy);
+                }
                 shape.fonts.push(FontEntry {
                     bold: bls >= 700,
                     italic: (grbit & 0x0002) != 0,
                     underline: uls != 0,
+                    underline_double: uls == 0x02 || uls == 0x22,
                     strike: (grbit & 0x0008) != 0,
                     size_pt: (dy_height as i32) / 20,
                     color_idx: icv,
@@ -679,6 +777,13 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                 .unwrap_or_default();
                 let rgce_start = name_bytes_start + name_byte_len;
                 let rgce = &data[rgce_start..rgce_start + cce];
+                shape.raw_names.push(RawNameEntry {
+                    grbit,
+                    ch_key: data[2],
+                    itab: u16::from_le_bytes([data[8], data[9]]),
+                    name: name.clone(),
+                    rgce: rgce.to_vec(),
+                });
                 if !is_builtin && !name.is_empty() && cce > 0 {
                     let refs = extract_refs_with_xti(
                         rgce,
@@ -767,6 +872,59 @@ pub fn scan_xls_shape(bytes: &[u8]) -> XlsShape {
                         let hex = format!("#{:02X}{:02X}{:02X}", r, g, b);
                         shape.palette.insert(8 + i as u16, hex);
                     }
+                }
+            }
+            R_XFEXT if data.len() >= 20 => {
+                // frtHeader(12), reserved1(2), ixfe(2), reserved2(2),
+                // cexts(2), rgExt[cexts] ([MS-XLS] 2.4.355).
+                let ixfe = u16::from_le_bytes([data[14], data[15]]);
+                let cexts = u16::from_le_bytes([data[18], data[19]]) as usize;
+                let mut props = XfExtProps::default();
+                let mut p = 20usize;
+                for _ in 0..cexts {
+                    if p + 4 > data.len() {
+                        break;
+                    }
+                    let ext_type = u16::from_le_bytes([data[p], data[p + 1]]);
+                    let cb = u16::from_le_bytes([data[p + 2], data[p + 3]]) as usize;
+                    if cb < 4 || p + cb > data.len() {
+                        break;
+                    }
+                    if let Some(color) = parse_full_color_ext(&data[p + 4..p + cb]) {
+                        match ext_type {
+                            0x0004 => props.fill_fg = Some(color),
+                            0x0005 => props.fill_bg = Some(color),
+                            0x0007 => props.border_top = Some(color),
+                            0x0008 => props.border_bottom = Some(color),
+                            0x0009 => props.border_left = Some(color),
+                            0x000A => props.border_right = Some(color),
+                            0x000D => props.font_color = Some(color),
+                            _ => {}
+                        }
+                    }
+                    p += cb;
+                }
+                shape.xfext.insert(ixfe, props);
+            }
+            R_THEME if data.len() >= 16 => {
+                // frtHeader(12), dwThemeVersion(4), rgb (zip payload;
+                // absent for the built-in default theme). Large themes
+                // spill into CONTINUE records.
+                let mut payload = data[16..].to_vec();
+                let mut scan_pos = data_end;
+                while scan_pos + 4 <= buf.len() {
+                    let nxt_type = u16::from_le_bytes([buf[scan_pos], buf[scan_pos + 1]]);
+                    let nxt_len = u16::from_le_bytes([buf[scan_pos + 2], buf[scan_pos + 3]])
+                        as usize;
+                    if nxt_type != R_CONTINUE { break; }
+                    let nxt_start = scan_pos + 4;
+                    let nxt_end = nxt_start + nxt_len;
+                    if nxt_end > buf.len() { break; }
+                    payload.extend_from_slice(&buf[nxt_start..nxt_end]);
+                    scan_pos = nxt_end;
+                }
+                if let Some(colors) = parse_theme_colors(&payload) {
+                    shape.theme_colors = Some(colors);
                 }
             }
             R_BLANK if sheet_idx >= 0 && data.len() >= 6 => {
@@ -1088,6 +1246,77 @@ pub fn extract_ptg_name_x_indices(rgce: &[u8]) -> Vec<u16> {
         i += advance;
     }
     out
+}
+
+/// Parse one FullColorExt ([MS-XLS] 2.5.155): xclrType(2),
+/// nTintShade(2, signed), xclrValue(4), unused(8). Returns None for
+/// auto/ninched colors (keep the icv-derived color in those cases).
+fn parse_full_color_ext(d: &[u8]) -> Option<ExtColor> {
+    if d.len() < 8 {
+        return None;
+    }
+    let xclr_type = u16::from_le_bytes([d[0], d[1]]);
+    let tint = i16::from_le_bytes([d[2], d[3]]);
+    match xclr_type {
+        1 => Some(ExtColor::Icv(
+            u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as u16,
+            tint,
+        )),
+        // xclrValue is a LongRGBA laid out R, G, B, A.
+        2 => Some(ExtColor::Rgb([d[4], d[5], d[6]], tint)),
+        3 => Some(ExtColor::Theme(
+            u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
+            tint,
+        )),
+        _ => None,
+    }
+}
+
+/// Extract the clrScheme colors from a THEME record's zipped theme XML.
+/// Returns the 12 colors in clrScheme file order (dk1, lt1, dk2, lt2,
+/// accent1..6, hlink, folHlink) as "#RRGGBB" strings.
+fn parse_theme_colors(payload: &[u8]) -> Option<Vec<String>> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(payload)).ok()?;
+    let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+    let theme_name = names
+        .iter()
+        .find(|n| n.contains("theme") && n.ends_with(".xml"))?
+        .clone();
+    let mut xml = String::new();
+    {
+        use std::io::Read;
+        let mut f = archive.by_name(&theme_name).ok()?;
+        f.read_to_string(&mut xml).ok()?;
+    }
+    let start = xml.find("<a:clrScheme")?;
+    let end = xml[start..].find("</a:clrScheme>")? + start;
+    let scheme = &xml[start..end];
+    const TAGS: [&str; 12] = [
+        "dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3",
+        "accent4", "accent5", "accent6", "hlink", "folHlink",
+    ];
+    let mut colors = Vec::with_capacity(12);
+    for tag in TAGS {
+        let open = format!("<a:{}>", tag);
+        let close = format!("</a:{}>", tag);
+        let tag_at = scheme.find(&open)?;
+        let close_at = scheme[tag_at..].find(&close)? + tag_at;
+        let rest = &scheme[tag_at..close_at];
+        // Either <a:srgbClr val="RRGGBB"/> or
+        // <a:sysClr val="windowText" lastClr="RRGGBB"/>.
+        let hex = if let Some(p) = rest.find("srgbClr val=\"") {
+            rest.get(p + 13..p + 19)
+        } else if let Some(p) = rest.find("lastClr=\"") {
+            rest.get(p + 9..p + 15)
+        } else {
+            None
+        }?;
+        if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        colors.push(format!("#{}", hex.to_uppercase()));
+    }
+    Some(colors)
 }
 
 /// Seed the default BIFF8 palette (64 slots).

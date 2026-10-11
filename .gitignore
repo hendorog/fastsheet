@@ -19,6 +19,8 @@ vite.config.ts.timestamp-*
 !/fixtures/basic.xlsx
 !/fixtures/tables.xlsx
 !/fixtures/array_formulas.xlsx
+!/fixtures/formula_gauntlet.xlsx
+!/fixtures/style_gauntlet.xlsx
 .claude/
 
 # Internal working docs (kept on disk, not pushed to public repo)

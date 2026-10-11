@@ -438,6 +438,17 @@ pub enum Function {
     MySortBlank,
     MyTranspose,
     MyFilter,
+    // Standard Excel built-ins missing from upstream IronCalc 0.7.1,
+    // implemented as fastsheet additions under their real names (like
+    // CHAR above). Found by fixtures/formula_gauntlet.xlsx.
+    Sumproduct,
+    Address,
+    Proper,
+    Code,
+    Mode,
+    Replace,
+    Numbervalue,
+    Fixed,
 }
 
 macro_rules! impl_function_lookup {
@@ -454,6 +465,15 @@ macro_rules! impl_function_lookup {
                     "MYSORTBLANK" => return Some(Function::MySortBlank),
                     "MYTRANSPOSE" => return Some(Function::MyTranspose),
                     "MYFILTER" => return Some(Function::MyFilter),
+                    "SUMPRODUCT" => return Some(Function::Sumproduct),
+                    "ADDRESS" => return Some(Function::Address),
+                    "PROPER" => return Some(Function::Proper),
+                    "CODE" => return Some(Function::Code),
+                    "MODE" => return Some(Function::Mode),
+                    "MODE.SNGL" => return Some(Function::Mode),
+                    "REPLACE" => return Some(Function::Replace),
+                    "NUMBERVALUE" => return Some(Function::Numbervalue),
+                    "FIXED" => return Some(Function::Fixed),
                     _ => {}
                 }
                 $(
@@ -1201,6 +1221,14 @@ impl Function {
             Function::MySortBlank => "MYSORTBLANK".to_string(),
             Function::MyTranspose => "MYTRANSPOSE".to_string(),
             Function::MyFilter => "MYFILTER".to_string(),
+            Function::Sumproduct => "SUMPRODUCT".to_string(),
+            Function::Address => "ADDRESS".to_string(),
+            Function::Proper => "PROPER".to_string(),
+            Function::Code => "CODE".to_string(),
+            Function::Mode => "MODE".to_string(),
+            Function::Replace => "REPLACE".to_string(),
+            Function::Numbervalue => "NUMBERVALUE".to_string(),
+            Function::Fixed => "FIXED".to_string(),
         }
     }
     pub fn into_iter() -> IntoIter<Function, 345> {
@@ -2048,6 +2076,14 @@ impl<'a> Model<'a> {
             Function::MySortBlank => self.fn_my_sort_blank(args, cell),
             Function::MyTranspose => self.fn_my_transpose(args, cell),
             Function::MyFilter => self.fn_my_filter(args, cell),
+            Function::Sumproduct => self.fn_sumproduct(args, cell),
+            Function::Address => self.fn_address(args, cell),
+            Function::Proper => self.fn_proper(args, cell),
+            Function::Code => self.fn_code(args, cell),
+            Function::Mode => self.fn_mode(args, cell),
+            Function::Replace => self.fn_replace(args, cell),
+            Function::Numbervalue => self.fn_numbervalue(args, cell),
+            Function::Fixed => self.fn_fixed(args, cell),
         }
     }
 }

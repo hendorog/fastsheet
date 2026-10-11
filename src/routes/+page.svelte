@@ -93,6 +93,13 @@
   let currentPath = $state("");
   let workbookDirty = $state(false);
   let bypassCloseConfirm = false;
+  /// Depth counter for long-running backend operations (open, save,
+  /// recalc, batch edits). While > 0 the topbar shows the Lotus-style
+  /// WAIT indicator and the pointer becomes an hourglass. A counter
+  /// (not a flag) so overlapping ops don't clear each other's state.
+  /// Call sites bump it before their try block and decrement in a
+  /// finally so an error can't leave the indicator stuck on.
+  let busyCount = $state(0);
 
   function noteRecalcPending(count: number) {
     if (!autoRecalc && count > 0) pendingRecalcEdits += count;
@@ -137,6 +144,7 @@
   // selection but the form seeds from the active cell.
   let formatModalOpen = $state(false);
   let formatModalCell = $state({ row: 1, col: 1, r1: 1, c1: 1, r2: 1, c2: 1 });
+  let formatModalTab = $state<"number" | "font" | "border" | "fill" | "alignment">("number");
 
   /// Generic color picker overlay. Replaces the old hex-only prompt
   /// for /R F B and /R F X. The handlers (onSelect / onClear) are set
@@ -494,6 +502,9 @@
     for (const r of rowLru.keys()) {
       if (evict.size >= dropCount) break;
       if (r >= protectLo && r <= protectHi) continue;
+      // Frozen rows are always on screen (sticky) but sit outside the
+      // visible band Grid reports — never evict them.
+      if (r <= frozenRows) continue;
       evict.add(r);
     }
     if (evict.size === 0) return;
@@ -556,6 +567,50 @@
       while (r <= r2 && !loadedRows.has(r)) r++;
       await fetchRowBand(start, r - 1);
     }
+  }
+
+  /// Pull the active sheet's row heights for rows 1..targetRow into the
+  /// `rowHeights` map. Cheap (heights only — single narrow column), but
+  /// makes the cumulative `rowOffsets` accurate all the way to the
+  /// target so a jump-scroll lands precisely. Without it, the rows
+  /// between the current band and a far target carry default heights and
+  /// the scroll computation drifts (lands short of the target).
+  async function ensureRowHeightsThrough(targetRow: number) {
+    if (!workbook || targetRow < 1) return;
+    // Cap at the used-row count: rows past it carry the default height,
+    // so the cumulative offset stays exact without fetching a giant
+    // (and slow — get_layout is O(rows)) range for a far jump.
+    const endRow = Math.min(targetRow, viewportRows);
+    try {
+      const layout = await invoke<LayoutData>("get_layout", {
+        sheet: activeSheet,
+        startRow: 1,
+        endRow,
+        startCol: 1,
+        endCol: 1,
+      });
+      if (layout.row_heights.length === 0) return;
+      const newRH = new Map(rowHeights);
+      for (const [r, h] of layout.row_heights) newRH.set(r, rowHeightPx(h));
+      rowHeights = newRH;
+    } catch {}
+  }
+
+  /// Programmatic jump (F5 goto, trace/compare navigation) to a cell.
+  /// The lazy row loader hasn't fetched the rows between the current view
+  /// and a far target, so Grid's scroll-into-view runs on estimated
+  /// geometry, lands short, and the target cell is never fetched —
+  /// rendering blank with an empty formula bar. Make the geometry exact
+  /// through the target, fetch the target's own band so its data is
+  /// present, then request the scroll (whose band-change tops up the
+  /// rest of the landing viewport).
+  async function jumpScrollTo(row: number, col: number) {
+    if (!workbook) return;
+    await ensureRowHeightsThrough(row);
+    await ensureRowsLoaded(row, row);
+    scrollTarget = { row, col };
+    await tick();
+    scrollTarget = null;
   }
 
   /// Column auto-fit must inspect more than the current visible row band.
@@ -622,10 +677,16 @@
     loadedRows = new Set();
     rowLru = new Map();
     await loadSheetLayout();
-    loadedColStart = Math.max(1, colBandStart);
+    // Grid's visible band deliberately starts after the frozen rows /
+    // cols (they render separately, sticky), so the band-driven fetch
+    // below would never load their data — include them explicitly.
+    loadedColStart = frozenCols > 0 ? 1 : Math.max(1, colBandStart);
     loadedColEnd = Math.min(viewportCols, colBandEnd > 0 ? colBandEnd : 60);
     const r1 = Math.max(1, bandStart);
     const r2 = Math.min(viewportRows, bandEnd > 0 ? bandEnd : 60);
+    if (frozenRows > 0) {
+      await ensureRowsLoaded(1, Math.min(frozenRows, viewportRows));
+    }
     await ensureRowsLoaded(r1, r2);
   }
 
@@ -638,6 +699,11 @@
     bandLoadRaf = requestAnimationFrame(async () => {
       bandLoadRaf = null;
       if (!workbook) return;
+      // Frozen rows sit outside the reported band — keep them loaded
+      // (no-op when already present; guards against eviction races).
+      if (frozenRows > 0) {
+        await ensureRowsLoaded(1, Math.min(frozenRows, viewportRows));
+      }
       const r1 = Math.max(1, bandStart);
       const r2 = Math.min(viewportRows, bandEnd);
       await ensureRowsLoaded(r1, r2);
@@ -750,6 +816,7 @@
       focusGrid();
       return;
     }
+    busyCount++;
     try {
       workbook = await invoke<WorkbookInfo>("open_workbook", { path: p });
       activeSheet = 0;
@@ -775,6 +842,8 @@
       focusGrid();
     } catch (e) {
       statusMsg = `Open failed: ${e}`;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -811,6 +880,7 @@
     // The Rust save_workbook command dispatches on extension: .xls →
     // BIFF8 writer (xls_save.rs), .xlsx → preservation patcher or
     // IronCalc save_to_xlsx fallback.
+    busyCount++;
     try {
       const r = await invoke<SaveResult>("save_workbook", { path });
       currentPath = path;
@@ -818,6 +888,8 @@
       statusMsg = describeSave(r);
     } catch (e) {
       statusMsg = `Save failed: ${e}`;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -867,12 +939,15 @@
   }
 
   async function writeExtractWorkbook(path: string, rows: string[][], label: string) {
+    busyCount++;
     try {
       const r = await invoke<SaveResult>("extract_cells_to_workbook", { path, rows });
       const backup = r.backup_path ? ` · backup: ${r.backup_path}` : "";
       statusMsg = `Xtracted ${label} to ${r.path} · ${r.cells_patched} cell${r.cells_patched === 1 ? "" : "s"} written${backup}`;
     } catch (e) {
       statusMsg = `Xtract failed: ${e}`;
+    } finally {
+      busyCount--;
     }
     focusGrid();
   }
@@ -1085,6 +1160,7 @@
   }
 
   async function backupAndSave(path: string) {
+    busyCount++;
     try {
       const r = await invoke<BackupResult>("backup_and_save", { path });
       currentPath = path;
@@ -1092,6 +1168,8 @@
       statusMsg = `${describeSave(r.save)} · backup: ${r.backup_path}`;
     } catch (e) {
       statusMsg = `Backup failed: ${e}`;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -1422,6 +1500,7 @@
   async function recalcWorkbook() {
     if (!workbook) return;
     statusMsg = "Recalculating…";
+    busyCount++;
     try {
       const ms = await invoke<number>("recalc");
       await refreshViewport();
@@ -1429,6 +1508,8 @@
       statusMsg = `Recalc done in ${ms} ms`;
     } catch (e) {
       statusMsg = `Recalc failed: ${e}`;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -1502,6 +1583,7 @@
   }
 
   async function compareOpenWith(p: string) {
+    busyCount++;
     try {
       const r = await invoke<CompareResult>("compare_open", { path: p });
       compareResult = r;
@@ -1511,6 +1593,8 @@
     } catch (e) {
       statusMsg = `Compare failed: ${e}`;
       compareResult = null;
+    } finally {
+      busyCount--;
     }
   }
 
@@ -1557,9 +1641,10 @@
       await switchSheet(d.sheet_idx);
     }
     growViewportToInclude(d.row, d.col);
-    // Fire a one-shot scroll target so the grid centers on the diff
-    // cell without changing the cursor.
-    scrollTarget = { row: d.row, col: d.col };
+    // Load + scroll to the diff cell (jumpScrollTo handles far targets
+    // the lazy loader hasn't fetched — otherwise the previewed cell can
+    // render blank). Doesn't change the cursor.
+    await jumpScrollTo(d.row, d.col);
   }
 
   /// Highlight overlays for every visible diff on the active sheet.
@@ -1649,7 +1734,7 @@
           label: node.address,
         },
       ];
-      scrollTarget = { row: range.r1, col: range.c1 };
+      await jumpScrollTo(range.r1, range.c1);
       return;
     }
     if (node.sheet === null || node.row === null || node.col === null) {
@@ -1671,7 +1756,7 @@
         color: "#ff8800",
       },
     ];
-    scrollTarget = { row: node.row, col: node.col };
+    await jumpScrollTo(node.row, node.col);
   }
 
   async function closeTrace(restoreCursor: boolean) {
@@ -2085,6 +2170,7 @@
   /// the user already chose manual mode (/W G R M) — they get to
   /// keep their batched-pending state instead of a forced recalc.
   async function withSuspendedRecalc<T>(fn: () => Promise<T>): Promise<T> {
+    busyCount++;
     const wasAuto = autoRecalc;
     if (wasAuto) {
       try { await invoke("set_auto_recalc", { enabled: false }); } catch {}
@@ -2098,6 +2184,7 @@
           await invoke("recalc");
         } catch {}
       }
+      busyCount--;
     }
   }
 
@@ -2532,6 +2619,7 @@
         if (sheetIdx !== activeSheet) await switchSheet(sheetIdx);
         selRow = 1; selCol = 1;
         rangeEndRow = 1; rangeEndCol = 1;
+        await jumpScrollTo(1, 1);
         return true;
       }
     }
@@ -2559,6 +2647,7 @@
     rangeEndRow = selRow;
     rangeEndCol = selCol;
     growViewportToInclude(selRow, selCol);
+    await jumpScrollTo(selRow, selCol);
     return true;
   }
 
@@ -2835,7 +2924,7 @@
     focusGrid();
   }
 
-  function openFormatCellsModal() {
+  function openFormatCellsModal(tab: "number" | "font" | "border" | "fill" | "alignment" = "number") {
     if (!workbook) {
       statusMsg = "Open or create a workbook first.";
       return;
@@ -2845,6 +2934,7 @@
     const c1 = Math.min(selCol, rangeEndCol);
     const c2 = Math.max(selCol, rangeEndCol);
     formatModalCell = { row: selRow, col: selCol, r1, c1, r2, c2 };
+    formatModalTab = tab;
     formatModalOpen = true;
   }
 
@@ -4447,6 +4537,7 @@
     searchRange: openFindReplace,
     alignRange,
     attrRange,
+    attrFont: () => openFormatCellsModal("font"),
     setFillColor,
     setTextColor,
     rangeValue,
@@ -4997,7 +5088,7 @@
   });
 </script>
 
-<div class="app">
+<div class="app" class:busy={busyCount > 0}>
   {#if menuOpen}
     <div class="menubar" role="menu">
       <span class="menu-prompt">{breadcrumbText}&gt;</span>
@@ -5066,6 +5157,12 @@
         {selCell?.input ?? ""}
       {/if}
     </span>
+    <!-- Lotus-style mode indicator: reserved slot so the formula bar
+         doesn't resize when WAIT appears; opacity animation delays the
+         reveal ~150ms so quick operations don't flash it. -->
+    <span class="wait-tag" class:active={busyCount > 0} aria-live="polite">
+      <span class="hourglass" aria-hidden="true">⏳</span>WAIT
+    </span>
   </header>
 
   {#if navOpen}
@@ -5123,6 +5220,7 @@
       rangeC1={formatModalCell.c1}
       rangeR2={formatModalCell.r2}
       rangeC2={formatModalCell.c2}
+      initialTab={formatModalTab}
       onClose={() => {
         formatModalOpen = false;
         focusGrid();
@@ -5488,6 +5586,59 @@
     min-height: 1.3rem;
     overflow: hidden;
     white-space: nowrap;
+  }
+  /* Hourglass pointer everywhere while a long operation runs. The
+     :global(*) is needed because child-component elements (grid cells,
+     navigator rows) carry their own cursor styles. */
+  .app.busy,
+  .app.busy :global(*) {
+    cursor: wait;
+  }
+  .wait-tag {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: #b88a00;
+    color: #fff;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    padding: 0.1rem 0.5rem;
+    border-radius: 2px;
+    /* Slot is always laid out (visibility, not conditional render) so
+       the formula bar doesn't jump when WAIT toggles. */
+    visibility: hidden;
+  }
+  .wait-tag.active {
+    visibility: visible;
+    opacity: 0;
+    /* 0s-duration + 150ms delay = appear only if the op outlasts 150ms;
+       animation restarts on every activation because the class toggles. */
+    animation: wait-appear 0s step-end 0.15s forwards;
+  }
+  .hourglass {
+    display: inline-block;
+    font-size: 12px;
+  }
+  .wait-tag.active .hourglass {
+    animation: hourglass-flip 1.5s ease-in-out 0.15s infinite;
+  }
+  @keyframes wait-appear {
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes hourglass-flip {
+    0%,
+    30% {
+      transform: rotate(0deg);
+    }
+    50%,
+    80% {
+      transform: rotate(180deg);
+    }
+    100% {
+      transform: rotate(360deg);
+    }
   }
   .editor {
     width: 100%;
